@@ -1139,6 +1139,48 @@ Translation Guidelines:
 }
 
 // -------------------------------------------------------------
+// Site Appearance & Background Photo Storage (Synchronized across devices)
+// -------------------------------------------------------------
+const SITE_APPEARANCE_FILE = path.join(DATA_DIR, "site_appearance.json");
+
+interface SiteAppearanceData {
+  config?: any; // VisualAppearanceConfig
+  customBg?: string; // photo data URL or image URL
+  bgBlur?: number;
+  bgOpacity?: number;
+  savedColors?: string[];
+  theme?: "light" | "dark";
+  updatedAt?: number;
+}
+
+let siteAppearanceData: SiteAppearanceData = {};
+
+function loadSiteAppearance() {
+  try {
+    if (fs.existsSync(SITE_APPEARANCE_FILE)) {
+      const raw = fs.readFileSync(SITE_APPEARANCE_FILE, "utf-8");
+      siteAppearanceData = JSON.parse(raw);
+    }
+  } catch (err) {
+    console.error("Failed to load site appearance from disk:", err);
+  }
+}
+
+function saveSiteAppearance() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    fs.writeFileSync(SITE_APPEARANCE_FILE, JSON.stringify(siteAppearanceData, null, 2), "utf-8");
+  } catch (err) {
+    console.error("Failed to save site appearance to disk:", err);
+  }
+}
+
+// Initial load of site appearance
+loadSiteAppearance();
+
+// -------------------------------------------------------------
 // Telegram Settings Storage & Local Wrapper
 // -------------------------------------------------------------
 const TELEGRAM_SETTINGS_FILE = path.join(DATA_DIR, "telegram_settings.json");
@@ -1455,6 +1497,44 @@ app.get("/api/projects/status", (req, res) => {
 // Telegram Settings management endpoints
 app.get("/api/telegram-settings", (req, res) => {
   res.json(telegramSettings);
+});
+
+// Site Appearance & Background Photo management endpoints (Cross-Device Shared)
+app.get("/api/site-appearance", (req, res) => {
+  try {
+    loadSiteAppearance();
+    res.json({
+      success: true,
+      hasAppearance: !!(siteAppearanceData.config || siteAppearanceData.customBg),
+      data: siteAppearanceData,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+app.post("/api/site-appearance", express.json({ limit: "50mb" }), (req, res) => {
+  try {
+    const { config, customBg, bgBlur, bgOpacity, savedColors, theme } = req.body;
+
+    if (config !== undefined) siteAppearanceData.config = config;
+    if (customBg !== undefined) siteAppearanceData.customBg = customBg;
+    if (typeof bgBlur === "number") siteAppearanceData.bgBlur = bgBlur;
+    if (typeof bgOpacity === "number") siteAppearanceData.bgOpacity = bgOpacity;
+    if (Array.isArray(savedColors)) siteAppearanceData.savedColors = savedColors;
+    if (theme === "light" || theme === "dark") siteAppearanceData.theme = theme;
+    siteAppearanceData.updatedAt = Date.now();
+
+    saveSiteAppearance();
+    res.json({
+      success: true,
+      message: "Site appearance saved and synced across devices",
+      data: siteAppearanceData,
+    });
+  } catch (err: any) {
+    console.error("Failed to save site appearance:", err);
+    res.status(500).json({ success: false, error: String(err) });
+  }
 });
 
 app.post("/api/telegram-settings", express.json(), (req, res) => {

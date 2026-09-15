@@ -23,6 +23,7 @@ import {
   Paintbrush,
 } from "lucide-react";
 import { AppearanceCustomizer } from "./AppearanceCustomizer";
+import { syncSiteAppearanceToServer } from "../theme/visualAppearance";
 
 interface TelegramSettings {
   botToken: string;
@@ -96,10 +97,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [tgTestError, setTgTestError] = useState<string | null>(null);
   const [tgSaveStatus, setTgSaveStatus] = useState<"idle" | "success" | "error">("idle");
 
-  // Reset view to hub when opened
+  // Reset view to hub and refresh background state when opened
   useEffect(() => {
     if (isOpen) {
       setActiveView("hub");
+      try {
+        setCustomBgUrl(localStorage.getItem("megatext_custom_bg") || "");
+        const b = localStorage.getItem("megatext_bg_blur");
+        setBgBlur(b ? parseInt(b, 10) : 0);
+        const o = localStorage.getItem("megatext_bg_opacity");
+        setBgOpacity(o ? parseInt(o, 10) : 60);
+      } catch (e) {
+        console.warn(e);
+      }
       // Load telegram config in background
       setIsTgLoading(true);
       fetch("/api/telegram-settings")
@@ -126,6 +136,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         localStorage.removeItem("megatext_custom_bg");
         window.dispatchEvent(new Event("megatext_bg_changed"));
       }
+      syncSiteAppearanceToServer({ customBg: url });
     } catch (e) {
       console.warn("Storage warning for custom bg:", e);
     }
@@ -157,12 +168,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setBgBlur(val);
     localStorage.setItem("megatext_bg_blur", String(val));
     window.dispatchEvent(new Event("megatext_bg_changed"));
+    syncSiteAppearanceToServer({ bgBlur: val });
   };
 
   const handleOpacityChange = (val: number) => {
     setBgOpacity(val);
     localStorage.setItem("megatext_bg_opacity", String(val));
     window.dispatchEvent(new Event("megatext_bg_changed"));
+    syncSiteAppearanceToServer({ bgOpacity: val });
   };
 
   // Telegram actions

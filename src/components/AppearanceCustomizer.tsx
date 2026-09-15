@@ -55,6 +55,18 @@ export const AppearanceCustomizer: React.FC = () => {
     setTimeout(() => setShowSavedNotification(false), 2000);
   };
 
+  // Keep state in sync with external updates (e.g., cross-device sync)
+  React.useEffect(() => {
+    const handleAppearanceChange = () => {
+      setConfig(loadAppearanceConfig());
+      setSavedColors(loadSavedCustomColors());
+    };
+    window.addEventListener("megatext_appearance_changed", handleAppearanceChange);
+    return () => {
+      window.removeEventListener("megatext_appearance_changed", handleAppearanceChange);
+    };
+  }, []);
+
   const handleReset = () => {
     updateConfig(DEFAULT_APPEARANCE);
   };

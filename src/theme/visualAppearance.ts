@@ -194,6 +194,32 @@ const STORAGE_KEY = "megatext_visual_appearance_v2";
 const SAVED_COLORS_KEY = "megatext_custom_saved_colors_v1";
 const SAVED_PRESETS_KEY = "megatext_user_saved_presets_v1";
 
+let appearanceSyncTimer: any = null;
+
+export function syncSiteAppearanceToServer(partialData: {
+  config?: VisualAppearanceConfig;
+  customBg?: string;
+  bgBlur?: number;
+  bgOpacity?: number;
+  savedColors?: string[];
+  theme?: "light" | "dark";
+}) {
+  if (appearanceSyncTimer) {
+    clearTimeout(appearanceSyncTimer);
+  }
+  appearanceSyncTimer = setTimeout(async () => {
+    try {
+      await fetch("/api/site-appearance", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(partialData),
+      });
+    } catch (err) {
+      console.warn("Could not sync appearance to server:", err);
+    }
+  }, 300);
+}
+
 export const DEFAULT_SAVED_COLORS: string[] = [
   "#8b5cf6", // Purple
   "#ec4899", // Sakura Pink
@@ -231,6 +257,7 @@ export function saveCustomColorToPalette(hex: string): string[] {
     if (!current.some((c) => c.toLowerCase() === cleanHex)) {
       const updated = [cleanHex, ...current].slice(0, 32); // Keep up to 32 saved colors
       localStorage.setItem(SAVED_COLORS_KEY, JSON.stringify(updated));
+      syncSiteAppearanceToServer({ savedColors: updated });
       return updated;
     }
     return current;
@@ -246,6 +273,7 @@ export function deleteCustomColorFromPalette(hex: string): string[] {
     const cleanHex = hex.trim().toLowerCase();
     const updated = current.filter((c) => c.toLowerCase() !== cleanHex);
     localStorage.setItem(SAVED_COLORS_KEY, JSON.stringify(updated));
+    syncSiteAppearanceToServer({ savedColors: updated });
     return updated;
   } catch (e) {
     console.warn("Failed to delete custom color:", e);
@@ -320,6 +348,7 @@ export function saveAppearanceConfig(config: VisualAppearanceConfig): void {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
     applyAppearanceToDOM(config);
     window.dispatchEvent(new CustomEvent("megatext_appearance_changed", { detail: config }));
+    syncSiteAppearanceToServer({ config });
   } catch (e) {
     console.warn("Failed to save appearance config:", e);
   }

@@ -6,6 +6,7 @@ import {
   Menu,
   X,
   Layers,
+  Clock,
   Settings,
   Lock,
   RefreshCw,
@@ -22,6 +23,7 @@ interface NavbarProps {
   totalChunks?: number;
   onReset: () => void;
   onOpenGlossary: () => void;
+  onOpenHistory: () => void;
   onOpenTelegramSettings: () => void;
   glossaryCount: number;
   theme: "light" | "dark";
@@ -40,6 +42,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   totalChunks = 0,
   onReset,
   onOpenGlossary,
+  onOpenHistory,
   onOpenTelegramSettings,
   glossaryCount,
   theme,
@@ -122,6 +125,20 @@ export const Navbar: React.FC<NavbarProps> = ({
                   {glossaryCount} terms
                 </span>
               )}
+            </button>
+
+            {/* History - placed directly below Glossary & Terminology */}
+            <button
+              id="menu-history-btn"
+              type="button"
+              onClick={() => {
+                setIsMenuOpen(false);
+                onOpenHistory();
+              }}
+              className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-purple-50 dark:hover:bg-purple-950/40 transition cursor-pointer"
+            >
+              <Clock className="h-4 w-4 text-purple-600" />
+              <span>History</span>
             </button>
 
             {/* App Settings */}

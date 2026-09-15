@@ -15,11 +15,10 @@ import { AuthGateModal } from "./components/AuthGateModal";
 import { TelegramSettingsModal } from "./components/TelegramSettingsModal";
 import { SettingsModal } from "./components/SettingsModal";
 import { CustomBackgroundLayer } from "./components/CustomBackgroundLayer";
-import { BottomNav } from "./components/BottomNav";
 import { HistoryModal } from "./components/HistoryModal";
 import { ActiveTranslationView } from "./components/ActiveTranslationView";
 import { TranslationCompleteView } from "./components/TranslationCompleteView";
-import { applyAppearanceToDOM, loadAppearanceConfig } from "./theme/visualAppearance";
+import { applyAppearanceToDOM, loadAppearanceConfig, syncSiteAppearanceToServer } from "./theme/visualAppearance";
 import {
   TextChunk,
   TranslationStyle,
@@ -113,8 +112,78 @@ export default function App() {
     };
   }, []);
 
+  // Sync site appearance & background photo across devices (Phone A <-> Phone B)
+  useEffect(() => {
+    let isCancelled = false;
+
+    const fetchSharedAppearance = async () => {
+      try {
+        const res = await fetch("/api/site-appearance");
+        if (!res.ok) return;
+        const result = await res.json();
+        if (isCancelled || !result.success || !result.hasAppearance || !result.data) return;
+
+        const { config, customBg, bgBlur, bgOpacity, savedColors, theme: serverTheme } = result.data;
+
+        // Apply shared visual config if provided
+        if (config && typeof config === "object") {
+          localStorage.setItem("megatext_visual_appearance_v2", JSON.stringify(config));
+          applyAppearanceToDOM(config);
+          window.dispatchEvent(new CustomEvent("megatext_appearance_changed", { detail: config }));
+        }
+
+        // Apply shared custom background photo
+        if (typeof customBg === "string") {
+          if (customBg) {
+            localStorage.setItem("megatext_custom_bg", customBg);
+          } else {
+            localStorage.removeItem("megatext_custom_bg");
+          }
+          if (typeof bgBlur === "number") {
+            localStorage.setItem("megatext_bg_blur", String(bgBlur));
+          }
+          if (typeof bgOpacity === "number") {
+            localStorage.setItem("megatext_bg_opacity", String(bgOpacity));
+          }
+          window.dispatchEvent(new Event("megatext_bg_changed"));
+        }
+
+        // Apply shared saved custom colors palette
+        if (Array.isArray(savedColors)) {
+          localStorage.setItem("megatext_custom_saved_colors_v1", JSON.stringify(savedColors));
+        }
+
+        // Apply shared theme
+        if (serverTheme === "dark" || serverTheme === "light") {
+          setTheme((currentTheme) => {
+            if (currentTheme !== serverTheme) return serverTheme;
+            return currentTheme;
+          });
+        }
+      } catch (e) {
+        console.warn("Could not fetch shared appearance from server:", e);
+      }
+    };
+
+    fetchSharedAppearance();
+    // Re-check every 5 seconds and whenever window gains focus
+    const interval = setInterval(fetchSharedAppearance, 5000);
+    const handleFocus = () => fetchSharedAppearance();
+    window.addEventListener("focus", handleFocus);
+
+    return () => {
+      isCancelled = true;
+      clearInterval(interval);
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, []);
+
   const toggleTheme = () => {
-    setTheme((prev) => (prev === "dark" ? "light" : "dark"));
+    setTheme((prev) => {
+      const next = prev === "dark" ? "light" : "dark";
+      syncSiteAppearanceToServer({ theme: next });
+      return next;
+    });
   };
 
   // Authentication State
@@ -254,20 +323,10 @@ export default function App() {
   );
 
   // Modals & Navigation
-  const [activeNavTab, setActiveNavTab] = useState<"home" | "history" | "settings">("home");
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [isGlossaryOpen, setIsGlossaryOpen] = useState(false);
   const [isExportOpen, setIsExportOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-
-  const handleBottomNavChange = (tab: "home" | "history" | "settings") => {
-    setActiveNavTab(tab);
-    if (tab === "history") {
-      setIsHistoryOpen(true);
-    } else if (tab === "settings") {
-      setIsSettingsOpen(true);
-    }
-  };
   const [toastData, setToastData] = useState<{
     message: string;
     downloadUrl?: string;
@@ -1143,6 +1202,7 @@ Export Timestamp: ${new Date().toLocaleString()}
         totalChunks={totalChunks}
         onReset={handleReset}
         onOpenGlossary={() => setIsGlossaryOpen(true)}
+        onOpenHistory={() => setIsHistoryOpen(true)}
         onOpenTelegramSettings={() => setIsSettingsOpen(true)}
         glossaryCount={glossary.length}
         theme={theme}
@@ -1177,7 +1237,7 @@ Export Timestamp: ${new Date().toLocaleString()}
       )}
 
       {/* Mobile-first Main Screen Canvas (Reference 3 Screens) */}
-      <main className="flex-1 app-responsive-container max-w-md w-full mx-auto px-3 pt-5 pb-24 relative z-10">
+      <main className="flex-1 app-responsive-container max-w-md w-full mx-auto px-3 pt-5 pb-8 relative z-10">
         {!session ? (
           /* Screen 1: Upload / Setup Screen (Reference Screen 1) */
           <UploadSection
@@ -1248,19 +1308,10 @@ Export Timestamp: ${new Date().toLocaleString()}
         )}
       </main>
 
-      {/* Fixed Bottom Navigation (Reference Screen 1, 2, 3) */}
-      <BottomNav
-        activeTab={activeNavTab}
-        onChangeTab={handleBottomNavChange}
-      />
-
       {/* History Drawer Modal */}
       <HistoryModal
         isOpen={isHistoryOpen}
-        onClose={() => {
-          setIsHistoryOpen(false);
-          setActiveNavTab("home");
-        }}
+        onClose={() => setIsHistoryOpen(false)}
         session={session}
         onDownloadProgress={handleDownloadProgress}
         onReset={handleReset}
