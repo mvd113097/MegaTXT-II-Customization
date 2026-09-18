@@ -11,14 +11,18 @@ import { ProgressBar } from "./components/ProgressBar";
 import { TranslationQueueHub } from "./components/TranslationQueueHub";
 import { GlossaryModal } from "./components/GlossaryModal";
 import { ExportModal } from "./components/ExportModal";
-import { AuthGateModal } from "./components/AuthGateModal";
 import { TelegramSettingsModal } from "./components/TelegramSettingsModal";
-import { SettingsModal } from "./components/SettingsModal";
-import { CustomBackgroundLayer } from "./components/CustomBackgroundLayer";
+import { BottomNav } from "./components/BottomNav";
 import { HistoryModal } from "./components/HistoryModal";
 import { ActiveTranslationView } from "./components/ActiveTranslationView";
 import { TranslationCompleteView } from "./components/TranslationCompleteView";
-import { applyAppearanceToDOM, loadAppearanceConfig, syncSiteAppearanceToServer } from "./theme/visualAppearance";
+import { StoreView } from "./components/StoreView";
+import { ExploreView } from "./components/ExploreView";
+import {
+  PagodaHeaderIllustration,
+  SakuraFooterDecoration,
+} from "./components/illustrations/StorybookArtwork";
+import { PasswordGate } from "./components/PasswordGate";
 import {
   TextChunk,
   TranslationStyle,
@@ -82,161 +86,10 @@ export default function App() {
     } catch {
       // ignore
     }
-    // Clean legacy theme artifacts and apply visual appearance engine
-    try {
-      localStorage.removeItem("megatext_active_theme_id");
-      localStorage.removeItem("megatext_installed_themes_v1");
-      const rootEl = document.documentElement;
-      delete rootEl.dataset.megatextTheme;
-      delete rootEl.dataset.megatextThemeScene;
-      applyAppearanceToDOM(loadAppearanceConfig());
-    } catch {
-      // ignore
-    }
   }, [theme]);
 
-  // Listen for appearance changes across tabs or customizer events
-  useEffect(() => {
-    const handleAppearanceChange = () => {
-      try {
-        applyAppearanceToDOM(loadAppearanceConfig());
-      } catch (e) {
-        console.warn(e);
-      }
-    };
-    window.addEventListener("megatext_appearance_changed", handleAppearanceChange);
-    window.addEventListener("storage", handleAppearanceChange);
-    return () => {
-      window.removeEventListener("megatext_appearance_changed", handleAppearanceChange);
-      window.removeEventListener("storage", handleAppearanceChange);
-    };
-  }, []);
-
-  // Sync site appearance & background photo across devices (Phone A <-> Phone B)
-  useEffect(() => {
-    let isCancelled = false;
-
-    const fetchSharedAppearance = async () => {
-      try {
-        const res = await fetch("/api/site-appearance");
-        if (!res.ok) return;
-        const result = await res.json();
-        if (isCancelled || !result.success || !result.hasAppearance || !result.data) return;
-
-        const { config, customBg, bgBlur, bgOpacity, savedColors, theme: serverTheme } = result.data;
-
-        // Apply shared visual config if provided
-        if (config && typeof config === "object") {
-          localStorage.setItem("megatext_visual_appearance_v2", JSON.stringify(config));
-          applyAppearanceToDOM(config);
-          window.dispatchEvent(new CustomEvent("megatext_appearance_changed", { detail: config }));
-        }
-
-        // Apply shared custom background photo
-        if (typeof customBg === "string") {
-          if (customBg) {
-            localStorage.setItem("megatext_custom_bg", customBg);
-          } else {
-            localStorage.removeItem("megatext_custom_bg");
-          }
-          if (typeof bgBlur === "number") {
-            localStorage.setItem("megatext_bg_blur", String(bgBlur));
-          }
-          if (typeof bgOpacity === "number") {
-            localStorage.setItem("megatext_bg_opacity", String(bgOpacity));
-          }
-          window.dispatchEvent(new Event("megatext_bg_changed"));
-        }
-
-        // Apply shared saved custom colors palette
-        if (Array.isArray(savedColors)) {
-          localStorage.setItem("megatext_custom_saved_colors_v1", JSON.stringify(savedColors));
-        }
-
-        // Apply shared theme
-        if (serverTheme === "dark" || serverTheme === "light") {
-          setTheme((currentTheme) => {
-            if (currentTheme !== serverTheme) return serverTheme;
-            return currentTheme;
-          });
-        }
-      } catch (e) {
-        console.warn("Could not fetch shared appearance from server:", e);
-      }
-    };
-
-    fetchSharedAppearance();
-    // Re-check every 5 seconds and whenever window gains focus
-    const interval = setInterval(fetchSharedAppearance, 5000);
-    const handleFocus = () => fetchSharedAppearance();
-    window.addEventListener("focus", handleFocus);
-
-    return () => {
-      isCancelled = true;
-      clearInterval(interval);
-      window.removeEventListener("focus", handleFocus);
-    };
-  }, []);
-
   const toggleTheme = () => {
-    setTheme((prev) => {
-      const next = prev === "dark" ? "light" : "dark";
-      syncSiteAppearanceToServer({ theme: next });
-      return next;
-    });
-  };
-
-  // Authentication State
-  const [authToken, setAuthToken] = useState<string>(() => {
-    try {
-      return localStorage.getItem("megatext_auth_token") || "";
-    } catch {
-      return "";
-    }
-  });
-  const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
-  const [isAuthLoading, setIsAuthLoading] = useState(true);
-
-  // Check auth status on boot
-  const checkAuthStatus = async (tokenToCheck?: string) => {
-    const activeTok = tokenToCheck !== undefined ? tokenToCheck : authToken;
-    try {
-      const res = await fetch("/api/auth/status", {
-        headers: activeTok ? { Authorization: `Bearer ${activeTok}` } : {},
-      });
-      const data = await res.json();
-      setAuthStatus(data);
-      if (data.authenticated && activeTok) {
-        setAuthToken(activeTok);
-      }
-    } catch (e) {
-      console.warn("Auth status check warning:", e);
-    } finally {
-      setIsAuthLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    checkAuthStatus();
-  }, [authToken]);
-
-  const handleLogout = async () => {
-    try {
-      if (authToken) {
-        await fetch("/api/auth/logout", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${authToken}` },
-        });
-      }
-    } catch {}
-    localStorage.removeItem("megatext_auth_token");
-    setAuthToken("");
-    setAuthStatus((prev) => (prev ? { ...prev, authenticated: false, googleVerified: false, passcodeVerified: false } : null));
-    setToastData({
-      message: "🔒 Logged out successfully. Master lockscreen engaged.",
-      type: "warning",
-    });
-    setTimeout(() => setToastData(null), 4000);
+    setTheme((prev) => (prev === "dark" ? "light" : "dark"));
   };
 
   // Generate or retrieve persistent unique client/device session ID
@@ -253,17 +106,42 @@ export default function App() {
     }
   };
 
-  // Helper to attach authorization and session isolation headers
+  // Security & Auth Status
+  const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
+  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
+
+  // Helper to attach session isolation headers
   const getAuthHeaders = () => {
+    const token = typeof window !== "undefined" ? localStorage.getItem("megatext_auth_token") || "" : "";
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       "x-session-id": getClientSessionId(),
+      "x-auth-token": token,
+      "Authorization": token ? `Bearer ${token}` : "",
     };
-    if (authToken) {
-      headers["Authorization"] = `Bearer ${authToken}`;
+    if (session?.fileName) {
+      headers["x-novel-filename"] = encodeURIComponent(session.fileName);
     }
     return headers;
   };
+
+  // Check server auth status on initial load
+  useEffect(() => {
+    async function checkAuthStatus() {
+      try {
+        const res = await fetch("/api/auth/status", {
+          headers: getAuthHeaders(),
+        });
+        const data = await res.json();
+        setAuthStatus(data);
+      } catch (err) {
+        console.warn("Failed to check auth status:", err);
+      } finally {
+        setIsCheckingAuth(false);
+      }
+    }
+    checkAuthStatus();
+  }, []);
 
   // Translation Mode state: Option 1 (cloud) vs Option 2 (browser)
   const [mode, setMode] = useState<TranslationMode>(() => {
@@ -323,10 +201,21 @@ export default function App() {
   );
 
   // Modals & Navigation
+  const [activeNavTab, setActiveNavTab] = useState<"home" | "store" | "explore" | "history" | "settings">("home");
+  const [storeSearchTrigger, setStoreSearchTrigger] = useState<{ query: string; timestamp: number } | null>(null);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [isGlossaryOpen, setIsGlossaryOpen] = useState(false);
   const [isExportOpen, setIsExportOpen] = useState(false);
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isTelegramSettingsOpen, setIsTelegramSettingsOpen] = useState(false);
+
+  const handleBottomNavChange = (tab: "home" | "store" | "explore" | "history" | "settings") => {
+    setActiveNavTab(tab);
+    if (tab === "history") {
+      setIsHistoryOpen(true);
+    } else if (tab === "settings") {
+      setIsTelegramSettingsOpen(true);
+    }
+  };
   const [toastData, setToastData] = useState<{
     message: string;
     downloadUrl?: string;
@@ -363,9 +252,23 @@ export default function App() {
     }
   }, [session]);
 
+  const [isSyncingProgress, setIsSyncingProgress] = useState(false);
+
   // On-demand sync of full translated chapter texts for completed chunks
-  const syncCompletedTexts = async () => {
+  const syncCompletedTexts = async (force: boolean = false) => {
     if (mode !== "cloud") return;
+
+    // Data-saving optimization: If not forced, check if all completed chunks already have English text in memory
+    if (!force && chunksRef.current.length > 0) {
+      const missingCompletedText = chunksRef.current.some(
+        (c) => c.status === "completed" && (!c.englishText || !c.englishText.trim())
+      );
+      if (!missingCompletedText) {
+        // All completed chunks are already populated in memory — 0 KB network data used!
+        return;
+      }
+    }
+
     try {
       const res = await fetch("/api/cloud-job/sync-texts?completedOnly=true", {
         headers: getAuthHeaders(),
@@ -399,65 +302,168 @@ export default function App() {
     }
   };
 
-  // Auto-check and recover existing cloud job from server on initial load (or when authenticated)
-  useEffect(() => {
-    async function checkServerCloudJob() {
-      try {
-        const res = await fetch("/api/cloud-job/status?full=true", {
-          headers: getAuthHeaders(),
+  // High-performance Cloud Progress Synchronization:
+  // 1. Password Unlock: forceFullText=true instantly populates 50k+ translated words without page refresh
+  // 2. Tab Visibility / Focus: ~2 KB lightweight sync when returning after Telegram notifications
+  // 3. Manual Sync Button: pulls latest progress in milliseconds with live benchmark toast
+  const syncCloudProgress = async (forceFullText: boolean = false, showFeedbackToast: boolean = false) => {
+    const startTimeMs = performance.now();
+    setIsSyncingProgress(true);
+    try {
+      const url = forceFullText ? "/api/cloud-job/status?full=true" : "/api/cloud-job/status";
+      const res = await fetch(url, {
+        headers: getAuthHeaders(),
+      });
+      const data = await res.json();
+      const elapsedMs = Math.round(performance.now() - startTimeMs);
+
+      if (data.hasJob && data.job) {
+        const sJob = data.job;
+        setServerCloudJob(sJob);
+        const sortedChunks = sJob.chunks ? [...sJob.chunks].sort((a: any, b: any) => a.index - b.index) : [];
+
+        setSession((prev) => {
+          if (!prev || prev.fileName !== sJob.fileName) {
+            return {
+              fileName: sJob.fileName,
+              fileSizeBytes: sJob.fileSizeBytes || 0,
+              totalChineseChars: sJob.totalChineseChars || 0,
+              chunks: sortedChunks.map((c: any) => ({
+                id: c.id,
+                index: c.index,
+                chapterTitle: c.chapterTitle,
+                chineseText: c.chineseText || "",
+                englishText: c.englishText || "",
+                charCount: c.charCount || 0,
+                wordCount: c.wordCount || 0,
+                status: c.status,
+                hasEnglish: c.hasEnglish,
+                hasChinese: c.hasChinese,
+                attempts: c.attempts,
+                errorMessage: c.errorMessage,
+              })),
+              style: (sJob.style as TranslationStyle) || "xianxia",
+              customInstructions: sJob.customInstructions || "",
+              glossary: sJob.glossary || [],
+              mode: "cloud",
+              status: sJob.status,
+              createdAt: sJob.startedAt,
+              lastUpdated: sJob.lastActiveAt,
+              completedEnglishWords: sJob.completedEnglishWords,
+              completedChars: sJob.completedChars,
+              lastDownloadedWordCount: prev?.lastDownloadedWordCount,
+              lastDownloadedAt: prev?.lastDownloadedAt,
+            };
+          }
+
+          // Monotonic chapter merge: NEVER downgrade completed local chunks
+          const prevChunks = prev.chunks || [];
+          const merged = sortedChunks.map((incChunk: any) => {
+            const existing = prevChunks.find((c) => c.id === incChunk.id || c.index === incChunk.index);
+            const hasEnglishLocally = existing && existing.status === "completed" && existing.englishText && existing.englishText.trim().length > 0;
+            const hasEnglishServer = (incChunk.englishText && incChunk.englishText.trim().length > 0) || incChunk.hasEnglish || (incChunk.wordCount && incChunk.wordCount > 0);
+
+            // Never downgrade completed local chapter text
+            const mergedEnglish = (incChunk.englishText && incChunk.englishText.trim().length > 0)
+              ? incChunk.englishText
+              : (existing?.englishText || "");
+
+            const mergedChinese = incChunk.chineseText !== undefined && incChunk.chineseText.length > 0
+              ? incChunk.chineseText
+              : (existing?.chineseText || "");
+
+            const isDone = incChunk.status === "completed" || hasEnglishLocally || hasEnglishServer;
+            const finalWordCount = incChunk.wordCount ?? existing?.wordCount ?? (mergedEnglish ? countEnglishWords(mergedEnglish) : 0);
+            const finalCharCount = incChunk.charCount ?? existing?.charCount ?? 0;
+
+            return {
+              ...existing,
+              ...incChunk,
+              chineseText: mergedChinese,
+              englishText: mergedEnglish,
+              wordCount: finalWordCount,
+              charCount: finalCharCount,
+              status: isDone ? "completed" : incChunk.status,
+            };
+          }).sort((a: any, b: any) => a.index - b.index);
+
+          const allDone = merged.every((c: any) => c.status === "completed");
+          const finalStatus = (allDone || prev.status === "completed" || sJob.status === "completed") ? "completed" : sJob.status;
+
+          chunksRef.current = merged;
+          return {
+            ...prev,
+            status: finalStatus,
+            chunks: merged,
+            completedEnglishWords: sJob.completedEnglishWords,
+            completedChars: sJob.completedChars,
+            lastUpdated: Math.max(prev.lastUpdated || 0, sJob.lastActiveAt || 0),
+          };
         });
-        const data = await res.json();
-        if (data.hasJob && data.job) {
-          const sJob = data.job;
-          setServerCloudJob(sJob);
-          const sortedChunks = sJob.chunks ? [...sJob.chunks].sort((a: any, b: any) => a.index - b.index) : [];
-          setSession((prev) => {
-            const prevCompleted = prev?.chunks?.filter((c) => c.status === "completed").length || 0;
-            const serverCompleted = sJob.completedChunks || (sortedChunks.filter((c: any) => c.status === "completed").length);
-            if (!prev || prev.fileName === sJob.fileName || (serverCompleted > prevCompleted)) {
-              return {
-                fileName: sJob.fileName,
-                fileSizeBytes: sJob.fileSizeBytes || 0,
-                totalChineseChars: sJob.totalChineseChars || 0,
-                chunks: sortedChunks,
-                style: (sJob.style as TranslationStyle) || "xianxia",
-                customInstructions: sJob.customInstructions || "",
-                glossary: sJob.glossary || [],
-                mode: "cloud",
-                status: sJob.status,
-                createdAt: sJob.startedAt,
-                lastUpdated: sJob.lastActiveAt,
-                lastDownloadedWordCount: prev?.lastDownloadedWordCount,
-                lastDownloadedAt: prev?.lastDownloadedAt,
-              };
-            }
-            return prev;
-          });
-          chunksRef.current = sortedChunks;
-          if (typeof sJob.concurrency === "number" && sJob.concurrency >= 1 && sJob.concurrency <= 5) {
-            setConcurrency(sJob.concurrency);
-            try {
-              localStorage.setItem("megatext_concurrency", String(sJob.concurrency));
-            } catch {}
-          }
-          if (sJob.status === "running") {
-            setIsRunning(true);
-            setIsPaused(false);
-          } else if (sJob.status === "paused") {
-            setIsRunning(false);
-            setIsPaused(true);
-          } else if (sJob.status === "completed") {
-            setIsRunning(false);
-            setIsPaused(false);
-            syncCompletedTexts();
-          }
+
+        if (typeof sJob.concurrency === "number" && sJob.concurrency >= 1 && sJob.concurrency <= 5) {
+          setConcurrency(sJob.concurrency);
+          try {
+            localStorage.setItem("megatext_concurrency", String(sJob.concurrency));
+          } catch {}
         }
-      } catch (err) {
-        console.warn("Could not check cloud job on server:", err);
+
+        if (sJob.status === "running") {
+          setIsRunning(true);
+          setIsPaused(false);
+        } else if (sJob.status === "paused") {
+          setIsRunning(false);
+          setIsPaused(true);
+        } else if (sJob.status === "completed") {
+          setIsRunning(false);
+          setIsPaused(false);
+        }
+
+        if (forceFullText) {
+          syncCompletedTexts(true);
+        }
+
+        if (showFeedbackToast) {
+          const completedCount = Math.max(
+            sJob.completedChunks || 0,
+            sortedChunks.filter((c: any) => c.status === "completed" || c.hasEnglish).length
+          );
+          const totalCount = sJob.totalChunks || sortedChunks.length;
+          const wordsReady = sJob.completedEnglishWords || sortedChunks.reduce((acc: number, c: any) => acc + (c.wordCount || 0), 0);
+          setToastData({
+            message: `Synced in ${elapsedMs}ms (~2 KB): ${completedCount}/${totalCount} chapters ready (${wordsReady.toLocaleString()} English words)`,
+            type: "success",
+          });
+          setTimeout(() => {
+            setToastData((t) => (t && t.message.includes("Synced in") ? null : t));
+          }, 3500);
+        }
+      } else if (showFeedbackToast) {
+        setToastData({
+          message: `Synced in ${elapsedMs}ms: Workspace is up-to-date`,
+          type: "success",
+        });
+        setTimeout(() => {
+          setToastData((t) => (t && t.message.includes("Synced in") ? null : t));
+        }, 3000);
       }
+    } catch (err) {
+      console.warn("Cloud progress sync error:", err);
+      if (showFeedbackToast) {
+        setToastData({
+          message: "Unable to sync progress. Please check your network connection.",
+          type: "warning",
+        });
+      }
+    } finally {
+      setIsSyncingProgress(false);
     }
-    checkServerCloudJob();
-  }, [authToken]);
+  };
+
+  // Auto-check and recover existing cloud job from server on initial load (Lightweight ~2 KB mode, saves 95%+ data)
+  useEffect(() => {
+    syncCloudProgress(false, false);
+  }, []);
 
   // Load existing server job explicitly if requested
   const handleLoadServerJob = () => {
@@ -484,71 +490,80 @@ export default function App() {
       setIsRunning(false);
       setIsPaused(false);
     }
-    syncCompletedTexts();
+    syncCompletedTexts(true);
   };
 
-  // Cloud polling loop: polls lightweight status (~1.5KB compressed) to save 99.9% mobile data
+  // Tab Visibility & Window Focus Listener:
+  // Automatically triggers a lightweight progress sync (~2 KB) whenever you re-open or switch back
+  // to the browser tab after getting a Telegram notification or multitasking.
   useEffect(() => {
     if (mode !== "cloud") return;
-    const interval = setInterval(async () => {
-      try {
-        const res = await fetch("/api/cloud-job/status", {
-          headers: getAuthHeaders(),
-        });
-        const data = await res.json();
-        if (data.hasJob && data.job) {
-          const sJob = data.job;
-          setServerCloudJob(sJob);
-          let needsTextSync = false;
 
-          setSession((prev) => {
-            if (!prev || prev.fileName !== sJob.fileName) return prev;
-            const prevChunks = prev.chunks || [];
-            const mergedChunks = sJob.chunks.map((incChunk: any) => {
-              const existing = prevChunks.find((c) => c.id === incChunk.id || c.index === incChunk.index);
-              const hasEnglishLocally = existing && existing.englishText && existing.englishText.trim().length > 0;
-              if (incChunk.hasEnglish && !hasEnglishLocally) {
-                needsTextSync = true;
-              }
-              return {
-                ...existing,
-                ...incChunk,
-                chineseText: incChunk.chineseText !== undefined ? incChunk.chineseText : (existing?.chineseText || ""),
-                englishText: incChunk.englishText !== undefined ? incChunk.englishText : (existing?.englishText || ""),
-              };
-            }).sort((a: any, b: any) => a.index - b.index);
-
-            chunksRef.current = mergedChunks;
-            return {
-              ...prev,
-              status: sJob.status,
-              chunks: mergedChunks,
-              lastUpdated: sJob.lastActiveAt,
-            };
-          });
-
-          if (needsTextSync) {
-            syncCompletedTexts();
-          }
-
-          if (sJob.status === "running") {
-            setIsRunning(true);
-            setIsPaused(false);
-          } else if (sJob.status === "paused") {
-            setIsRunning(false);
-            setIsPaused(true);
-          } else if (sJob.status === "completed" || sJob.status === "idle") {
-            setIsRunning(false);
-            setIsPaused(false);
-          }
-        }
-      } catch (err) {
-        // silent poll error
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === "visible") {
+        syncCloudProgress(false, false);
       }
-    }, 2500);
+    };
 
-    return () => clearInterval(interval);
-  }, [mode, authToken]);
+    let intervalTime = typeof document !== "undefined" && document.hidden ? 15000 : 5000;
+    let timer = setInterval(() => {
+      syncCloudProgress(false, false);
+    }, intervalTime);
+
+    const handleVisibilityChange = () => {
+      clearInterval(timer);
+      if (document.hidden) {
+        timer = setInterval(() => {
+          syncCloudProgress(false, false);
+        }, 15000);
+      } else {
+        // Instantly poll on tab focus so UI is immediately up-to-date
+        syncCloudProgress(false, false);
+        timer = setInterval(() => {
+          syncCloudProgress(false, false);
+        }, 5000);
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", handleVisibilityOrFocus);
+
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", handleVisibilityOrFocus);
+    };
+  }, [mode]);
+
+  // Dynamic Browser Wake-Lock & Keep-Alive (Method 3)
+  // When a translation is actively running, sends a tiny keep-alive pulse every 90 seconds
+  // Automatically stops immediately when translation completes or is paused so the server can sleep.
+  useEffect(() => {
+    if (!isRunning || isPaused) return;
+
+    // Optional browser screen wake-lock (keeps phone screen / device active if supported)
+    let wakeLockSentinel: any = null;
+    if ("wakeLock" in navigator && (navigator as any).wakeLock?.request) {
+      (navigator as any).wakeLock.request("screen").then((sentinel: any) => {
+        wakeLockSentinel = sentinel;
+      }).catch(() => {
+        // Wake-lock denied or unsupported; HTTP heartbeat handles container keep-alive
+      });
+    }
+
+    const keepAliveInterval = setInterval(() => {
+      fetch("/api/heartbeat").catch(() => {
+        // Silent catch for background heartbeat
+      });
+    }, 90000); // 90 seconds (well before Cloud Run's 10-15 minute idle timeout)
+
+    return () => {
+      clearInterval(keepAliveInterval);
+      if (wakeLockSentinel && wakeLockSentinel.release) {
+        wakeLockSentinel.release().catch(() => {});
+      }
+    };
+  }, [isRunning, isPaused]);
 
   // Handle file or text load
   const handleLoadText = (
@@ -615,6 +630,27 @@ export default function App() {
     setIsStarting(true);
 
     try {
+      // 1. Try lightweight resume first (avoids sending 8-9MB payload if job exists on server)
+      const resumeRes = await fetch("/api/cloud-job/resume", {
+        method: "POST",
+        headers: getAuthHeaders(),
+      });
+
+      if (resumeRes.ok) {
+        const resumeData = await resumeRes.json();
+        if (resumeData && resumeData.success) {
+          setIsRunning(true);
+          setIsPaused(false);
+          setToastData({
+            message: "☁️ Cloud Mode Resumed: The server is actively translating your novel in the background.",
+            type: "success",
+          });
+          setTimeout(() => setToastData(null), 8000);
+          return;
+        }
+      }
+
+      // 2. If job not found on server or needs initial launch, send start request
       const res = await fetch("/api/cloud-job/start", {
         method: "POST",
         headers: getAuthHeaders(),
@@ -987,6 +1023,14 @@ export default function App() {
     }
   };
 
+  // Open Export Modal with automated background text synchronization if in cloud mode
+  const handleOpenExport = async () => {
+    if (mode === "cloud") {
+      syncCompletedTexts();
+    }
+    setIsExportOpen(true);
+  };
+
   // Dedicated progress downloader: downloads strictly the unbroken continuous chapters from Chapter 1 without stopping background translation
   const handleDownloadProgress = async (format: "epub" | "txt" = "epub") => {
     if (!session) return;
@@ -1111,28 +1155,40 @@ Export Timestamp: ${new Date().toLocaleString()}
   };
 
   // Calculate real-time metrics
-  const totalChunks = session?.chunks.length || 0;
-  const completedChunks =
-    session?.chunks.filter((c) => c.status === "completed").length || 0;
+  const totalChunks = session?.chunks.length || (serverCloudJob && serverCloudJob.fileName === session?.fileName ? serverCloudJob.totalChunks : 0) || 0;
+  const completedChunks = Math.max(
+    (serverCloudJob && serverCloudJob.fileName === session?.fileName ? serverCloudJob.completedChunks : 0) || 0,
+    session?.chunks.filter((c) => c.status === "completed").length || 0
+  );
   const inProgressChunks =
     session?.chunks.filter((c) => c.status === "processing").length || 0;
   const errorChunks =
     session?.chunks.filter((c) => c.status === "error").length || 0;
 
-  const totalChineseChars = session?.totalChineseChars || 0;
-  const completedChars =
+  const totalChineseChars = session?.totalChineseChars || (serverCloudJob && serverCloudJob.fileName === session?.fileName ? serverCloudJob.totalChineseChars : 0) || 0;
+  const completedChars = Math.max(
+    (serverCloudJob && serverCloudJob.fileName === session?.fileName ? serverCloudJob.completedChars : 0) || 0,
+    session?.completedChars || 0,
     session?.chunks
       .filter((c) => c.status === "completed")
-      .reduce((acc, curr) => acc + curr.charCount, 0) || 0;
+      .reduce((acc, curr) => acc + (curr.charCount || 0), 0) || 0
+  );
 
-  // Calculate total English words produced so far
-  const completedEnglishWords =
-    session?.chunks
-      .filter((c) => c.status === "completed")
-      .reduce(
-        (acc, curr) => acc + (curr.wordCount || countEnglishWords(curr.englishText)),
-        0
-      ) || 0;
+  // Calculate total English words produced so far:
+  // Dynamically uses server calculation, session metric, or chunk wordCount/englishText
+  const calculatedChunkWords = session?.chunks
+    .filter((c) => c.status === "completed")
+    .reduce(
+      (acc, curr) =>
+        acc + (curr.wordCount || (curr.englishText ? countEnglishWords(curr.englishText) : 0)),
+      0
+    ) || 0;
+
+  const completedEnglishWords = Math.max(
+    (serverCloudJob && serverCloudJob.fileName === session?.fileName ? serverCloudJob.completedEnglishWords : 0) || 0,
+    session?.completedEnglishWords || 0,
+    calculatedChunkWords
+  );
 
   const lastDownloadedWordCount = session?.lastDownloadedWordCount || 0;
   const newWordsSinceLastDownload = Math.max(
@@ -1186,10 +1242,45 @@ Export Timestamp: ${new Date().toLocaleString()}
     estimatedRemainingSeconds,
   };
 
+  if (isCheckingAuth) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center text-slate-300">
+        <div className="flex items-center gap-3 bg-slate-900/90 px-6 py-4 rounded-2xl border border-slate-800 shadow-2xl">
+          <RefreshCw className="w-5 h-5 animate-spin text-purple-400" />
+          <span className="text-sm font-semibold text-slate-200">Checking security status...</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (authStatus?.requiresPasscode && !authStatus?.passcodeVerified) {
+    return (
+      <PasswordGate
+        onUnlockSuccess={(token) => {
+          if (token) {
+            try {
+              localStorage.setItem("megatext_auth_token", token);
+            } catch {}
+          }
+          setAuthStatus({
+            authenticated: true,
+            requiresGoogle: false,
+            requiresPasscode: true,
+            googleVerified: true,
+            passcodeVerified: true,
+            hasPasscodeConfigured: true,
+          });
+          // Auto-fetch progress immediately on password unlock: loads the latest cloud job status and full texts
+          syncCloudProgress(true, false);
+        }}
+      />
+    );
+  }
+
   return (
-    <div className="min-h-screen w-full overflow-x-hidden storybook-page-surface dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col font-sans transition-colors duration-200 relative selection:bg-purple-200 selection:text-purple-900">
-      {/* Custom User Background Photo Layer (if set) */}
-      <CustomBackgroundLayer />
+    <div className="min-h-screen w-full overflow-x-hidden bg-[#FAF8FE] dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col font-sans transition-colors duration-200 relative selection:bg-purple-200 selection:text-purple-900">
+      {/* Pagoda Landscape Header Backdrop (Illustrated Storybook Spec) */}
+      <PagodaHeaderIllustration />
 
       {/* Navigation header */}
       <Navbar
@@ -1202,116 +1293,136 @@ Export Timestamp: ${new Date().toLocaleString()}
         totalChunks={totalChunks}
         onReset={handleReset}
         onOpenGlossary={() => setIsGlossaryOpen(true)}
-        onOpenHistory={() => setIsHistoryOpen(true)}
-        onOpenTelegramSettings={() => setIsSettingsOpen(true)}
+        onOpenTelegramSettings={() => setIsTelegramSettingsOpen(true)}
         glossaryCount={glossary.length}
         theme={theme}
         onToggleTheme={toggleTheme}
-        userEmail={authStatus?.userEmail}
-        onLogout={handleLogout}
       />
 
-      {/* Full-screen Master Passcode Security Gate */}
-      {!isAuthLoading && authStatus && !authStatus.authenticated && (
-        <AuthGateModal
-          authStatus={authStatus}
-          onLoginSuccess={(token) => {
-            setAuthToken(token);
-            setAuthStatus((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    authenticated: true,
-                    passcodeVerified: true,
-                  }
-                : null
-            );
-            checkAuthStatus(token);
-            setToastData({
-              message: "🔓 Access granted. Workspace unlocked!",
-              type: "success",
-            });
-            setTimeout(() => setToastData(null), 4000);
-          }}
-        />
-      )}
+      {/* Main Screen Canvas */}
+      <main className={`flex-1 w-full mx-auto px-3 sm:px-4 pt-3 pb-24 relative z-10 ${
+        activeNavTab === "store" || activeNavTab === "explore" ? "max-w-4xl" : "max-w-md"
+      }`}>
+        {/* Store Tab View */}
+        <div className={activeNavTab === "store" ? "block" : "hidden"}>
+          <StoreView
+            onImportNovel={(title, rawText) => {
+              handleLoadText(rawText, title, 3000, true);
+              setActiveNavTab("home");
+            }}
+            getAuthHeaders={getAuthHeaders}
+            externalSearchTrigger={storeSearchTrigger}
+          />
+        </div>
 
-      {/* Mobile-first Main Screen Canvas (Reference 3 Screens) */}
-      <main className="flex-1 app-responsive-container max-w-md w-full mx-auto px-3 pt-5 pb-8 relative z-10">
-        {!session ? (
-          /* Screen 1: Upload / Setup Screen (Reference Screen 1) */
-          <UploadSection
-            onLoadText={handleLoadText}
-            serverJob={serverCloudJob}
-            onLoadServerJob={handleLoadServerJob}
-          />
-        ) : isCompleted ? (
-          /* Screen 3: Dedicated Translation Complete Screen (Reference Screen 3) */
-          <TranslationCompleteView
-            session={session}
-            metrics={metrics}
-            mode={mode}
-            style={style}
-            concurrency={concurrency}
-            onDownloadProgress={handleDownloadProgress}
-            onOpenExport={() => setIsExportOpen(true)}
-            onReset={handleReset}
-          />
-        ) : (
-          /* Screen 2: Active Translation Screen (Reference Screen 2) */
-          <ActiveTranslationView
-            session={session}
-            metrics={metrics}
-            mode={mode}
-            onChangeMode={handleModeChange}
-            style={style}
-            onChangeStyle={(s) => {
-              setStyle(s);
-              setSession((prev) => (prev ? { ...prev, style: s } : null));
+        {/* Explore & Leaderboards Tab View */}
+        <div className={activeNavTab === "explore" ? "block" : "hidden"}>
+          <ExploreView
+            onImportNovel={(title, rawText) => {
+              handleLoadText(rawText, title, 3000, true);
+              setActiveNavTab("home");
             }}
-            customInstructions={customInstructions}
-            onChangeCustomInstructions={(inst) => {
-              setCustomInstructions(inst);
-              setSession((prev) =>
-                prev ? { ...prev, customInstructions: inst } : null
-              );
+            getAuthHeaders={getAuthHeaders}
+            onSearchStore={(keyword) => {
+              setStoreSearchTrigger({ query: keyword, timestamp: Date.now() });
+              setActiveNavTab("store");
             }}
-            concurrency={concurrency}
-            onChangeConcurrency={(newConc) => {
-              setConcurrency(newConc);
-              try {
-                localStorage.setItem("megatext_concurrency", String(newConc));
-              } catch {}
-              if (mode === "cloud" && session) {
-                fetch("/api/cloud-job/update-settings", {
-                  method: "POST",
-                  headers: getAuthHeaders(),
-                  body: JSON.stringify({ concurrency: newConc }),
-                }).catch(() => {});
-              }
-            }}
-            isRunning={isRunning}
-            isPaused={isPaused}
-            isStarting={isStarting}
-            onStart={handleStart}
-            onPause={handlePause}
-            onResume={handleResume}
-            onTranslateNext={handleTranslateNextSingle}
-            onRetryFailed={handleRetryFailed}
-            onOpenExport={() => setIsExportOpen(true)}
-            onDownloadProgress={handleDownloadProgress}
-            onTranslateChunk={handleTranslateSpecificChunk}
-            onReset={handleReset}
-            completedEnglishWords={completedEnglishWords}
-            lastDownloadedWords={lastDownloadedWordCount}
           />
-        )}
+        </div>
+
+        {/* Home Tab Views (Upload / Translating / Completed) */}
+        <div className={activeNavTab === "home" ? "block" : "hidden"}>
+          {!session ? (
+            /* Screen 1: Upload / Setup Screen (Reference Screen 1) */
+            <UploadSection
+              onLoadText={handleLoadText}
+              serverJob={serverCloudJob}
+              onLoadServerJob={handleLoadServerJob}
+            />
+          ) : isCompleted ? (
+            /* Screen 3: Dedicated Translation Complete Screen (Reference Screen 3) */
+            <TranslationCompleteView
+              session={session}
+              metrics={metrics}
+              mode={mode}
+              style={style}
+              concurrency={concurrency}
+              onDownloadProgress={handleDownloadProgress}
+              onOpenExport={handleOpenExport}
+              onReset={handleReset}
+              onSyncProgress={() => syncCloudProgress(false, true)}
+              isSyncing={isSyncingProgress}
+            />
+          ) : (
+            /* Screen 2: Active Translation Screen (Reference Screen 2) */
+            <ActiveTranslationView
+              session={session}
+              metrics={metrics}
+              mode={mode}
+              onChangeMode={handleModeChange}
+              style={style}
+              onChangeStyle={(s) => {
+                setStyle(s);
+                setSession((prev) => (prev ? { ...prev, style: s } : null));
+              }}
+              customInstructions={customInstructions}
+              onChangeCustomInstructions={(inst) => {
+                setCustomInstructions(inst);
+                setSession((prev) =>
+                  prev ? { ...prev, customInstructions: inst } : null
+                );
+              }}
+              concurrency={concurrency}
+              onChangeConcurrency={(newConc) => {
+                setConcurrency(newConc);
+                try {
+                  localStorage.setItem("megatext_concurrency", String(newConc));
+                } catch {}
+                if (mode === "cloud" && session) {
+                  fetch("/api/cloud-job/update-settings", {
+                    method: "POST",
+                    headers: getAuthHeaders(),
+                    body: JSON.stringify({ concurrency: newConc }),
+                  }).catch(() => {});
+                }
+              }}
+              isRunning={isRunning}
+              isPaused={isPaused}
+              isStarting={isStarting}
+              onStart={handleStart}
+              onPause={handlePause}
+              onResume={handleResume}
+              onTranslateNext={handleTranslateNextSingle}
+              onRetryFailed={handleRetryFailed}
+              onOpenExport={handleOpenExport}
+              onDownloadProgress={handleDownloadProgress}
+              onTranslateChunk={handleTranslateSpecificChunk}
+              onReset={handleReset}
+              completedEnglishWords={completedEnglishWords}
+              lastDownloadedWords={lastDownloadedWordCount}
+              onSyncProgress={() => syncCloudProgress(false, true)}
+              isSyncing={isSyncingProgress}
+            />
+          )}
+        </div>
       </main>
+
+      {/* Floating Sakura Petals Bottom Decoration */}
+      <SakuraFooterDecoration />
+
+      {/* Fixed Bottom Navigation (Reference Screen 1, 2, 3) */}
+      <BottomNav
+        activeTab={activeNavTab}
+        onChangeTab={handleBottomNavChange}
+      />
 
       {/* History Drawer Modal */}
       <HistoryModal
         isOpen={isHistoryOpen}
-        onClose={() => setIsHistoryOpen(false)}
+        onClose={() => {
+          setIsHistoryOpen(false);
+          setActiveNavTab("home");
+        }}
         session={session}
         onDownloadProgress={handleDownloadProgress}
         onReset={handleReset}
@@ -1341,18 +1452,13 @@ Export Timestamp: ${new Date().toLocaleString()}
         />
       )}
 
-      {/* Comprehensive Clean Settings Modal */}
-      <SettingsModal
-        isOpen={isSettingsOpen}
-        onClose={() => setIsSettingsOpen(false)}
-        onOpenGlossary={() => setIsGlossaryOpen(true)}
-        concurrency={concurrency}
-        onChangeConcurrency={(n) => {
-          setConcurrency(n);
-          localStorage.setItem("megatext_concurrency", String(n));
+      {/* Telegram Notifications Settings Modal */}
+      <TelegramSettingsModal
+        isOpen={isTelegramSettingsOpen}
+        onClose={() => {
+          setIsTelegramSettingsOpen(false);
+          setActiveNavTab("home");
         }}
-        theme={theme}
-        onToggleTheme={toggleTheme}
       />
 
       {/* Floating Toast notification when user downloads progress or gets a status alert */}

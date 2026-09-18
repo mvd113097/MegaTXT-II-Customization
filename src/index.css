@@ -5,7 +5,7 @@
 @layer base {
   html, body {
     @apply w-full overflow-x-hidden antialiased;
-    font-family: var(--custom-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   }
   
   html.dark body {
@@ -17,7 +17,20 @@
   }
 }
 
-/* Custom smooth scrollbar */
+/* Soft pastel glassmorphism and subtle cloud glow utilities */
+.pastel-card {
+  @apply rounded-3xl border transition-all duration-200;
+}
+
+.pastel-card-light {
+  @apply bg-white/95 border-purple-100/80 shadow-sm shadow-purple-500/5;
+}
+
+.dark .pastel-card-light {
+  @apply bg-slate-900/90 border-purple-900/40 shadow-none;
+}
+
+/* Custom smooth scrollbar for chapter lists on mobile */
 ::-webkit-scrollbar {
   width: 5px;
   height: 5px;
@@ -28,270 +41,10 @@
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(167, 139, 250, 0.35);
+  background: rgba(167, 139, 250, 0.3);
   border-radius: 9999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(167, 139, 250, 0.6);
-}
-
-/* Storybook page surface background */
-.storybook-page-surface {
-  background:
-    radial-gradient(circle at 15% 8%, rgba(255, 205, 235, 0.30), transparent 26%),
-    radial-gradient(circle at 85% 16%, rgba(190, 220, 255, 0.34), transparent 28%),
-    #FAF8FE;
-}
-
-.dark .storybook-page-surface {
-  background:
-    radial-gradient(circle at 15% 8%, rgba(147, 51, 234, 0.12), transparent 30%),
-    radial-gradient(circle at 85% 16%, rgba(59, 130, 246, 0.10), transparent 30%),
-    #0E0A1A;
-}
-
-@media (max-width: 640px) {
-  .storybook-page-surface {
-    min-height: 100dvh;
-  }
-}
-
-html[data-has-custom-bg="true"] body,
-html[data-has-custom-bg="true"] .storybook-page-surface {
-  background: transparent !important;
-  background-color: transparent !important;
-}
-
-/* =========================================================
-   Live Customizable Appearance Variables & Glass Engine
-   ========================================================= */
-:root {
-  --custom-card-bg: rgba(255, 255, 255, 0.40);
-  --custom-card-blur: 16px;
-  --custom-subcard-bg: rgba(255, 255, 255, 0.28);
-  --custom-subcard-blur: 10px;
-  --custom-card-border: rgba(255, 255, 255, 0.75);
-  --custom-card-border-width: 1px;
-  --custom-card-radius: 28px;
-  --custom-card-padding: 16px 20px;
-  --custom-card-shadow: 0 16px 40px rgba(139, 92, 246, 0.1), inset 0 1px 2px rgba(255, 255, 255, 0.9);
-  --custom-btn-gradient: linear-gradient(to right, #9333ea, #ec4899);
-  --custom-btn-radius: 18px;
-  --custom-btn-padding: 14px 20px;
-  --custom-btn-font-size: 14px;
-  --custom-app-max-width: 460px;
-  --custom-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  --custom-text-primary: #1e1b4b;
-  --custom-text-heading: #0f0c29;
-  --custom-text-accent: #9333ea;
-  --custom-text-muted: rgba(30, 27, 75, 0.80);
-  --custom-text-subtle: rgba(30, 27, 75, 0.60);
-  --custom-text-shadow: none;
-  --custom-heading-shadow: none;
-}
-
-.dark {
-  --custom-card-bg: rgba(15, 12, 28, 0.55);
-  --custom-subcard-bg: rgba(25, 20, 45, 0.45);
-  --custom-card-border: rgba(255, 255, 255, 0.14);
-  --custom-card-shadow: 0 16px 44px rgba(0, 0, 0, 0.55), inset 0 1px 1px rgba(255, 255, 255, 0.1);
-  --custom-text-primary: #f8fafc;
-  --custom-text-heading: #ffffff;
-  --custom-text-accent: #f472b6;
-  --custom-text-muted: rgba(248, 250, 252, 0.80);
-  --custom-text-subtle: rgba(248, 250, 252, 0.60);
-}
-
-/* Glassmorphism Card System */
-.upload-screen-shell,
-.glass-panel-card {
-  border-width: var(--custom-card-border-width, 1px) !important;
-  border-style: solid !important;
-  border-color: var(--custom-card-border, rgba(255, 255, 255, 0.75)) !important;
-  border-radius: var(--custom-card-radius, 28px) !important;
-  background: var(--custom-card-bg, rgba(255, 255, 255, 0.40)) !important;
-  backdrop-filter: blur(var(--custom-card-blur, 16px)) !important;
-  -webkit-backdrop-filter: blur(var(--custom-card-blur, 16px)) !important;
-  box-shadow: var(--custom-card-shadow) !important;
-  padding: var(--custom-card-padding, 16px 20px) !important;
-  transition: background 0.2s ease, backdrop-filter 0.2s ease, border-color 0.2s ease, border-radius 0.2s ease, padding 0.2s ease;
-}
-
-/* Individual Card Specific Overrides (Complete, Progress, Header, Queue, Upload) */
-.complete-card-style,
-.card-target-complete {
-  background: var(--card-complete-bg, var(--custom-card-bg)) !important;
-  backdrop-filter: blur(var(--card-complete-blur, var(--custom-card-blur))) !important;
-  -webkit-backdrop-filter: blur(var(--card-complete-blur, var(--custom-card-blur))) !important;
-  border-width: var(--card-complete-border-width, var(--custom-card-border-width, 1px)) !important;
-  border-style: solid !important;
-  border-color: var(--card-complete-border, var(--custom-card-border)) !important;
-  border-radius: var(--card-complete-radius, var(--custom-card-radius, 28px)) !important;
-  padding: var(--card-complete-padding, var(--custom-card-padding, 16px 20px)) !important;
-  box-shadow: var(--card-complete-shadow, var(--custom-card-shadow)) !important;
-  transition: background 0.2s ease, backdrop-filter 0.2s ease, border-color 0.2s ease, border-radius 0.2s ease, padding 0.2s ease;
-}
-
-.card-target-progress {
-  background: var(--card-progress-bg, var(--custom-card-bg)) !important;
-  backdrop-filter: blur(var(--card-progress-blur, var(--custom-card-blur))) !important;
-  -webkit-backdrop-filter: blur(var(--card-progress-blur, var(--custom-card-blur))) !important;
-  border-width: var(--card-progress-border-width, var(--custom-card-border-width, 1px)) !important;
-  border-style: solid !important;
-  border-color: var(--card-progress-border, var(--custom-card-border)) !important;
-  border-radius: var(--card-progress-radius, var(--custom-card-radius, 28px)) !important;
-  padding: var(--card-progress-padding, var(--custom-card-padding, 16px 20px)) !important;
-  box-shadow: var(--card-progress-shadow, var(--custom-card-shadow)) !important;
-  transition: background 0.2s ease, backdrop-filter 0.2s ease, border-color 0.2s ease, border-radius 0.2s ease, padding 0.2s ease;
-}
-
-.card-target-header {
-  background: var(--card-header-bg, var(--custom-card-bg)) !important;
-  backdrop-filter: blur(var(--card-header-blur, var(--custom-card-blur))) !important;
-  -webkit-backdrop-filter: blur(var(--card-header-blur, var(--custom-card-blur))) !important;
-  border-width: var(--card-header-border-width, var(--custom-card-border-width, 1px)) !important;
-  border-style: solid !important;
-  border-color: var(--card-header-border, var(--custom-card-border)) !important;
-  border-radius: var(--card-header-radius, var(--custom-card-radius, 28px)) !important;
-  padding: var(--card-header-padding, var(--custom-card-padding, 16px 20px)) !important;
-  box-shadow: var(--card-header-shadow, var(--custom-card-shadow)) !important;
-  transition: background 0.2s ease, backdrop-filter 0.2s ease, border-color 0.2s ease, border-radius 0.2s ease, padding 0.2s ease;
-}
-
-.card-target-queue {
-  background: var(--card-queue-bg, var(--custom-card-bg)) !important;
-  backdrop-filter: blur(var(--card-queue-blur, var(--custom-card-blur))) !important;
-  -webkit-backdrop-filter: blur(var(--card-queue-blur, var(--custom-card-blur))) !important;
-  border-width: var(--card-queue-border-width, var(--custom-card-border-width, 1px)) !important;
-  border-style: solid !important;
-  border-color: var(--card-queue-border, var(--custom-card-border)) !important;
-  border-radius: var(--card-queue-radius, var(--custom-card-radius, 28px)) !important;
-  padding: var(--card-queue-padding, var(--custom-card-padding, 16px 20px)) !important;
-  box-shadow: var(--card-queue-shadow, var(--custom-card-shadow)) !important;
-  transition: background 0.2s ease, backdrop-filter 0.2s ease, border-color 0.2s ease, border-radius 0.2s ease, padding 0.2s ease;
-}
-
-.card-target-upload {
-  background: var(--card-upload-bg, var(--custom-card-bg)) !important;
-  backdrop-filter: blur(var(--card-upload-blur, var(--custom-card-blur))) !important;
-  -webkit-backdrop-filter: blur(var(--card-upload-blur, var(--custom-card-blur))) !important;
-  border-width: var(--card-upload-border-width, var(--custom-card-border-width, 1px)) !important;
-  border-style: solid !important;
-  border-color: var(--card-upload-border, var(--custom-card-border)) !important;
-  border-radius: var(--card-upload-radius, var(--custom-card-radius, 28px)) !important;
-  padding: var(--card-upload-padding, var(--custom-card-padding, 16px 20px)) !important;
-  box-shadow: var(--card-upload-shadow, var(--custom-card-shadow)) !important;
-  transition: background 0.2s ease, backdrop-filter 0.2s ease, border-color 0.2s ease, border-radius 0.2s ease, padding 0.2s ease;
-}
-
-.subcard-glass,
-.glass-sub-panel {
-  background: var(--custom-subcard-bg, rgba(255, 255, 255, 0.28)) !important;
-  backdrop-filter: blur(var(--custom-subcard-blur, 10px)) !important;
-  -webkit-backdrop-filter: blur(var(--custom-subcard-blur, 10px)) !important;
-  border-radius: calc(var(--custom-card-radius, 28px) * 0.7) !important;
-}
-
-.custom-btn-gradient,
-.btn-primary-gradient {
-  background: var(--custom-btn-gradient, linear-gradient(to right, #9333ea, #ec4899)) !important;
-  border-radius: var(--custom-btn-radius, 18px) !important;
-  padding: var(--custom-btn-padding, 14px 20px) !important;
-  font-size: var(--custom-btn-font-size, 14px) !important;
-}
-
-.app-responsive-container {
-  max-width: var(--custom-app-max-width, 460px) !important;
-}
-
-/* =========================================================
-   Typography & Universal Font Color Application
-   ========================================================= */
-body {
-  font-family: var(--custom-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif) !important;
-  color: var(--custom-text-primary) !important;
-}
-
-/* Primary text & Headings */
-h1, h2, h3, h4, h5, h6,
-.app-heading-text,
-.app-custom-text-heading {
-  color: var(--custom-text-heading) !important;
-  text-shadow: var(--custom-heading-shadow, none) !important;
-}
-
-.app-custom-text-primary,
-.text-slate-950,
-.text-slate-900,
-.text-slate-800,
-.text-slate-700,
-.dark .text-slate-100,
-.dark .text-slate-200,
-.dark .text-white {
-  color: var(--custom-text-primary) !important;
-  text-shadow: var(--custom-text-shadow, none);
-}
-
-.text-slate-600,
-.text-slate-500,
-.dark .text-slate-300,
-.dark .text-slate-400 {
-  color: var(--custom-text-muted, var(--custom-text-primary)) !important;
-  text-shadow: var(--custom-text-shadow, none);
-}
-
-.text-slate-400,
-.text-slate-300,
-.dark .text-slate-500,
-.dark .text-slate-600 {
-  color: var(--custom-text-subtle, var(--custom-text-primary)) !important;
-  text-shadow: var(--custom-text-shadow, none);
-}
-
-.text-purple-700,
-.text-purple-600,
-.dark .text-purple-300,
-.dark .text-purple-200 {
-  color: var(--custom-text-accent, #9333ea) !important;
-}
-
-/* Buttons and badges with explicit white or dark text preserve their contrast */
-button.custom-btn-gradient,
-button.custom-btn-gradient *,
-.btn-primary-gradient,
-.btn-primary-gradient *,
-.bg-purple-600.text-white,
-.bg-purple-600 .text-white,
-.bg-pink-500.text-white,
-.bg-pink-500 .text-white,
-.bg-pink-600.text-white,
-.bg-pink-600 .text-white,
-.bg-emerald-500.text-white,
-.bg-emerald-600.text-white,
-.bg-rose-500.text-white,
-.bg-rose-600.text-white,
-.bg-slate-900.text-white,
-.bg-slate-800.text-white,
-.bg-black.text-white {
-  color: #ffffff !important;
-  text-shadow: none !important;
-}
-
-/* High contrast text readability booster */
-html[data-high-contrast-text="true"]:not(.dark) h1,
-html[data-high-contrast-text="true"]:not(.dark) h2,
-html[data-high-contrast-text="true"]:not(.dark) h3,
-html[data-high-contrast-text="true"]:not(.dark) .text-slate-900,
-html[data-high-contrast-text="true"]:not(.dark) .text-slate-950,
-html[data-high-contrast-text="true"]:not(.dark) .text-purple-950 {
-  text-shadow: 0 1px 3px rgba(255, 255, 255, 0.95), 0 0 1px rgba(255, 255, 255, 0.9) !important;
-}
-
-html[data-high-contrast-text="true"].dark h1,
-html[data-high-contrast-text="true"].dark h2,
-html[data-high-contrast-text="true"].dark h3,
-html[data-high-contrast-text="true"].dark .text-white,
-html[data-high-contrast-text="true"].dark .text-slate-100 {
-  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.95), 0 0 2px rgba(0, 0, 0, 0.9) !important;
+  background: rgba(167, 139, 250, 0.5);
 }

@@ -1,5 +1,5 @@
 import React from "react";
-import { Clock, X, BookOpen, CheckCircle2, Download, Trash2, ArrowRight } from "lucide-react";
+import { Clock, X, BookOpen, CheckCircle2, Download, Trash2, ArrowRight, FileText } from "lucide-react";
 import { TranslationSession } from "../types";
 
 interface HistoryModalProps {
@@ -19,11 +19,12 @@ export const HistoryModal: React.FC<HistoryModalProps> = ({
 }) => {
   if (!isOpen) return null;
 
-  const completedChunks = session
-    ? session.chunks.filter((c) => c.status === "completed").length
-    : 0;
-  const totalChunks = session ? session.chunks.length : 0;
+  const chunks = session?.chunks || [];
+  const completedChunks = chunks.filter((c) => c.status === "completed").length;
+  const totalChunks = chunks.length;
   const isFinished = totalChunks > 0 && completedChunks === totalChunks;
+  const totalChars = session?.totalChineseChars ?? (session as any)?.totalCharacters ?? 0;
+  const percent = totalChunks > 0 ? Math.round((completedChunks / totalChunks) * 100) : 0;
 
   return (
     <div
@@ -59,42 +60,66 @@ export const HistoryModal: React.FC<HistoryModalProps> = ({
         {/* Content */}
         {session ? (
           <div className="space-y-3">
-            <div className="rounded-2xl border border-purple-100 dark:border-purple-900/50 bg-purple-50/30 dark:bg-purple-950/30 p-4 space-y-2.5">
+            <div className="rounded-2xl border border-purple-100 dark:border-purple-900/50 bg-purple-50/30 dark:bg-slate-800/80 p-4 space-y-3">
               <div className="flex items-start justify-between gap-2">
                 <div className="flex items-center gap-2 min-w-0 flex-1">
                   <BookOpen className="h-4 w-4 text-purple-600 shrink-0" />
-                  <h4 className="text-xs font-bold text-slate-800 dark:text-slate-100 line-clamp-2 leading-snug" title={session.fileName}>
-                    {session.fileName}
+                  <h4 className="text-xs font-bold text-slate-800 dark:text-slate-100 truncate">
+                    {session.fileName || "Untitled Manuscript"}
                   </h4>
                 </div>
                 {isFinished ? (
-                  <span className="inline-flex items-center gap-1 shrink-0 rounded-full bg-emerald-100 dark:bg-emerald-950/80 px-2 py-0.5 text-[10px] font-bold text-emerald-800 dark:text-emerald-200">
+                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 dark:bg-emerald-950/80 px-2 py-0.5 text-[10px] font-bold text-emerald-800 dark:text-emerald-200 shrink-0">
                     <CheckCircle2 className="h-3 w-3" />
                     Completed
                   </span>
                 ) : (
-                  <span className="shrink-0 rounded-full bg-purple-100 dark:bg-purple-950/80 px-2 py-0.5 text-[10px] font-bold text-purple-700 dark:text-purple-300">
-                    {completedChunks} / {totalChunks} Chunks
+                  <span className="rounded-full bg-purple-100 dark:bg-purple-950/80 px-2 py-0.5 text-[10px] font-bold text-purple-700 dark:text-purple-300 shrink-0">
+                    {completedChunks} / {totalChunks} Chunks ({percent}%)
                   </span>
                 )}
               </div>
 
-              <p className="text-[11px] text-slate-600 dark:text-slate-300">
-                Total Characters: {session.totalCharacters.toLocaleString()} Chinese characters
-              </p>
+              {/* Progress Bar */}
+              <div className="h-2 w-full overflow-hidden rounded-full bg-purple-100 dark:bg-slate-800">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-sky-400 to-purple-600 transition-all duration-300"
+                  style={{ width: `${percent}%` }}
+                />
+              </div>
 
-              <div className="flex items-center gap-2 pt-1">
+              <div className="text-[11px] text-slate-500 dark:text-slate-400 space-y-0.5">
+                <p>Total Characters: {totalChars.toLocaleString()} Chinese characters</p>
+                {session.createdAt && (
+                  <p>Started: {new Date(session.createdAt).toLocaleDateString()} {new Date(session.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+                )}
+              </div>
+
+              {/* Actions */}
+              <div className="flex flex-wrap items-center gap-2 pt-1">
                 {completedChunks > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onDownloadProgress("epub");
-                    }}
-                    className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-gradient-to-r from-purple-600 to-pink-500 px-3 py-2 text-xs font-bold text-white shadow-2xs hover:opacity-95 active:scale-95 transition cursor-pointer whitespace-nowrap"
-                  >
-                    <Download className="h-3.5 w-3.5" />
-                    <span>Download EPUB</span>
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onDownloadProgress("epub");
+                      }}
+                      className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-purple-600 px-3 py-2 text-xs font-bold text-white shadow-2xs hover:bg-purple-700 active:scale-95 transition cursor-pointer"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      <span>Download EPUB</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onDownloadProgress("txt");
+                      }}
+                      className="inline-flex items-center justify-center gap-1 rounded-xl border border-purple-200 dark:border-purple-800 bg-white dark:bg-slate-800 px-3 py-2 text-xs font-bold text-purple-700 dark:text-purple-300 hover:bg-purple-50 active:scale-95 transition cursor-pointer"
+                    >
+                      <FileText className="h-3.5 w-3.5" />
+                      <span>TXT</span>
+                    </button>
+                  </>
                 )}
                 <button
                   type="button"
@@ -102,7 +127,7 @@ export const HistoryModal: React.FC<HistoryModalProps> = ({
                     onReset();
                     onClose();
                   }}
-                  className="inline-flex items-center justify-center gap-1 rounded-xl border border-rose-200 dark:border-rose-900 bg-white dark:bg-slate-800 px-3 py-2 text-xs font-bold text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 active:scale-95 transition cursor-pointer whitespace-nowrap"
+                  className="inline-flex items-center justify-center gap-1 rounded-xl border border-rose-200 dark:border-rose-900 bg-white dark:bg-slate-800 px-3 py-2 text-xs font-bold text-rose-600 dark:text-rose-400 hover:bg-rose-50 active:scale-95 transition cursor-pointer"
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                   <span>Delete</span>

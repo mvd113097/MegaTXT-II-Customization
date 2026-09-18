@@ -24,6 +24,9 @@ export interface TextChunk {
   chineseText: string;
   englishText: string;
   charCount: number;
+  wordCount?: number;
+  hasEnglish?: boolean;
+  hasChinese?: boolean;
   status: ChunkStatus;
   attempts?: number;
   errorMessage?: string;
@@ -43,6 +46,8 @@ export interface TranslationSession {
   status?: "idle" | "running" | "paused" | "completed";
   createdAt: number;
   lastUpdated: number;
+  completedEnglishWords?: number;
+  completedChars?: number;
   lastDownloadedWordCount?: number;
   lastDownloadedAt?: number;
 }

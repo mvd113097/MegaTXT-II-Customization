@@ -10,8 +10,9 @@ import {
   EyeOff,
   Clock,
   Settings2,
-  Palette,
-  ChevronRight,
+  Lock,
+  KeyRound,
+  ShieldCheck,
 } from "lucide-react";
 
 interface TelegramSettings {
@@ -25,13 +26,11 @@ interface TelegramSettings {
 interface TelegramSettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onOpenThemes?: () => void;
 }
 
 export const TelegramSettingsModal: React.FC<TelegramSettingsModalProps> = ({
   isOpen,
   onClose,
-  onOpenThemes,
 }) => {
   const [settings, setSettings] = useState<TelegramSettings>({
     botToken: "",
@@ -48,6 +47,13 @@ export const TelegramSettingsModal: React.FC<TelegramSettingsModalProps> = ({
   const [testError, setTestError] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<"idle" | "success" | "error">("idle");
 
+  // Passcode Gate settings state
+  const [newPasscode, setNewPasscode] = useState("");
+  const [showPasscodeInput, setShowPasscodeInput] = useState(false);
+  const [passcodeMsg, setPasscodeMsg] = useState<string | null>(null);
+  const [isUpdatingPasscode, setIsUpdatingPasscode] = useState(false);
+  const [hasPasscode, setHasPasscode] = useState(false);
+
   // Fetch current settings on open
   useEffect(() => {
     if (isOpen) {
@@ -62,8 +68,39 @@ export const TelegramSettingsModal: React.FC<TelegramSettingsModalProps> = ({
           console.error("Failed to load Telegram settings:", err);
           setIsLoading(false);
         });
+
+      fetch("/api/auth/status")
+        .then((res) => res.json())
+        .then((data) => {
+          setHasPasscode(data.hasPasscodeConfigured || false);
+        })
+        .catch(() => {});
     }
   }, [isOpen]);
+
+  const handleUpdatePasscode = async () => {
+    setIsUpdatingPasscode(true);
+    setPasscodeMsg(null);
+    try {
+      const res = await fetch("/api/auth/set-passcode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ passcode: newPasscode.trim() }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setHasPasscode(data.hasPasscodeConfigured);
+        setPasscodeMsg(data.message || "Passcode updated.");
+        setNewPasscode("");
+      } else {
+        setPasscodeMsg(data.error || "Failed to update passcode.");
+      }
+    } catch {
+      setPasscodeMsg("Error connecting to server.");
+    } finally {
+      setIsUpdatingPasscode(false);
+    }
+  };
 
   if (!isOpen) return null;
 
@@ -150,7 +187,7 @@ export const TelegramSettingsModal: React.FC<TelegramSettingsModalProps> = ({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-purple-950/30 dark:bg-black/70 p-4 backdrop-blur-xs">
       <div className="flex max-h-[90vh] w-full max-w-lg flex-col rounded-3xl border border-purple-100 dark:border-purple-900/60 bg-white/98 dark:bg-slate-900/98 shadow-2xl shadow-purple-500/10 transition-colors duration-200 overflow-hidden">
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-purple-100/70 dark:border-purple-900/40 px-6 py-4 bg-purple-50/40 dark:bg-purple-950/40">
+        <div className="flex items-center justify-between border-b border-purple-100/70 dark:border-purple-900/40 px-6 py-4 bg-[#FAF8FE]/80 dark:bg-slate-900">
           <div className="flex items-center gap-2.5">
             <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-purple-100 dark:bg-purple-950 text-purple-600 dark:text-purple-300">
               <Bell className="h-5 w-5" />
@@ -181,41 +218,8 @@ export const TelegramSettingsModal: React.FC<TelegramSettingsModalProps> = ({
           </div>
         ) : (
           <form onSubmit={handleSave} className="flex-1 overflow-y-auto p-6 space-y-5">
-            {/* Visual Themes Quick Selector Card */}
-            {onOpenThemes && (
-              <div
-                onClick={() => {
-                  onClose();
-                  onOpenThemes();
-                }}
-                className="flex items-center justify-between rounded-2xl border border-purple-200 dark:border-purple-800/80 bg-gradient-to-r from-purple-50/80 to-pink-50/80 dark:from-purple-950/40 dark:to-pink-950/20 p-4 cursor-pointer hover:border-purple-400 dark:hover:border-purple-600 hover:shadow-md transition active:scale-[0.99] group"
-              >
-                <div className="flex items-center gap-3">
-                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-tr from-purple-600 to-pink-500 text-white shadow-md shadow-purple-500/20">
-                    <Palette className="h-5 w-5" />
-                  </div>
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <h4 className="text-xs sm:text-sm font-extrabold text-slate-900 dark:text-slate-100 group-hover:text-purple-600 dark:group-hover:text-purple-300 transition">
-                        Themes & Visual Presets
-                      </h4>
-                      <span className="rounded-full bg-purple-600 dark:bg-purple-500 px-2 py-0.5 text-[9px] font-bold text-white uppercase tracking-wider">
-                        6 Styles
-                      </span>
-                    </div>
-                    <p className="text-[10px] sm:text-xs text-slate-500 dark:text-purple-300/80">
-                      Explore aesthetic artwork themes and apply them with one click
-                    </p>
-                  </div>
-                </div>
-                <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-white/80 dark:bg-slate-850/80 text-purple-600 dark:text-purple-300 group-hover:translate-x-0.5 transition">
-                  <ChevronRight className="h-4 w-4" />
-                </div>
-              </div>
-            )}
-
             {/* Global toggle */}
-            <div className="flex items-center justify-between rounded-xl border border-slate-200 dark:border-purple-900/50 bg-slate-50/50 dark:bg-purple-950/30 p-4 transition">
+            <div className="flex items-center justify-between rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/60 p-4 transition">
               <div className="space-y-0.5">
                 <label className="text-xs sm:text-sm font-semibold text-slate-900 dark:text-slate-100">
                   Enable Telegram Notifications
@@ -253,7 +257,7 @@ export const TelegramSettingsModal: React.FC<TelegramSettingsModalProps> = ({
                       value={settings.botToken}
                       onChange={(e) => setSettings({ ...settings, botToken: e.target.value })}
                       placeholder="e.g. 123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ"
-                      className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 py-2 pl-3 pr-10 text-xs text-slate-800 dark:text-slate-100 focus:border-indigo-500 focus:outline-none transition"
+                      className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 py-2 pl-3 pr-10 text-xs text-slate-900 dark:text-slate-100 focus:border-indigo-500 focus:outline-none transition"
                       required={settings.enabled}
                     />
                     <button
@@ -279,13 +283,13 @@ export const TelegramSettingsModal: React.FC<TelegramSettingsModalProps> = ({
                     value={settings.chatIds}
                     onChange={(e) => setSettings({ ...settings, chatIds: e.target.value })}
                     placeholder="e.g. 987654321, -10012345678"
-                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-xs text-slate-800 dark:text-slate-100 focus:border-indigo-500 focus:outline-none transition"
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-xs text-slate-900 dark:text-slate-100 focus:border-indigo-500 focus:outline-none transition"
                     required={settings.enabled}
                   />
                 </div>
 
                 {/* Periodic Progress Updates Toggle */}
-                <div className="rounded-xl border border-slate-100 dark:border-slate-800 bg-slate-50/20 p-4 space-y-3.5">
+                <div className="rounded-xl border border-slate-100 dark:border-slate-800 bg-slate-50/20 dark:bg-slate-800/30 p-4 space-y-3.5">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       <Clock className="h-4 w-4 text-indigo-500" />
@@ -321,7 +325,7 @@ export const TelegramSettingsModal: React.FC<TelegramSettingsModalProps> = ({
                       <select
                         value={settings.statusIntervalMin}
                         onChange={(e) => setSettings({ ...settings, statusIntervalMin: Number(e.target.value) })}
-                        className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1 text-xs text-slate-700 dark:text-slate-200 focus:border-indigo-500 focus:outline-none cursor-pointer"
+                        className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1 text-xs text-slate-800 dark:text-slate-200 focus:border-indigo-500 focus:outline-none cursor-pointer"
                       >
                         <option value={1}>Every 1 minute (For testing)</option>
                         <option value={5}>Every 5 minutes (Recommended)</option>
@@ -378,6 +382,85 @@ export const TelegramSettingsModal: React.FC<TelegramSettingsModalProps> = ({
                 </div>
               </div>
             )}
+
+            {/* Master Passcode Protection Section */}
+            <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50 p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="p-2 rounded-lg bg-purple-100 dark:bg-purple-950/60 text-purple-600 dark:text-purple-400">
+                    <Lock className="h-4 w-4" />
+                  </div>
+                  <div>
+                    <h4 className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                      Master Passcode Gate
+                    </h4>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      {hasPasscode
+                        ? "Passcode gate active (UI requires password to open)."
+                        : "Passcode gate inactive (open UI access)."}
+                    </p>
+                  </div>
+                </div>
+                <span
+                  className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                    hasPasscode
+                      ? "bg-purple-100 text-purple-700 border-purple-200 dark:bg-purple-950 dark:text-purple-300 dark:border-purple-800"
+                      : "bg-slate-200 text-slate-600 border-slate-300 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700"
+                  }`}
+                >
+                  {hasPasscode ? "Protected" : "Unprotected"}
+                </span>
+              </div>
+
+              <div className="pt-2 border-t border-slate-200/60 dark:border-slate-800/60 space-y-2">
+                <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
+                  <KeyRound className="h-3.5 w-3.5 text-purple-500" />
+                  <span>{hasPasscode ? "Change or Clear Passcode" : "Set Master Passcode"}</span>
+                </label>
+
+                <div className="flex items-center gap-2">
+                  <div className="relative flex-1">
+                    <input
+                      type={showPasscodeInput ? "text" : "password"}
+                      value={newPasscode}
+                      onChange={(e) => setNewPasscode(e.target.value)}
+                      placeholder={hasPasscode ? "Enter new passcode (or leave empty to clear)..." : "Enter new passcode..."}
+                      className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 py-1.5 pl-3 pr-8 text-xs text-slate-900 dark:text-slate-100 focus:border-purple-500 focus:outline-none transition"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPasscodeInput(!showPasscodeInput)}
+                      className="absolute right-2 top-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer"
+                    >
+                      {showPasscodeInput ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleUpdatePasscode}
+                    disabled={isUpdatingPasscode}
+                    className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs shadow-xs transition disabled:opacity-50 cursor-pointer whitespace-nowrap shrink-0 flex items-center gap-1"
+                  >
+                    {isUpdatingPasscode ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <span>Save Passcode</span>
+                    )}
+                  </button>
+                </div>
+
+                {passcodeMsg && (
+                  <p className="text-[11px] font-medium text-purple-600 dark:text-purple-400 flex items-center gap-1 animate-in fade-in">
+                    <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+                    <span>{passcodeMsg}</span>
+                  </p>
+                )}
+                <p className="text-[10px] text-slate-400 leading-normal">
+                  Note: Translation jobs and API operations continue running without requiring passcode authentication.
+                </p>
+              </div>
+            </div>
 
             {/* Save Button */}
             <div className="pt-4 border-t border-slate-100 dark:border-slate-800/80 flex items-center justify-end gap-3">

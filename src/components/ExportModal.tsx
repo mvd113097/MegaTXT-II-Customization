@@ -56,14 +56,24 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
   const continuity = analyzeChunkContinuity(chunks);
   const contiguousChunks = continuity.continuousChunks;
-  const totalEnglishWords = contiguousChunks.reduce(
+  const allCompletedChunks = continuity.allCompletedChunks;
+  
+  // Use all completed chunks if all are done or if all completed chunks form a complete set
+  const exportChunks =
+    allCompletedChunks.length >= chunks.length || allCompletedChunks.length > contiguousChunks.length
+      ? allCompletedChunks
+      : contiguousChunks.length > 0
+      ? contiguousChunks
+      : allCompletedChunks;
+
+  const totalEnglishWords = exportChunks.reduce(
     (acc, c) => acc + countEnglishWords(c.englishText),
     0
   );
   const baseName = fileName.replace(/\.[^/.]+$/, "") || "translated_novel";
-  const hasContiguousTranslations = contiguousChunks.length > 0;
+  const hasContiguousTranslations = exportChunks.length > 0;
 
-  // Generate output string based on format (strictly contiguous from Chunk 1)
+  // Generate output string based on format
   const generateExportContent = (): string => {
     if (exportFormat === "chinese_txt") {
       const sortedChunks = [...chunks].sort((a, b) => a.index - b.index);
@@ -76,7 +86,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     }
 
     if (exportFormat === "english_txt" || exportFormat === "epub") {
-      return contiguousChunks
+      return exportChunks
         .map((c) => {
           const header = c.chapterTitle ? `${c.chapterTitle}\n\n` : "";
           return `${header}${c.englishText.trim()}`;
@@ -85,7 +95,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     }
 
     if (exportFormat === "bilingual_txt" || exportFormat === "bilingual_epub") {
-      return contiguousChunks
+      return exportChunks
         .map((c) => {
           const header = c.chapterTitle
             ? `====================\n${c.chapterTitle}\n====================\n\n`
@@ -96,7 +106,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     }
 
     if (exportFormat === "markdown") {
-      return contiguousChunks
+      return exportChunks
         .map((c) => {
           const title = c.chapterTitle
             ? `# ${c.chapterTitle}\n\n`
@@ -113,8 +123,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     setErrorMessage(null);
     setDownloadSuccess(null);
 
-    // If requesting English/bilingual format but nothing contiguous translated yet
-    if (exportFormat !== "chinese_txt" && contiguousChunks.length === 0) {
+    // If requesting English/bilingual format but nothing translated yet
+    if (exportFormat !== "chinese_txt" && exportChunks.length === 0) {
       setErrorMessage(
         "Chapter 1 has not finished translating yet. The Never-Skip Engine guarantees all books start from Chapter 1 without missing gaps. Please wait for Chapter 1 to finish, or switch format to 'Original Chinese TXT'."
       );
@@ -125,9 +135,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     if (exportFormat === "epub" || exportFormat === "bilingual_epub") {
       try {
         setIsExporting(true);
-        const res = await downloadEpub(contiguousChunks, fileName, {
+        const res = await downloadEpub(exportChunks, fileName, {
           bookTitle: baseName.replace(/_/g, " "),
           isBilingual: exportFormat === "bilingual_epub",
+          allowGaps: true,
         });
 
         setDownloadSuccess({
@@ -191,7 +202,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-purple-950/30 dark:bg-black/70 p-4 backdrop-blur-xs">
       <div className="flex w-full max-w-xl max-h-[90vh] flex-col rounded-3xl border border-purple-100 dark:border-purple-900/60 bg-white/98 dark:bg-slate-900/98 shadow-2xl shadow-purple-500/10 transition-colors duration-200 overflow-hidden">
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-purple-100/70 dark:border-purple-900/40 px-6 py-4 bg-purple-50/40 dark:bg-purple-950/40">
+        <div className="flex items-center justify-between border-b border-purple-100/70 dark:border-purple-900/40 px-6 py-4 bg-[#FAF8FE]/80 dark:bg-slate-900">
           <div className="flex items-center gap-2.5">
             <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-purple-100 dark:bg-purple-950 text-purple-600 dark:text-purple-300">
               <Download className="h-5 w-5" />

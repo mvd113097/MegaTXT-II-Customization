@@ -9,6 +9,7 @@ import {
   Play,
   Pause,
   RotateCcw,
+  RefreshCw,
   FastForward,
   Download,
   BookCheck,
@@ -20,6 +21,7 @@ import {
   Activity,
   Search,
   ExternalLink,
+  ListOrdered,
 } from "lucide-react";
 import {
   TranslationSession,
@@ -28,7 +30,6 @@ import {
   TranslationMode,
   TextChunk,
 } from "../types";
-import { SleepingCatIllustration } from "./illustrations/StorybookArtwork";
 
 interface ActiveTranslationViewProps {
   session: TranslationSession;
@@ -51,10 +52,12 @@ interface ActiveTranslationViewProps {
   onRetryFailed: () => void;
   onOpenExport: () => void;
   onDownloadProgress: (format?: "epub" | "txt") => void;
-  onTranslateChunk: (index: number) => void;
+  onTranslateChunk: (chunkId: string) => void;
   onReset: () => void;
   completedEnglishWords: number;
   lastDownloadedWords: number;
+  onSyncProgress?: () => void;
+  isSyncing?: boolean;
 }
 
 function formatDuration(seconds: number): string {
@@ -94,8 +97,9 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
   onReset,
   completedEnglishWords,
   lastDownloadedWords,
+  onSyncProgress,
+  isSyncing = false,
 }) => {
-  const [showAllQueue, setShowAllQueue] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | "completed" | "processing" | "pending">("all");
   const [showFormatDropdown, setShowFormatDropdown] = useState(false);
@@ -106,7 +110,8 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
   const pendingChunks = session.chunks.filter((c) => c.status === "pending");
   const errorChunks = session.chunks.filter((c) => c.status === "error");
 
-  const percent = totalChunks > 0 ? Math.min(100, Math.round((completedChunks.length / totalChunks) * 100)) : 0;
+  const effectiveCompletedCount = Math.max(metrics.completedChunks, completedChunks.length);
+  const percent = totalChunks > 0 ? Math.min(100, Math.round((effectiveCompletedCount / totalChunks) * 100)) : 0;
   const charPercent = metrics.totalChars > 0 ? Math.min(100, Math.round((metrics.completedChars / metrics.totalChars) * 100)) : 0;
 
   // Find active chunk
@@ -120,7 +125,7 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
     if (statusFilter !== "all" && chunk.status !== statusFilter) return false;
     if (searchTerm) {
       const matchIndex = `chapter ${chunk.index + 1}`.includes(searchTerm.toLowerCase());
-      const matchTitle = chunk.title?.toLowerCase().includes(searchTerm.toLowerCase());
+      const matchTitle = (chunk.chapterTitle || (chunk as any).title)?.toLowerCase().includes(searchTerm.toLowerCase());
       const matchChinese = chunk.chineseText.includes(searchTerm);
       const matchEnglish = chunk.englishText?.toLowerCase().includes(searchTerm.toLowerCase());
       return matchIndex || matchTitle || matchChinese || matchEnglish;
@@ -139,7 +144,7 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
   return (
     <div className="space-y-3.5 transition animate-in fade-in duration-200">
       {/* 1. Novel Header Card (Reference Screen 2) */}
-      <div className="rounded-3xl p-4 sm:p-5 transition-all duration-200 glass-panel-card card-target-header">
+      <div className="rounded-3xl border border-purple-100/80 dark:border-purple-900/40 bg-white/95 dark:bg-slate-900/95 p-4 sm:p-5 shadow-md shadow-purple-500/5 transition-colors">
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
             <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-100 via-purple-100 to-pink-100 dark:from-indigo-950 dark:via-purple-900/60 dark:to-pink-950/60 text-purple-600 dark:text-purple-300 shadow-2xs">
@@ -178,7 +183,21 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
       </div>
 
       {/* 2. Big Circular Progress Card (Reference Screen 2) */}
-      <div className="rounded-3xl p-4 sm:p-5 transition-all duration-200 glass-panel-card card-target-progress">
+      <div className="relative rounded-3xl border border-purple-100/80 dark:border-purple-900/40 bg-white/95 dark:bg-slate-900/95 p-4 sm:p-5 shadow-md shadow-purple-500/5 transition-colors">
+        {/* Top-Right Sync Progress Button (Encircled location) */}
+        {onSyncProgress && (
+          <button
+            type="button"
+            onClick={onSyncProgress}
+            disabled={isSyncing}
+            className="absolute top-3.5 right-3.5 sm:top-4 sm:right-4 z-10 flex h-8 w-8 items-center justify-center rounded-xl bg-purple-50/90 hover:bg-purple-100 dark:bg-purple-950/80 dark:hover:bg-purple-900/90 border border-purple-200/80 dark:border-purple-800/80 text-purple-600 dark:text-purple-300 shadow-2xs transition hover:scale-105 active:scale-95 disabled:opacity-60 cursor-pointer"
+            title="Sync progress in milliseconds (~2 KB)"
+            aria-label="Sync progress"
+          >
+            <RefreshCw className={`h-4 w-4 ${isSyncing ? "animate-spin text-purple-600 dark:text-purple-400" : ""}`} />
+          </button>
+        )}
+
         <div className="flex flex-row items-center gap-4 sm:gap-6">
           {/* Circular Donut Gauge on Left */}
           <div className="relative flex shrink-0 items-center justify-center">
@@ -225,7 +244,7 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
               <Layers className="h-3.5 w-3.5 text-indigo-500 mt-0.5 shrink-0" />
               <div className="min-w-0 flex-1">
                 <div className="font-extrabold text-slate-800 dark:text-slate-100 truncate text-xs sm:text-sm leading-tight">
-                  {completedChunks.length.toLocaleString()} / {totalChunks.toLocaleString()}
+                  {effectiveCompletedCount.toLocaleString()} / {totalChunks.toLocaleString()}
                 </div>
                 <div className="text-[10px] text-slate-500 dark:text-slate-400 font-medium leading-tight">
                   chunks completed
@@ -276,7 +295,7 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
 
       {/* 3. "Current Chapter" Card (Reference Screen 2) */}
       {activeChunk && (
-        <div className="rounded-3xl p-4 sm:p-5 transition-all duration-200 glass-panel-card space-y-2">
+        <div className="rounded-3xl border border-purple-100/80 dark:border-purple-900/40 bg-white/95 dark:bg-slate-900/95 p-4 sm:p-5 shadow-md shadow-purple-500/5 transition-colors space-y-2">
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-xs font-extrabold uppercase tracking-wider text-slate-800 dark:text-slate-200">
               <BookOpen className="h-4 w-4 text-purple-500" />
@@ -289,10 +308,10 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
 
           <div>
             <h3 className="text-sm font-bold text-slate-900 dark:text-white truncate">
-              {activeChunk.title || `Chapter ${activeChunk.index + 1}`}
+              {activeChunk.chapterTitle || (activeChunk as any).title || `Chapter ${activeChunk.index + 1}`}
             </h3>
             <p className="text-[11px] text-slate-500 dark:text-slate-400 line-clamp-1 mt-0.5">
-              {activeChunk.chineseText.slice(0, 90)}...
+              {(activeChunk.chineseText || "").slice(0, 90)}...
             </p>
           </div>
 
@@ -310,10 +329,10 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
 
       {/* 4. Active Model & Streams Cards Side-by-Side (Reference Screen 2) */}
       <div className="grid grid-cols-2 gap-2.5">
-        <div className="flex items-center gap-2 rounded-2xl p-3 glass-panel-card">
-          <Sparkles className="h-4 w-4 text-pink-500 shrink-0" />
+        <div className="flex items-center gap-2 rounded-2xl border border-purple-100 dark:border-purple-900/50 bg-white/95 dark:bg-slate-900/95 p-3 shadow-xs">
+          <Sparkles className="h-4 w-4 text-sky-500 shrink-0" />
           <div className="min-w-0 flex-1">
-            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-purple-300/80">Active Model</div>
+            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Active Model</div>
             <div className="text-xs font-extrabold text-slate-800 dark:text-slate-100 truncate">
               gemini-3.8-flash
             </div>
@@ -323,10 +342,10 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
           </div>
         </div>
 
-        <div className="flex items-center gap-2 rounded-2xl p-3 glass-panel-card">
-          <Zap className="h-4 w-4 text-purple-500 shrink-0" />
+        <div className="flex items-center gap-2 rounded-2xl border border-purple-100 dark:border-purple-900/50 bg-white/95 dark:bg-slate-900/95 p-3 shadow-xs">
+          <Zap className="h-4 w-4 text-indigo-500 shrink-0" />
           <div className="min-w-0 flex-1">
-            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-purple-300/80">Streams</div>
+            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Streams</div>
             <div className="flex items-center gap-1">
               <select
                 value={concurrency}
@@ -340,7 +359,7 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
                 <option value={1}>1</option>
               </select>
             </div>
-            <div className="text-[10px] font-bold text-slate-500 dark:text-purple-300/80">
+            <div className="text-[10px] font-bold text-slate-500 dark:text-slate-400">
               (Maximum Speed)
             </div>
           </div>
@@ -353,10 +372,7 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
           <button
             id="starting-translation-btn"
             disabled
-            style={{
-              borderRadius: "var(--custom-btn-radius)",
-            }}
-            className="flex w-full items-center justify-center gap-2 bg-purple-400 py-3.5 px-4 text-sm font-bold text-white shadow-md opacity-90 cursor-wait text-center leading-snug"
+            className="flex w-full items-center justify-center gap-2 rounded-2xl bg-purple-400 py-3.5 px-4 text-sm font-bold text-white shadow-md opacity-90 cursor-wait"
           >
             <Loader2 className="h-4 w-4 animate-spin" />
             <span>Starting translation...</span>
@@ -365,37 +381,25 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
           <button
             id="active-pause-btn"
             onClick={onPause}
-            style={{
-              background: "var(--custom-btn-gradient)",
-              borderRadius: "var(--custom-btn-radius)",
-            }}
-            className="flex w-full items-center justify-center gap-2.5 py-3.5 px-4 text-sm font-black text-white shadow-md shadow-purple-500/20 active:scale-98 transition cursor-pointer text-center leading-snug"
+            className="flex w-full items-center justify-center gap-2.5 rounded-2xl bg-[#C084FC] hover:bg-[#A855F7] py-3.5 px-4 text-sm font-bold text-white shadow-md shadow-purple-500/15 active:scale-98 transition cursor-pointer"
           >
             <span className="font-mono text-base leading-none">❚❚</span>
             <span>Pause Translation</span>
           </button>
-        ) : isPaused ? (
+        ) : isPaused || (metrics.completedChunks > 0 && metrics.completedChunks < metrics.totalChunks) ? (
           <button
             id="active-resume-btn"
-            onClick={onResume}
-            style={{
-              background: "var(--custom-btn-gradient)",
-              borderRadius: "var(--custom-btn-radius)",
-            }}
-            className="flex w-full items-center justify-center gap-2 py-3.5 px-4 text-sm font-black text-white shadow-md shadow-pink-500/20 active:scale-98 transition cursor-pointer text-center leading-snug"
+            onClick={isPaused ? onResume : onStart}
+            className="flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 hover:opacity-95 py-3.5 px-4 text-sm font-bold text-white shadow-md shadow-purple-500/20 active:scale-98 transition cursor-pointer"
           >
             <Play className="h-4 w-4 fill-white" />
-            <span>Resume Translation</span>
+            <span>{mode === "cloud" ? "Resume Cloud Translation ☁️" : "Resume Translation ⚡"}</span>
           </button>
         ) : (
           <button
             id="active-start-btn"
             onClick={onStart}
-            style={{
-              background: "var(--custom-btn-gradient)",
-              borderRadius: "var(--custom-btn-radius)",
-            }}
-            className="flex w-full items-center justify-center gap-2 py-3.5 px-4 text-sm font-black text-white shadow-md shadow-pink-500/20 active:scale-98 transition cursor-pointer text-center leading-snug"
+            className="flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 hover:opacity-95 py-3.5 px-4 text-sm font-bold text-white shadow-md shadow-purple-500/20 active:scale-98 transition cursor-pointer"
           >
             <Play className="h-4 w-4 fill-white" />
             <span>{mode === "cloud" ? "Start Cloud Translation ☁️" : "Start Translation ⚡"}</span>
@@ -409,153 +413,178 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
         <button
           id="active-download-epub-btn"
           onClick={() => onDownloadProgress("epub")}
-          className="flex items-center justify-center gap-1.5 rounded-2xl border border-sky-300 dark:border-sky-800 bg-sky-50/80 dark:bg-sky-950/40 hover:bg-sky-100 dark:hover:bg-sky-900/50 py-3 px-2 text-center text-xs font-extrabold text-sky-800 dark:text-sky-200 transition active:scale-98 cursor-pointer shadow-2xs leading-tight backdrop-blur-xs"
+          className="flex items-center justify-center gap-2 rounded-2xl border border-sky-300 dark:border-sky-800 bg-sky-50/80 dark:bg-sky-950/40 hover:bg-sky-100 dark:hover:bg-sky-900/50 py-3 px-3 text-xs font-extrabold text-sky-800 dark:text-sky-200 transition active:scale-98 cursor-pointer shadow-2xs"
         >
-          <BookCheck className="h-4 w-4 shrink-0 text-sky-600 dark:text-sky-400" />
-          <span>Download Current EPUB</span>
+          <BookCheck className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+          <span className="truncate">Download Current EPUB</span>
         </button>
 
         {/* Delete Translation Button */}
         <button
           id="active-reset-book-btn"
           onClick={onReset}
-          className="flex items-center justify-center gap-1.5 rounded-2xl border border-rose-200 dark:border-rose-900/60 bg-rose-50/60 dark:bg-rose-950/30 hover:bg-rose-100 dark:hover:bg-rose-900/40 py-3 px-2 text-center text-xs font-extrabold text-rose-700 dark:text-rose-300 transition active:scale-98 cursor-pointer shadow-2xs leading-tight backdrop-blur-xs"
+          className="flex items-center justify-center gap-2 rounded-2xl border border-rose-200 dark:border-rose-900/60 bg-rose-50/60 dark:bg-rose-950/30 hover:bg-rose-100 dark:hover:bg-rose-900/40 py-3 px-3 text-xs font-extrabold text-rose-700 dark:text-rose-300 transition active:scale-98 cursor-pointer shadow-2xs"
         >
-          <Trash2 className="h-4 w-4 shrink-0 text-rose-500" />
-          <span>Delete Translation</span>
+          <Trash2 className="h-4 w-4 text-rose-500" />
+          <span className="truncate">Delete Translation</span>
         </button>
       </div>
 
-      {/* 7. "Recent Activity" Card (Reference Screen 2) */}
-      <div className="rounded-3xl p-4 sm:p-5 transition-all duration-200 glass-panel-card card-target-queue space-y-2.5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2 text-xs font-extrabold text-slate-800 dark:text-slate-200 uppercase tracking-wider">
-            <Activity className="h-4 w-4 text-purple-500" />
-            <span>Recent Activity</span>
+      {/* 7. Translation Queue (Always Visible - Never Hidden) */}
+      <div className="rounded-3xl border border-purple-100/80 dark:border-purple-900/40 bg-white/95 dark:bg-slate-900/95 p-4 sm:p-5 shadow-md shadow-purple-500/5 transition-colors space-y-3">
+        {/* Header & Status Summary */}
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-purple-50 dark:border-slate-800/80 pb-2.5">
+          <div className="flex items-center gap-2">
+            <Activity className="h-4 w-4 text-purple-600 dark:text-purple-400 shrink-0" />
+            <span className="text-xs font-extrabold text-slate-800 dark:text-slate-200 uppercase tracking-wider">
+              Translation Queue
+            </span>
+            <span className="rounded-full bg-purple-100 dark:bg-purple-900/50 px-2 py-0.5 text-[10px] font-bold text-purple-700 dark:text-purple-300">
+              {completedChunks.length}/{totalChunks} done
+            </span>
           </div>
-          <button
-            type="button"
-            onClick={() => setShowAllQueue(!showAllQueue)}
-            className="flex items-center gap-1 text-[11px] font-bold text-purple-600 dark:text-purple-400 hover:underline cursor-pointer"
-          >
-            <span>{showAllQueue ? "Hide Queue" : `View All (${totalChunks})`}</span>
-            {showAllQueue ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-          </button>
+
+          {/* Filter Badges */}
+          <div className="flex items-center gap-1 text-[11px]">
+            <button
+              onClick={() => setStatusFilter("all")}
+              className={`rounded-full px-2.5 py-0.5 font-bold transition cursor-pointer ${
+                statusFilter === "all" ? "bg-purple-600 text-white" : "text-slate-500 hover:text-purple-600 dark:text-slate-400"
+              }`}
+            >
+              All ({totalChunks})
+            </button>
+            <button
+              onClick={() => setStatusFilter("completed")}
+              className={`rounded-full px-2.5 py-0.5 font-bold transition cursor-pointer ${
+                statusFilter === "completed" ? "bg-emerald-600 text-white" : "text-slate-500 hover:text-emerald-600 dark:text-slate-400"
+              }`}
+            >
+              Done ({completedChunks.length})
+            </button>
+            {processingChunks.length > 0 && (
+              <button
+                onClick={() => setStatusFilter("processing")}
+                className={`rounded-full px-2.5 py-0.5 font-bold transition cursor-pointer ${
+                  statusFilter === "processing" ? "bg-sky-600 text-white" : "text-sky-600 dark:text-sky-400 hover:bg-sky-50"
+                }`}
+              >
+                Active ({processingChunks.length})
+              </button>
+            )}
+            <button
+              onClick={() => setStatusFilter("pending")}
+              className={`rounded-full px-2.5 py-0.5 font-bold transition cursor-pointer ${
+                statusFilter === "pending" ? "bg-slate-300 dark:bg-slate-700 text-slate-900 dark:text-white" : "text-slate-500 dark:text-slate-400"
+              }`}
+            >
+              Queued ({pendingChunks.length})
+            </button>
+          </div>
         </div>
 
-        {/* Chronological Recent Chapter Activity Items */}
-        <div className="space-y-2 text-xs">
-          {session.chunks.slice(0, 5).map((chunk, idx) => {
+        {/* Quick Search / Filter Input */}
+        <div className="relative w-full">
+          <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-slate-400" />
+          <input
+            type="text"
+            placeholder="Search chapters or text..."
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            className="w-full rounded-xl border border-purple-100 dark:border-purple-900/60 bg-purple-50/40 dark:bg-slate-800/80 py-1.5 pl-8 pr-3 text-xs text-slate-800 dark:text-slate-200 placeholder-slate-400 focus:outline-none focus:border-purple-400"
+          />
+        </div>
+
+        {/* Always-Visible Complete Chapter List */}
+        <div className="max-h-80 sm:max-h-96 overflow-y-auto divide-y divide-purple-50 dark:divide-slate-800/70 pr-1 space-y-0.5">
+          {filteredChunks.map((chunk) => {
             const isDone = chunk.status === "completed";
             const isActive = chunk.status === "processing";
+            const isError = chunk.status === "error";
 
             return (
               <div
                 key={chunk.id}
-                className="flex items-center justify-between py-1.5 border-b border-purple-50/70 dark:border-slate-800/60 last:border-0"
+                className={`flex items-center justify-between py-2 px-2 rounded-xl transition ${
+                  isActive
+                    ? "bg-purple-50/90 dark:bg-purple-950/40 border border-purple-200/80 dark:border-purple-800/60 shadow-2xs"
+                    : "hover:bg-purple-50/40 dark:hover:bg-slate-800/40"
+                }`}
               >
-                <div className="flex items-center gap-2.5 min-w-0">
+                <div className="flex items-center gap-2.5 min-w-0 flex-1 pr-2">
                   {isDone ? (
                     <span className="flex h-4 w-4 items-center justify-center rounded-full bg-emerald-500 text-white shrink-0 text-[10px] font-bold">
                       ✓
                     </span>
                   ) : isActive ? (
                     <span className="flex h-4 w-4 items-center justify-center rounded-full bg-purple-600 text-white shrink-0 text-[10px] font-bold animate-pulse">
-                      ✓
+                      ⚡
+                    </span>
+                  ) : isError ? (
+                    <span className="flex h-4 w-4 items-center justify-center rounded-full bg-rose-500 text-white shrink-0 text-[10px] font-bold">
+                      !
                     </span>
                   ) : (
                     <span className="flex h-4 w-4 items-center justify-center rounded-full bg-purple-100 dark:bg-purple-900/60 text-purple-400 shrink-0 text-[10px] font-bold">
                       •
                     </span>
                   )}
-                  <span className="font-semibold text-slate-800 dark:text-slate-200 truncate">
-                    Chapter {chunk.index + 1} {chunk.title ? `· ${chunk.title}` : ""} {isActive ? "(Current)" : ""}
-                  </span>
+
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5 truncate">
+                      <span className="font-bold text-xs text-slate-800 dark:text-slate-100">
+                        Chapter {chunk.index + 1}
+                      </span>
+                      {(chunk.chapterTitle || (chunk as any).title) && (
+                        <span className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                          · {chunk.chapterTitle || (chunk as any).title}
+                        </span>
+                      )}
+                      {isActive && (
+                        <span className="rounded-md bg-purple-200/70 dark:bg-purple-900/80 px-1.5 py-0.2 text-[9px] font-bold text-purple-800 dark:text-purple-200 uppercase tracking-wider animate-pulse">
+                          Translating
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-[10px] text-slate-400 flex items-center gap-2">
+                      <span>{chunk.charCount.toLocaleString()} chars</span>
+                      {(chunk.wordCount || (chunk.englishText ? chunk.englishText.trim().split(/\s+/).filter(Boolean).length : 0)) > 0 ? (
+                        <span>· {(chunk.wordCount || chunk.englishText!.trim().split(/\s+/).filter(Boolean).length).toLocaleString()} words</span>
+                      ) : null}
+                    </div>
+                  </div>
                 </div>
 
-                <span className="text-[11px] text-slate-400 shrink-0">
-                  {isDone ? "completed" : isActive ? "Translating..." : "queued"}
-                </span>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span
+                    className={`text-[11px] font-semibold ${
+                      isDone
+                        ? "text-emerald-600 dark:text-emerald-400"
+                        : isActive
+                        ? "text-purple-600 dark:text-purple-400 font-bold"
+                        : isError
+                        ? "text-rose-500"
+                        : "text-slate-400"
+                    }`}
+                  >
+                    {isDone ? "completed" : isActive ? "translating..." : isError ? "error" : "queued"}
+                  </span>
+
+                  {!isDone && !isRunning && (
+                    <button
+                      type="button"
+                      onClick={() => onTranslateChunk(chunk.id)}
+                      className="rounded-lg border border-purple-200 dark:border-purple-800 px-2 py-0.5 text-[10px] font-bold text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-900/50 cursor-pointer"
+                    >
+                      Translate
+                    </button>
+                  )}
+                </div>
               </div>
             );
           })}
         </div>
       </div>
-
-      {/* 8. Collapsible Full Chapter Inspector & Search */}
-      {showAllQueue && (
-        <div className="rounded-3xl p-4 transition-all duration-200 glass-panel-card animate-in fade-in space-y-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-1 text-[11px]">
-              <button
-                onClick={() => setStatusFilter("all")}
-                className={`rounded-full px-2.5 py-0.5 font-bold transition cursor-pointer ${
-                  statusFilter === "all" ? "bg-purple-600 text-white" : "text-slate-500 hover:text-purple-600"
-                }`}
-              >
-                All ({totalChunks})
-              </button>
-              <button
-                onClick={() => setStatusFilter("completed")}
-                className={`rounded-full px-2.5 py-0.5 font-bold transition cursor-pointer ${
-                  statusFilter === "completed" ? "bg-emerald-600 text-white" : "text-slate-500 hover:text-emerald-600"
-                }`}
-              >
-                Done ({completedChunks.length})
-              </button>
-              <button
-                onClick={() => setStatusFilter("pending")}
-                className={`rounded-full px-2.5 py-0.5 font-bold transition cursor-pointer ${
-                  statusFilter === "pending" ? "bg-slate-300 dark:bg-slate-700 text-slate-900 dark:text-white" : "text-slate-500"
-                }`}
-              >
-                Queued ({pendingChunks.length})
-              </button>
-            </div>
-
-            <div className="relative w-full sm:w-44">
-              <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-slate-400" />
-              <input
-                type="text"
-                placeholder="Filter chapters..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full rounded-xl border border-purple-100 dark:border-purple-900/60 bg-white dark:bg-slate-800 py-1 pl-8 pr-2.5 text-xs text-slate-800 dark:text-slate-200 placeholder-slate-400 focus:outline-none"
-              />
-            </div>
-          </div>
-
-          <div className="max-h-60 overflow-y-auto divide-y divide-purple-50 dark:divide-slate-800">
-            {filteredChunks.map((chunk) => (
-              <div
-                key={chunk.id}
-                className="flex items-center justify-between py-2 text-xs"
-              >
-                <div className="min-w-0 flex-1 pr-2">
-                  <span className="font-bold text-slate-800 dark:text-slate-100">
-                    Chapter {chunk.index + 1}
-                  </span>
-                  <p className="text-[11px] text-slate-400 truncate">
-                    {chunk.charCount.toLocaleString()} chars · {chunk.status}
-                  </p>
-                </div>
-                {chunk.status !== "completed" && !isRunning && (
-                  <button
-                    type="button"
-                    onClick={() => onTranslateChunk(chunk.index)}
-                    className="rounded-lg border border-purple-200 dark:border-purple-800 px-2 py-1 text-[10px] font-bold text-purple-700 dark:text-purple-300 hover:bg-purple-50"
-                  >
-                    Translate
-                  </button>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* 9. THE SLEEPING CAT ON BOOKS ILLUSTRATION (Reference Screen 2) */}
-      <SleepingCatIllustration className="mt-0" />
     </div>
   );
 };

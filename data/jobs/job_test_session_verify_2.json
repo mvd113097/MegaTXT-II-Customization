@@ -1,0 +1,47 @@
+{
+  "id": "cloud_job_1789709278838",
+  "sessionId": "test_session_verify_1",
+  "fileName": "test_novel.txt",
+  "fileSizeBytes": 15000,
+  "totalChineseChars": 3000,
+  "chunks": [
+    {
+      "id": "chunk_0",
+      "index": 0,
+      "chapterTitle": "Chapter 1: The Mountain Gate",
+      "chineseText": "天道茫茫，修仙路远。",
+      "englishText": "The Heavenly Dao is boundless, and the path to immortal cultivation is long.",
+      "charCount": 1000,
+      "status": "completed",
+      "attempts": 1,
+      "edited": false
+    },
+    {
+      "id": "chunk_1",
+      "index": 1,
+      "chapterTitle": "Chapter 2: The Spirit Sword",
+      "chineseText": "剑光如雪，照亮长夜。",
+      "englishText": "",
+      "charCount": 1000,
+      "status": "processing",
+      "attempts": 1
+    },
+    {
+      "id": "chunk_2",
+      "index": 2,
+      "chapterTitle": "Chapter 3: The Gathering Clouds",
+      "chineseText": "风起云涌，危机四伏。",
+      "englishText": "",
+      "charCount": 1000,
+      "status": "pending",
+      "attempts": 0
+    }
+  ],
+  "style": "xianxia",
+  "customInstructions": "",
+  "glossary": [],
+  "concurrency": 1,
+  "status": "running",
+  "startedAt": 1789709278838,
+  "lastActiveAt": 1789709300145
+}

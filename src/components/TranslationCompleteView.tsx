@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useState } from "react";
 import {
   CheckCircle2,
   BookOpen,
@@ -12,6 +12,7 @@ import {
   BookCheck,
   RefreshCw,
   ExternalLink,
+  Loader2,
 } from "lucide-react";
 import { TranslationSession, TranslationMetrics, TranslationStyle, TranslationMode } from "../types";
 import { StoryVignetteIllustration } from "./illustrations/StorybookArtwork";
@@ -22,9 +23,11 @@ interface TranslationCompleteViewProps {
   mode: TranslationMode;
   style: TranslationStyle;
   concurrency: number;
-  onDownloadProgress: (format?: "epub" | "txt") => void;
+  onDownloadProgress: (format?: "epub" | "txt") => void | Promise<void>;
   onOpenExport: () => void;
   onReset: () => void;
+  onSyncProgress?: () => void;
+  isSyncing?: boolean;
 }
 
 function formatDuration(seconds: number): string {
@@ -48,10 +51,24 @@ export const TranslationCompleteView: React.FC<TranslationCompleteViewProps> = (
   onDownloadProgress,
   onOpenExport,
   onReset,
+  onSyncProgress,
+  isSyncing = false,
 }) => {
+  const [downloadingFormat, setDownloadingFormat] = useState<"epub" | "txt" | null>(null);
+
+  const handleDownload = async (format: "epub" | "txt") => {
+    if (downloadingFormat) return;
+    setDownloadingFormat(format);
+    try {
+      await onDownloadProgress(format);
+    } finally {
+      setDownloadingFormat(null);
+    }
+  };
+
   const totalChunks = session.chunks.length;
   const completedWords = metrics.completedEnglishWords;
-  const totalChars = metrics.completedChars || session.totalCharacters;
+  const totalChars = metrics.completedChars || session.totalChineseChars || 0;
 
   return (
     <div className="space-y-4 transition animate-in fade-in duration-300">
@@ -69,18 +86,20 @@ export const TranslationCompleteView: React.FC<TranslationCompleteViewProps> = (
       </div>
 
       {/* 2. Novel Summary Card */}
-      <div className="card-target-complete complete-card-style rounded-3xl border border-purple-100/80 dark:border-purple-900/40 bg-white/95 dark:bg-slate-900/95 p-4 sm:p-5 shadow-md shadow-purple-500/5 transition-colors space-y-3">
-        <div className="flex items-center gap-3">
-          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-100 via-purple-100 to-pink-100 dark:from-indigo-950 dark:via-purple-900/60 dark:to-pink-950/60 text-purple-600 dark:text-purple-300">
-            <BookOpen className="h-5 w-5" />
-          </div>
-          <div className="min-w-0">
-            <h3 className="text-sm sm:text-base font-extrabold text-slate-800 dark:text-slate-100 truncate" title={session.fileName}>
-              {session.fileName}
-            </h3>
-            <p className="text-xs text-purple-600 dark:text-purple-300 font-medium">
-              Chapter 1 — {totalChunks} · {completedWords.toLocaleString()} words
-            </p>
+      <div className="rounded-3xl border border-purple-100/80 dark:border-purple-900/40 bg-white/95 dark:bg-slate-900/95 p-4 sm:p-5 shadow-md shadow-purple-500/5 transition-colors space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-100 via-purple-100 to-pink-100 dark:from-indigo-950 dark:via-purple-900/60 dark:to-pink-950/60 text-purple-600 dark:text-purple-300">
+              <BookOpen className="h-5 w-5" />
+            </div>
+            <div className="min-w-0">
+              <h3 className="text-sm sm:text-base font-extrabold text-slate-800 dark:text-slate-100 truncate" title={session.fileName}>
+                {session.fileName}
+              </h3>
+              <p className="text-xs text-purple-600 dark:text-purple-300 font-medium">
+                Chapter 1 — {totalChunks} · {completedWords.toLocaleString()} words
+              </p>
+            </div>
           </div>
         </div>
 
@@ -116,14 +135,14 @@ export const TranslationCompleteView: React.FC<TranslationCompleteViewProps> = (
               <span>Total Time</span>
             </div>
             <span className="font-extrabold text-slate-800 dark:text-slate-100">
-              {metrics.elapsedSeconds > 0 ? formatDuration(metrics.elapsedSeconds) : "Complete"}
+              {metrics.elapsedMs > 0 ? formatDuration(Math.floor(metrics.elapsedMs / 1000)) : "Complete"}
             </span>
           </div>
         </div>
       </div>
 
       {/* 3. Download Your Translation Card (Reference Screen 3) */}
-      <div className="card-target-complete complete-card-style rounded-3xl border border-purple-100/80 dark:border-purple-900/40 bg-white/95 dark:bg-slate-900/95 p-4 sm:p-5 shadow-md shadow-purple-500/5 transition-colors space-y-3">
+      <div className="rounded-3xl border border-purple-100/80 dark:border-purple-900/40 bg-white/95 dark:bg-slate-900/95 p-4 sm:p-5 shadow-md shadow-purple-500/5 transition-colors space-y-3">
         <h4 className="text-xs font-extrabold uppercase tracking-wider text-slate-800 dark:text-slate-200">
           Download Your Translation
         </h4>
@@ -132,11 +151,21 @@ export const TranslationCompleteView: React.FC<TranslationCompleteViewProps> = (
         <button
           id="complete-screen-download-epub-btn"
           type="button"
-          onClick={() => onDownloadProgress("epub")}
-          className="w-full flex items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 hover:opacity-95 py-3.5 px-4 text-sm font-bold text-white shadow-md shadow-purple-500/20 active:scale-98 transition cursor-pointer"
+          disabled={downloadingFormat !== null}
+          onClick={() => handleDownload("epub")}
+          className="w-full flex items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 hover:opacity-95 py-3.5 px-4 text-sm font-bold text-white shadow-md shadow-purple-500/20 active:scale-98 transition cursor-pointer disabled:opacity-75 disabled:cursor-wait"
         >
-          <Download className="h-4.5 w-4.5" />
-          <span>Download EPUB</span>
+          {downloadingFormat === "epub" ? (
+            <>
+              <Loader2 className="h-4.5 w-4.5 animate-spin" />
+              <span>Packaging EPUB eBook...</span>
+            </>
+          ) : (
+            <>
+              <Download className="h-4.5 w-4.5" />
+              <span>Download EPUB</span>
+            </>
+          )}
         </button>
         <p className="text-center text-[11px] text-purple-600 dark:text-purple-300 font-medium">
           Your translated novel is ready!
@@ -148,25 +177,36 @@ export const TranslationCompleteView: React.FC<TranslationCompleteViewProps> = (
             id="complete-screen-preview-btn"
             type="button"
             onClick={onOpenExport}
-            className="flex items-center justify-center gap-1.5 rounded-2xl border border-purple-200 dark:border-purple-800 bg-white dark:bg-slate-800 hover:bg-purple-50 dark:hover:bg-slate-750 py-2.5 px-3 text-xs font-bold text-purple-700 dark:text-purple-300 transition active:scale-95 cursor-pointer"
+            className="flex items-center justify-center gap-1.5 rounded-2xl border border-purple-200 dark:border-purple-800 bg-white dark:bg-slate-800 hover:bg-purple-50 dark:hover:bg-slate-700 py-2.5 px-3 text-xs font-bold text-purple-700 dark:text-purple-300 transition active:scale-95 cursor-pointer"
           >
             <ExternalLink className="h-3.5 w-3.5" />
-            <span>Preview & Read</span>
+            <span>Preview & Export</span>
           </button>
+
           <button
             id="complete-screen-download-txt-btn"
             type="button"
-            onClick={() => onDownloadProgress("txt")}
-            className="flex items-center justify-center gap-1.5 rounded-2xl border border-purple-200 dark:border-purple-800 bg-white dark:bg-slate-800 hover:bg-purple-50 dark:hover:bg-slate-750 py-2.5 px-3 text-xs font-bold text-purple-700 dark:text-purple-300 transition active:scale-95 cursor-pointer"
+            disabled={downloadingFormat !== null}
+            onClick={() => handleDownload("txt")}
+            className="flex items-center justify-center gap-1.5 rounded-2xl border border-purple-200 dark:border-purple-800 bg-white dark:bg-slate-800 hover:bg-purple-50 dark:hover:bg-slate-700 py-2.5 px-3 text-xs font-bold text-purple-700 dark:text-purple-300 transition active:scale-95 cursor-pointer disabled:opacity-75 disabled:cursor-wait"
           >
-            <FileText className="h-3.5 w-3.5" />
-            <span>Plain TXT</span>
+            {downloadingFormat === "txt" ? (
+              <>
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                <span>Exporting...</span>
+              </>
+            ) : (
+              <>
+                <FileText className="h-3.5 w-3.5" />
+                <span>Plain TXT</span>
+              </>
+            )}
           </button>
         </div>
       </div>
 
       {/* 4. Translation Settings (Used) Card (Reference Screen 3) */}
-      <div className="card-target-complete complete-card-style rounded-3xl border border-purple-100/80 dark:border-purple-900/40 bg-white/95 dark:bg-slate-900/95 p-4 sm:p-5 shadow-md shadow-purple-500/5 transition-colors space-y-2.5">
+      <div className="rounded-3xl border border-purple-100/80 dark:border-purple-900/40 bg-white/95 dark:bg-slate-900/95 p-4 sm:p-5 shadow-md shadow-purple-500/5 transition-colors space-y-2.5">
         <div className="flex items-center gap-2 text-xs font-extrabold text-slate-800 dark:text-slate-200 uppercase tracking-wider">
           <Settings2 className="h-4 w-4 text-purple-500" />
           <span>Translation Settings (Used)</span>
@@ -207,7 +247,7 @@ export const TranslationCompleteView: React.FC<TranslationCompleteViewProps> = (
       </div>
 
       {/* 5. Translation Summary Card with Pagoda Sakura Vignette (Reference Screen 3) */}
-      <div className="card-target-complete complete-card-style rounded-3xl border border-purple-100/80 dark:border-purple-900/40 bg-white/95 dark:bg-slate-900/95 p-4 sm:p-5 shadow-md shadow-purple-500/5 transition-colors space-y-3">
+      <div className="rounded-3xl border border-purple-100/80 dark:border-purple-900/40 bg-white/95 dark:bg-slate-900/95 p-4 sm:p-5 shadow-md shadow-purple-500/5 transition-colors space-y-3">
         <div className="flex items-center gap-2 text-xs font-extrabold text-slate-800 dark:text-slate-200 uppercase tracking-wider">
           <Sparkles className="h-4 w-4 text-pink-500" />
           <span>Translation Summary</span>
