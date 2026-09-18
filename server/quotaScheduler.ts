@@ -205,6 +205,7 @@ export class QuotaAwareKeyScheduler {
           headers: {
             "User-Agent": "aistudio-build",
           },
+          timeout: 35000,
         },
       });
 

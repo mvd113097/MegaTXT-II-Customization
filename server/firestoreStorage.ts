@@ -80,6 +80,9 @@ export function isCloudStorageAvailable(): boolean {
       return false;
     }
   }
+  if (!dbInstance) {
+    initFirestore();
+  }
   return isFirestoreAvailable && !!dbInstance;
 }
 

@@ -58,13 +58,12 @@ function getGeminiClient(): GoogleGenAI {
 // High reliability free-tier translation engine with multi-project quota pooling,
 // exponential backoff, and content-filter resilience.
 // Supported modern models per Google GenAI SDK guidelines:
+// gemini-3.1-flash-lite delivers ~3s high throughput and rock-solid availability.
 const FREE_TIER_MODELS = [
+  "gemini-3.1-flash-lite",
+  "gemini-flash-latest",
   "gemini-3.8-flash",
-  "gemini-3.7-flash",
-  "gemini-3.6-flash",
-  "gemini-3.5-flash",
-  "gemini-3.5-flash-lite",
-  "gemini-3.1-flash-lite"
+  "gemini-3.1-pro-preview"
 ];
 
 // In-memory tracking of model availability and quota cooldowns
@@ -256,7 +255,7 @@ async function generateWithQuotaScheduler(
   quotaScheduler.acquireProject(project.id);
 
   try {
-    const response = await project.client.models.generateContent({
+    const generatePromise = project.client.models.generateContent({
       model: modelName,
       contents: userPrompt,
       config: {
@@ -271,6 +270,17 @@ async function generateWithQuotaScheduler(
           { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" },
         ] as any,
       },
+    });
+
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        reject(new Error(`API request to ${modelName} timed out after 35 seconds.`));
+      }, 35000);
+    });
+
+    const response = await Promise.race([generatePromise, timeoutPromise]).finally(() => {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
     });
 
     let resultText = response.text || "";
@@ -380,6 +390,9 @@ async function generateWithQuotaScheduler(
       errStr.includes("unavailable") ||
       errStr.includes("high demand") ||
       errStr.includes("overloaded") ||
+      errStr.includes("timed out") ||
+      errStr.includes("timeout") ||
+      errStr.includes("fetch failed") ||
       errStr.includes("transient error");
 
     const isFilterOrBlock =
@@ -1469,7 +1482,8 @@ Translation Guidelines:
 
           for (const chunk of batchChunks) {
             chunk.status = "error";
-            chunk.errorMessage = `Attempt ${attemptCount}: ${cleanErr}. Auto-retrying...`;
+            chunk.attempts = (chunk.attempts || 0) + 1;
+            chunk.errorMessage = `Attempt ${chunk.attempts}: ${cleanErr}. Auto-retrying...`;
             chunk.durationMs = Date.now() - startBatchTime;
             chunk.lastErrorAt = Date.now();
           }
