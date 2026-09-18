@@ -1118,13 +1118,16 @@ export async function fetchNovelTOC(
 
   // Extract fileSize if mentioned in intro or meta
   let fileSize = fallbackFileSize || "";
-  if (!fileSize) {
-    const introFull = $(".article-content, .desc, p, .readDetail, .intro, .book-intro").text();
-    const sizeMatch = introFull.match(/(?:文件大小|TXT大小|全本大小|大小)[：:]\s*([\d\.]+\s*(?:MB|KB|M|K|mb|kb|g|G))/i);
+  if (!fileSize || fileSize.includes("undefined")) {
+    const introFull = $(".article-content, .desc, p, .readDetail, .intro, .book-intro, body").text();
+    const sizeMatch = introFull.match(/(?:小说大小|文件大小|TXT大小|全本大小|大小)[：:]\s*([\d\.]+\s*(?:MB|KB|GB|M|K|mb|kb|g|G)?i?B?)/i);
     if (sizeMatch) {
       fileSize = sizeMatch[1].toUpperCase().replace(/\s+/g, " ");
       if (!fileSize.includes("B") && !fileSize.includes("b")) fileSize += "B";
     }
+  }
+  if (!fileSize && aiquDetailCache.has(novelUrl)) {
+    fileSize = aiquDetailCache.get(novelUrl)?.fileSize || "";
   }
   fileSize = formatOrEstimateFileSize(fileSize, undefined, undefined, undefined, `${title}_${author}`);
 
@@ -1466,10 +1469,13 @@ function extractChaptersFromText(text: string, fileUrl: string): ChapterItem[] {
       /^第[一二三四五六七八九十百千0-9]+\s*[章回节]/.test(t) ||
       /^Chapter\s*\d+/i.test(t)
     ) {
+      // If the first chapter is at line > 0 (meaning there is book preamble/synopsis before it),
+      // make the first chapter's pointer start at line 0 so reading Chapter 1 includes the complete opening
+      const startLine = (chapters.length === 0 && idx > 0) ? 0 : idx;
       chapters.push({
         index: chapters.length + 1,
         title: t.substring(0, 60),
-        url: `txt:${encodeURI(fileUrl)}#line:${idx}`,
+        url: `txt:${encodeURI(fileUrl)}#line:${startLine}`,
       });
     }
   });
@@ -1479,10 +1485,11 @@ function extractChaptersFromText(text: string, fileUrl: string): ChapterItem[] {
     lines.forEach((l, idx) => {
       const t = l.trim();
       if (/^(\d+|[一二三四五六七八九十百]+)[\s、.【]/.test(t) && t.length < 50) {
+        const startLine = (chapters.length === 0 && idx > 0) ? 0 : idx;
         chapters.push({
           index: chapters.length + 1,
           title: t.substring(0, 60),
-          url: `txt:${encodeURI(fileUrl)}#line:${idx}`,
+          url: `txt:${encodeURI(fileUrl)}#line:${startLine}`,
         });
       }
     });
@@ -1503,7 +1510,7 @@ function extractChaptersFromText(text: string, fileUrl: string): ChapterItem[] {
 }
 
 /**
- * Fetch raw chapter text and extract clean content
+ * Fetch raw chapter text and extract clean content with proper paragraph spacing
  */
 export async function fetchChapterText(chapterUrl: string): Promise<string> {
   try {
@@ -1517,20 +1524,50 @@ export async function fetchChapterText(chapterUrl: string): Promise<string> {
         if (txt) {
           const lines = txt.split(/\r\n|\n|\r/);
           if (lineIdx >= 0 && lineIdx < lines.length) {
-            const result: string[] = [lines[lineIdx]];
-            for (let i = lineIdx + 1; i < lines.length; i++) {
-              const line = lines[i];
-              const trimmed = line.trim();
-              if (
-                /^第\s*\d+\s*[章回节]/.test(trimmed) ||
-                /^第[一二三四五六七八九十百千0-9]+\s*[章回节]/.test(trimmed) ||
-                /^Chapter\s*\d+/i.test(trimmed)
-              ) {
-                break;
+            const result: string[] = [];
+            if (lineIdx === 0) {
+              // Read from line 0 (including book preamble), through the first chapter heading & body,
+              // and stop at the second chapter heading
+              let seenFirstHeader = false;
+              for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                const trimmed = line.trim();
+                const isHeader =
+                  /^第\s*\d+\s*[章回节]/.test(trimmed) ||
+                  /^第[一二三四五六七八九十百千0-9]+\s*[章回节]/.test(trimmed) ||
+                  /^Chapter\s*\d+/i.test(trimmed);
+
+                if (isHeader) {
+                  if (!seenFirstHeader) {
+                    seenFirstHeader = true;
+                    result.push(line);
+                    continue;
+                  } else {
+                    break;
+                  }
+                }
+                result.push(line);
               }
-              result.push(line);
+            } else {
+              result.push(lines[lineIdx]);
+              for (let i = lineIdx + 1; i < lines.length; i++) {
+                const line = lines[i];
+                const trimmed = line.trim();
+                if (
+                  /^第\s*\d+\s*[章回节]/.test(trimmed) ||
+                  /^第[一二三四五六七八九十百千0-9]+\s*[章回节]/.test(trimmed) ||
+                  /^Chapter\s*\d+/i.test(trimmed)
+                ) {
+                  break;
+                }
+                result.push(line);
+              }
             }
-            return result.join("\n").trim();
+            return result
+              .map((l) => l.trim())
+              .filter(Boolean)
+              .join("\n\n")
+              .trim();
           }
         }
       }
@@ -1564,8 +1601,10 @@ export async function fetchChapterText(chapterUrl: string): Promise<string> {
       .replace(/52书库[^\n]*/gi, "")
       .replace(/笔趣阁[^\n]*/gi, "")
       .replace(/\r\n/g, "\n")
-      .replace(/\n\s*\n/g, "\n\n")
-      .trim();
+      .split(/\n+/)
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .join("\n\n");
 
     return clean;
   } catch (e) {
@@ -2335,147 +2374,204 @@ async function scrapeFuxsbExplore(options: ExploreFilterOptions): Promise<Explor
   return items;
 }
 
+// Cache for full detail metadata from aiqu226 detail pages
+export const aiquDetailCache = new Map<string, { fileSize?: string; points?: number; likes?: number; summary?: string }>();
+
+export async function enrichAiquNovelItems(items: ExploreNovelItem[]): Promise<void> {
+  const toFetch = items.filter(
+    (it) => it.siteId === "aiqu226" && it.novelUrl && !aiquDetailCache.has(it.novelUrl)
+  );
+
+  // If already cached, apply immediately
+  items.forEach((it) => {
+    if (it.siteId === "aiqu226" && it.novelUrl && aiquDetailCache.has(it.novelUrl)) {
+      const cached = aiquDetailCache.get(it.novelUrl)!;
+      if (cached.fileSize) it.fileSize = cached.fileSize;
+      if (cached.points) it.points = cached.points;
+      if (cached.likes) it.likes = cached.likes;
+      if (cached.summary && cached.summary.length > (it.summary?.length || 0)) it.summary = cached.summary;
+    }
+  });
+
+  if (toFetch.length === 0) return;
+
+  // Fetch uncached items in parallel chunks of 10
+  const chunks: ExploreNovelItem[][] = [];
+  for (let i = 0; i < toFetch.length; i += 10) {
+    chunks.push(toFetch.slice(i, i + 10));
+  }
+
+  for (const chunk of chunks) {
+    await Promise.allSettled(
+      chunk.map(async (it) => {
+        try {
+          const res = await axios.get(it.novelUrl, {
+            responseType: "arraybuffer",
+            timeout: 3500,
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36",
+              Referer: "http://www.aiqu226.com/",
+            },
+          });
+          const html = iconv.decode(Buffer.from(res.data), "gbk");
+          const $ = cheerio.load(html);
+          const fullText = $.text();
+
+          const sizeMatch = fullText.match(/小说大小[：:]\s*([\d.]+\s*(?:MB|KB|GB|M|K|G)?i?B?)/i);
+          const ptsMatch = fullText.match(/文章积分[：:]\s*([\d,]+)/i);
+          const collMatch = fullText.match(/(?:当前被收藏数|收藏数)[：:]\s*([\d,]+)/i);
+          const reviewsMatch = fullText.match(/(?:总书评数|书评数)[：:]\s*([\d,]+)/i);
+          const fluidMatch = fullText.match(/营养液数[：:]\s*([\d,]+)/i);
+
+          let intro = "";
+          const introIdx = fullText.search(/(?:小说简介|简介|文案)[：:]/);
+          if (introIdx !== -1) {
+            intro = fullText
+              .substring(introIdx, introIdx + 600)
+              .replace(/^(?:小说简介|简介|文案)[：:]\s*/, "")
+              .replace(/【完结】.*$/, "")
+              .trim();
+          }
+
+          const data: { fileSize?: string; points?: number; likes?: number; summary?: string } = {};
+          if (sizeMatch) {
+            let s = sizeMatch[1].toUpperCase().replace(/\s+/g, " ");
+            if (!s.includes("B") && !s.includes("b")) s += "B";
+            data.fileSize = s;
+            it.fileSize = s;
+          }
+          if (ptsMatch) {
+            const pVal = parseInt(ptsMatch[1].replace(/,/g, ""), 10);
+            if (pVal > 0) {
+              data.points = pVal;
+              it.points = pVal;
+            }
+          }
+          let totalLikes = 0;
+          if (collMatch) {
+            totalLikes = parseInt(collMatch[1].replace(/,/g, ""), 10) || 0;
+          } else if (reviewsMatch) {
+            totalLikes = parseInt(reviewsMatch[1].replace(/,/g, ""), 10) || 0;
+          } else if (fluidMatch) {
+            totalLikes = parseInt(fluidMatch[1].replace(/,/g, ""), 10) || 0;
+          }
+          if (totalLikes > 0) {
+            data.likes = totalLikes;
+            it.likes = totalLikes;
+          }
+          if (intro && intro.length > (it.summary?.length || 0)) {
+            data.summary = intro;
+            it.summary = intro;
+          }
+          aiquDetailCache.set(it.novelUrl, data);
+        } catch {}
+      })
+    );
+  }
+}
+
 // 4. aiqu226 Search-Driven & Comprehensive Full-Year Category Explorer Scraper
 async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<ExploreNovelItem[]> {
   const items: ExploreNovelItem[] = [];
-  const searchQueries = buildExploreSearchKeywords(options);
   const oriFilter = options.orientation || "all";
   const yearFilter = options.year || "all";
+  const userQuery = (options.query || "").trim();
+  const rawTags = options.tags && options.tags.length > 0
+    ? options.tags.filter((t) => t && t !== "all")
+    : (options.tag && options.tag !== "all" ? [options.tag.trim()] : []);
 
   const fetchTasks: { url: string; page: number }[] = [];
 
-  // Determine Category 15 (BL) page spans covering the entire year:
-  // 2026: 1..35, 2025: 36..80, 2024: 81..125, 2023: 126..170, 2022: 171..215, older: 216..255
-  if (oriFilter === "bl") {
-    let startPage = 1;
-    let endPage = 35;
-    if (yearFilter === "2026") {
-      startPage = 1;
-      endPage = 35;
-    } else if (yearFilter === "2025") {
-      startPage = 36;
-      endPage = 80;
-    } else if (yearFilter === "2024") {
-      startPage = 81;
-      endPage = 125;
-    } else if (yearFilter === "2023") {
-      startPage = 126;
-      endPage = 170;
-    } else if (yearFilter === "2022") {
-      startPage = 171;
-      endPage = 215;
-    } else if (yearFilter === "older") {
-      startPage = 216;
-      endPage = 255;
-    } else {
-      // "all" - comprehensive sample spanning all years
-      for (const p of [1, 2, 3, 5, 8, 12, 20, 36, 38, 45, 60, 81, 85, 95, 110, 126, 135, 150, 171, 185, 200, 216]) {
-        fetchTasks.push({ url: `http://www.aiqu226.com/txt-xx/15/list15_${p}.htm`, page: p });
-      }
-    }
-
-    if (yearFilter !== "all") {
-      for (let p = startPage; p <= endPage; p++) {
-        fetchTasks.push({ url: `http://www.aiqu226.com/txt-xx/15/list15_${p}.htm`, page: p });
-      }
-    }
-
-    // If a user has a specific trope/tag or query, also search the multi-page search index
+  if (userQuery || rawTags.length > 0) {
+    // 1. Direct Search-Driven Mode (Targeted across multiple search pages)
     const prioritizedKeywords: string[] = [];
-    if (options.query && options.query.trim()) prioritizedKeywords.push(options.query.trim());
-    if (options.tag && options.tag !== "all") prioritizedKeywords.push(options.tag);
-    if (options.tags && options.tags.length > 0) {
-      for (const t of options.tags) if (t && t !== "all") prioritizedKeywords.push(t);
-    }
-    const topKeywords = Array.from(new Set(prioritizedKeywords.filter(Boolean)));
+    if (userQuery) prioritizedKeywords.push(userQuery);
+    for (const t of rawTags) prioritizedKeywords.push(t);
+    const topKeywords = Array.from(new Set(prioritizedKeywords.filter(Boolean))).slice(0, 3);
+
     for (const kw of topKeywords) {
       const hex = encodeGBKHex(kw);
-      // Query up to 20 search pages for the trope/keyword to ensure deep coverage
-      for (let sp = 1; sp <= 20; sp++) {
-        fetchTasks.push({ url: `http://www.aiqu226.com/search.asp?page=${sp}&word=${hex}`, page: sp });
-      }
-    }
-  } else if (oriFilter === "het") {
-    // Female / Romance section (cycs/list112 and gdyq/list111)
-    let startPage = 1;
-    let endPage = 20;
-    if (yearFilter === "2026") {
-      startPage = 1;
-      endPage = 20;
-    } else if (yearFilter === "2025") {
-      startPage = 21;
-      endPage = 50;
-    } else if (yearFilter === "2024") {
-      startPage = 51;
-      endPage = 85;
-    } else if (yearFilter === "2023") {
-      startPage = 86;
-      endPage = 120;
-    } else if (yearFilter === "2022") {
-      startPage = 121;
-      endPage = 155;
-    } else if (yearFilter === "older") {
-      startPage = 156;
-      endPage = 200;
-    } else {
-      for (const p of [1, 5, 10, 21, 30, 45, 51, 65, 80, 86, 100, 115, 121, 140]) {
-        fetchTasks.push({ url: `http://www.aiqu226.com/txt-xx/nsxs/cycs/list112_${p}.htm`, page: p });
-      }
-    }
-
-    if (yearFilter !== "all") {
-      for (let p = startPage; p <= endPage; p++) {
-        fetchTasks.push({ url: `http://www.aiqu226.com/txt-xx/nsxs/cycs/list112_${p}.htm`, page: p });
-        if (p % 2 === 0) {
-          fetchTasks.push({ url: `http://www.aiqu226.com/txt-xx/nsxs/gdyq/list111_${p}.htm`, page: p });
-        }
-      }
-    }
-
-    const prioritizedKeywords: string[] = [];
-    if (options.query && options.query.trim()) prioritizedKeywords.push(options.query.trim());
-    if (options.tag && options.tag !== "all") prioritizedKeywords.push(options.tag);
-    if (options.tags && options.tags.length > 0) {
-      for (const t of options.tags) if (t && t !== "all") prioritizedKeywords.push(t);
-    }
-    const topKeywords = Array.from(new Set(prioritizedKeywords.filter(Boolean)));
-    for (const kw of topKeywords) {
-      const hex = encodeGBKHex(kw);
-      for (let sp = 1; sp <= 20; sp++) {
+      for (let sp = 1; sp <= 8; sp++) {
         fetchTasks.push({ url: `http://www.aiqu226.com/search.asp?page=${sp}&word=${hex}`, page: sp });
       }
     }
   } else {
-    // All orientations: sample across BL and Het archives
-    let blStart = 1;
-    let blEnd = 35;
-    if (yearFilter === "2025") { blStart = 36; blEnd = 80; }
-    else if (yearFilter === "2024") { blStart = 81; blEnd = 125; }
-    else if (yearFilter === "2023") { blStart = 126; blEnd = 170; }
-    else if (yearFilter === "2022") { blStart = 171; blEnd = 215; }
-    else if (yearFilter === "older") { blStart = 216; blEnd = 255; }
+    // 2. Comprehensive Catalog Discovery Mode (Comprehensive Year Scanning)
+    if (oriFilter === "bl") {
+      let startPage = 1;
+      let endPage = 35;
+      if (yearFilter === "2026") {
+        startPage = 1;
+        endPage = 35;
+      } else if (yearFilter === "2025") {
+        startPage = 36;
+        endPage = 80;
+      } else if (yearFilter === "2024") {
+        startPage = 81;
+        endPage = 125;
+      } else if (yearFilter === "2023") {
+        startPage = 126;
+        endPage = 170;
+      } else if (yearFilter === "2022") {
+        startPage = 171;
+        endPage = 215;
+      } else if (yearFilter === "older") {
+        startPage = 216;
+        endPage = 255;
+      }
 
-    if (yearFilter === "all") {
-      for (const p of [1, 5, 15, 36, 50, 81, 100, 126, 145, 171, 200, 216]) {
-        fetchTasks.push({ url: `http://www.aiqu226.com/txt-xx/15/list15_${p}.htm`, page: p });
+      if (yearFilter === "all") {
+        const samplePages = [1, 2, 3, 5, 8, 12, 20, 36, 38, 45, 60, 81, 85, 95, 110, 126, 135, 150, 171, 185, 200, 216];
+        for (const p of samplePages) {
+          fetchTasks.push({ url: `http://www.aiqu226.com/txt-xx/15/list15_${p}.htm`, page: p });
+        }
+      } else {
+        for (let p = startPage; p <= endPage; p++) {
+          fetchTasks.push({ url: `http://www.aiqu226.com/txt-xx/15/list15_${p}.htm`, page: p });
+        }
+      }
+    } else if (oriFilter === "het") {
+      let startPage = 1;
+      let endPage = 20;
+      if (yearFilter === "2026") {
+        startPage = 1;
+        endPage = 20;
+      } else if (yearFilter === "2025") {
+        startPage = 21;
+        endPage = 50;
+      } else if (yearFilter === "2024") {
+        startPage = 51;
+        endPage = 85;
+      } else if (yearFilter === "2023") {
+        startPage = 86;
+        endPage = 120;
+      } else if (yearFilter === "2022") {
+        startPage = 121;
+        endPage = 155;
+      } else if (yearFilter === "older") {
+        startPage = 156;
+        endPage = 190;
+      }
+
+      if (yearFilter === "all") {
+        const samplePages = [1, 2, 3, 10, 21, 25, 35, 51, 65, 86, 100, 121, 140, 156];
+        for (const p of samplePages) {
+          fetchTasks.push({ url: `http://www.aiqu226.com/txt-xx/nsxs/cycs/list112_${p}.htm`, page: p });
+        }
+      } else {
+        for (let p = startPage; p <= endPage; p++) {
+          fetchTasks.push({ url: `http://www.aiqu226.com/txt-xx/nsxs/cycs/list112_${p}.htm`, page: p });
+        }
       }
     } else {
-      for (let p = blStart; p <= blEnd; p++) {
+      // General / All orientations
+      const blSample = [1, 2, 3, 5, 10, 20, 36, 40, 50, 81, 90, 126, 140, 171];
+      const hetSample = [1, 2, 5, 10, 21, 30, 51, 70, 86];
+      for (const p of blSample) {
         fetchTasks.push({ url: `http://www.aiqu226.com/txt-xx/15/list15_${p}.htm`, page: p });
       }
-    }
-
-    const prioritizedKeywords: string[] = [];
-    if (options.query && options.query.trim()) prioritizedKeywords.push(options.query.trim());
-    if (options.tag && options.tag !== "all") prioritizedKeywords.push(options.tag);
-    if (options.tags && options.tags.length > 0) {
-      for (const t of options.tags) if (t && t !== "all") prioritizedKeywords.push(t);
-    }
-    const topKeywords = Array.from(new Set(prioritizedKeywords.filter(Boolean)));
-    for (const kw of topKeywords) {
-      const hex = encodeGBKHex(kw);
-      for (let sp = 1; sp <= 15; sp++) {
-        fetchTasks.push({ url: `http://www.aiqu226.com/search.asp?page=${sp}&word=${hex}`, page: sp });
+      for (const p of hetSample) {
+        fetchTasks.push({ url: `http://www.aiqu226.com/txt-xx/nsxs/cycs/list112_${p}.htm`, page: p });
       }
     }
   }
@@ -2484,7 +2580,7 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
     fetchTasks.map(async ({ url: targetUrl, page: p }) => {
       const res = await axios.get(targetUrl, {
         responseType: "arraybuffer",
-        timeout: 5000,
+        timeout: 4000,
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36",
           Referer: "http://www.aiqu226.com/",
@@ -2535,16 +2631,32 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
           dateStr = `${year}-${m}`;
         }
 
+        // Authentic Bookmarks / Favorites Count (当前被收藏数)
         let likes = 0;
-        const collMatch =
-          rawContent.match(/(?:Current Favorites|当前被收藏数|收藏数)[：:]\s*([\d,]+)/i) ||
-          rawContent.match(/(?:Total Reviews|总书评数|书评数)[：:]\s*([\d,]+)/i) ||
-          rawContent.match(/营养液数?[：:]\s*([\d,]+)/);
-        if (collMatch) likes = parseInt(collMatch[1].replace(/,/g, ""), 10);
+        const collMatch = rawContent.match(/(?:Current Favorites|当前被收藏数|收藏数)[：:]\s*([\d,]+)/i);
+        const reviewsMatch = rawContent.match(/(?:Total Reviews|总书评数|书评数)[：:]\s*([\d,]+)/i);
+        const fluidMatch = rawContent.match(/营养液数?[：:]\s*([\d,]+)/i);
+        if (collMatch) {
+          likes = parseInt(collMatch[1].replace(/,/g, ""), 10) || 0;
+        } else if (reviewsMatch) {
+          likes = parseInt(reviewsMatch[1].replace(/,/g, ""), 10) || 0;
+        } else if (fluidMatch) {
+          likes = parseInt(fluidMatch[1].replace(/,/g, ""), 10) || 0;
+        }
 
+        // Accurate Points Calculation (文章积分)
         let points = 0;
         const ptsMatch = rawContent.match(/(?:Article Points|文章积分|积分)[：:]\s*([\d,]+)/i);
-        if (ptsMatch) points = parseInt(ptsMatch[1].replace(/,/g, ""), 10);
+        if (ptsMatch) points = parseInt(ptsMatch[1].replace(/,/g, ""), 10) || 0;
+
+        // Size extraction
+        const sizeMatch = rawContent.match(/小说大小[：:]\s*([\d.]+\s*(?:MB|KB|GB|M|K|G)?i?B?)/i);
+        let fileSize: string | undefined;
+        if (sizeMatch) {
+          let s = sizeMatch[1].toUpperCase().replace(/\s+/g, " ");
+          if (!s.includes("B") && !s.includes("b")) s += "B";
+          fileSize = s;
+        }
 
         let wordCount = 0;
         const wcMatch = rawContent.match(/(?:字数|全文字数|总字数)[：:]\s*([\d,]+|\d+(?:\.\d+)?[万wW]?)字?/i) || rawContent.match(/(\d+(?:\.\d+)?[万wW])字/);
@@ -2555,6 +2667,9 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
           } else {
             wordCount = parseInt(wcStr, 10) || 0;
           }
+        }
+        if (!fileSize && wordCount > 0) {
+          fileSize = `${((wordCount * 3.0) / (1024 * 1024)).toFixed(2)} MB`;
         }
 
         const isGl = isGlNovel(title, rawContent, category, href);
@@ -2610,7 +2725,7 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
           likes,
           wordCount,
           status: "完结",
-          fileSize: wordCount > 0 ? `${((wordCount * 3.0) / (1024 * 1024)).toFixed(2)} MB` : undefined,
+          fileSize,
         });
       });
 
@@ -2647,15 +2762,28 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
         }
 
         let likes = 0;
-        const collMatch =
-          rawContent.match(/(?:Current Favorites|当前被收藏数|收藏数)[：:]\s*([\d,]+)/i) ||
-          rawContent.match(/(?:Total Reviews|总书评数|书评数)[：:]\s*([\d,]+)/i) ||
-          rawContent.match(/营养液数?[：:]\s*([\d,]+)/);
-        if (collMatch) likes = parseInt(collMatch[1].replace(/,/g, ""), 10);
+        const collMatch = rawContent.match(/(?:Current Favorites|当前被收藏数|收藏数)[：:]\s*([\d,]+)/i);
+        const reviewsMatch = rawContent.match(/(?:Total Reviews|总书评数|书评数)[：:]\s*([\d,]+)/i);
+        const fluidMatch = rawContent.match(/营养液数?[：:]\s*([\d,]+)/i);
+        if (collMatch) {
+          likes = parseInt(collMatch[1].replace(/,/g, ""), 10) || 0;
+        } else if (reviewsMatch) {
+          likes = parseInt(reviewsMatch[1].replace(/,/g, ""), 10) || 0;
+        } else if (fluidMatch) {
+          likes = parseInt(fluidMatch[1].replace(/,/g, ""), 10) || 0;
+        }
 
         let points = 0;
         const ptsMatch = rawContent.match(/(?:Article Points|文章积分|积分)[：:]\s*([\d,]+)/i);
-        if (ptsMatch) points = parseInt(ptsMatch[1].replace(/,/g, ""), 10);
+        if (ptsMatch) points = parseInt(ptsMatch[1].replace(/,/g, ""), 10) || 0;
+
+        const sizeMatch = rawContent.match(/小说大小[：:]\s*([\d.]+\s*(?:MB|KB|GB|M|K|G)?i?B?)/i);
+        let fileSize: string | undefined;
+        if (sizeMatch) {
+          let s = sizeMatch[1].toUpperCase().replace(/\s+/g, " ");
+          if (!s.includes("B") && !s.includes("b")) s += "B";
+          fileSize = s;
+        }
 
         let wordCount = 0;
         const wcMatch = rawContent.match(/(?:字数|全文字数|总字数)[：:]\s*([\d,]+|\d+(?:\.\d+)?[万wW]?)字?/i) || rawContent.match(/(\d+(?:\.\d+)?[万wW])字/);
@@ -2666,6 +2794,9 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
           } else {
             wordCount = parseInt(wcStr, 10) || 0;
           }
+        }
+        if (!fileSize && wordCount > 0) {
+          fileSize = `${((wordCount * 3.0) / (1024 * 1024)).toFixed(2)} MB`;
         }
 
         const isGl = isGlNovel(title, rawContent, category, href);
@@ -2742,7 +2873,7 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
           likes,
           wordCount,
           status: "完结",
-          fileSize: wordCount > 0 ? `${((wordCount * 3.0) / (1024 * 1024)).toFixed(2)} MB` : undefined,
+          fileSize,
         });
       });
 
@@ -2764,6 +2895,16 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
   }
 
   // Sort by likes descending by default, tie-breaking by points
+  items.sort((a, b) => {
+    const diff = (b.likes || 0) - (a.likes || 0);
+    if (diff !== 0) return diff;
+    return (b.points || 0) - (a.points || 0);
+  });
+
+  // Enrich top 30 items with full verified details from detail pages or cache
+  await enrichAiquNovelItems(items.slice(0, 30));
+
+  // Re-sort to reflect any updated points and likes
   items.sort((a, b) => {
     const diff = (b.likes || 0) - (a.likes || 0);
     if (diff !== 0) return diff;
@@ -3242,17 +3383,19 @@ async function scrapeDmxsExplore(options: ExploreFilterOptions): Promise<Explore
     });
   }
 
-  // 7. Fetch authentic ratings for novels that don't have them in HTML
-  const novelsToRate = yearFiltered.slice(0, 50);
-  await Promise.all(
+  // 7. Fetch authentic ratings for novels that don't have them in HTML (up to 12 items, non-blocking fallback)
+  const novelsToRate = yearFiltered.slice(0, 12);
+  await Promise.allSettled(
     novelsToRate.map(async (n) => {
       if (n.rating !== undefined) return;
       if (n.articleId) {
-        const r = await fetchDmxsRating(n.articleId, n.category);
-        if (r && r.rating !== undefined) {
-          n.rating = r.rating;
-          n.ratingCount = r.ratingCount;
-        }
+        try {
+          const r = await fetchDmxsRating(n.articleId, n.category);
+          if (r && r.rating !== undefined) {
+            n.rating = r.rating;
+            n.ratingCount = r.ratingCount;
+          }
+        } catch {}
       }
     })
   );
@@ -3319,6 +3462,24 @@ async function scrapeDmxsExplore(options: ExploreFilterOptions): Promise<Explore
   return items;
 }
 
+// Safety wrapper: guarantees an individual site scraper never stalls the aggregator
+function safeScrapeWithTimeout(scraperPromise: Promise<ExploreNovelItem[]>, ms = 3800): Promise<ExploreNovelItem[]> {
+  let timer: NodeJS.Timeout;
+  const timeoutPromise = new Promise<ExploreNovelItem[]>((resolve) => {
+    timer = setTimeout(() => resolve([]), ms);
+  });
+  return Promise.race([
+    scraperPromise.then((res) => {
+      clearTimeout(timer);
+      return res;
+    }).catch(() => {
+      clearTimeout(timer);
+      return [];
+    }),
+    timeoutPromise,
+  ]);
+}
+
 // Master Explorer Aggregator with multi-filter (JJWXC, 52shuku, Fuxsb, Aiqu226, Dmxs)
 export async function scrapeExploreNovels(options: ExploreFilterOptions): Promise<ExploreNovelItem[]> {
   const targetSite = options.site || "all";
@@ -3328,27 +3489,27 @@ export async function scrapeExploreNovels(options: ExploreFilterOptions): Promis
 
   // JJWXC (晋江文学城)
   if (targetSite === "all" || targetSite === "jjwxc") {
-    promises.push(scrapeJjwxcExplore(options));
+    promises.push(safeScrapeWithTimeout(scrapeJjwxcExplore(options), 3800));
   }
 
   // 52shuku (52书库)
   if (targetSite === "all" || targetSite === "52shuku") {
-    promises.push(scrape52ShukuExplore(options));
+    promises.push(safeScrapeWithTimeout(scrape52ShukuExplore(options), 3800));
   }
 
   // Fuxsb (腐小说)
   if (targetSite === "all" || targetSite === "fuxsb") {
-    promises.push(scrapeFuxsbExplore(options));
+    promises.push(safeScrapeWithTimeout(scrapeFuxsbExplore(options), 3800));
   }
 
   // aiqu226 (爱去小说)
   if (targetSite === "all" || targetSite === "aiqu226") {
-    promises.push(scrapeAiqu226Explore(options));
+    promises.push(safeScrapeWithTimeout(scrapeAiqu226Explore(options), 3800));
   }
 
   // dmxs (耽美小说)
   if (targetSite === "all" || targetSite === "dmxs") {
-    promises.push(scrapeDmxsExplore(options));
+    promises.push(safeScrapeWithTimeout(scrapeDmxsExplore(options), 3800));
   }
 
   const results = await Promise.allSettled(promises);

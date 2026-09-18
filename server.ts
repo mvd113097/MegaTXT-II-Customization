@@ -9,7 +9,7 @@ import { GoogleGenAI } from "@google/genai";
 import { quotaScheduler, formatCleanErrorMessage } from "./server/quotaScheduler";
 import { parseAndValidateBatchResponse, groupChunksIntoBatches, MAX_BATCH_CHAR_BUDGET } from "./server/batchParser";
 import { sendTelegramNotification as rawSendTelegramNotification } from "./server/telegram";
-import { searchStoreNovels, fetchNovelTOC, fetchChapterText, scrapeExploreNovels, findNovelMirrors } from "./server/storeScraper";
+import { searchStoreNovels, fetchNovelTOC, fetchChapterText, scrapeExploreNovels, findNovelMirrors, enrichAiquNovelItems } from "./server/storeScraper";
 import {
   initFirestore,
   saveJobToFirestore,
@@ -2432,6 +2432,9 @@ app.get("/api/store/explore", requireAuthMiddleware, async (req, res) => {
     const startIndex = (pageNum - 1) * PAGE_SIZE;
     const pageItems = allItems.slice(startIndex, startIndex + PAGE_SIZE);
 
+    // Non-blocking background enrichment so the response is returned immediately to the client!
+    enrichAiquNovelItems(pageItems).catch(() => {});
+
     res.json({
       success: true,
       total: allItems.length,
@@ -2447,10 +2450,10 @@ app.get("/api/store/explore", requireAuthMiddleware, async (req, res) => {
   }
 });
 
-// Quick Chapter 1 Peek Endpoint for reading preview drawer
+// Quick Chapter Peek Endpoint for reading preview drawer
 app.post("/api/store/peek-chapter", requireAuthMiddleware, async (req, res) => {
   try {
-    const { novelUrl, siteId, title, author, intro, coverUrl, fileSize } = req.body;
+    const { novelUrl, siteId, title, author, intro, coverUrl, fileSize, targetIndex, targetChapterUrl } = req.body;
     if (!novelUrl && !title) {
       res.status(400).json({ error: "Missing 'novelUrl' or 'title' parameter." });
       return;
@@ -2469,15 +2472,22 @@ app.post("/api/store/peek-chapter", requireAuthMiddleware, async (req, res) => {
       return;
     }
 
-    const firstChapter = detail.chapters[0];
-    const chapterBody = await fetchChapterText(firstChapter.url);
+    let targetChapter = detail.chapters[0];
+    if (typeof targetIndex === "number" && targetIndex >= 1 && targetIndex <= detail.chapters.length) {
+      targetChapter = detail.chapters[targetIndex - 1];
+    } else if (targetChapterUrl) {
+      const found = detail.chapters.find((c) => c.url === targetChapterUrl);
+      if (found) targetChapter = found;
+    }
+
+    const chapterBody = await fetchChapterText(targetChapter.url);
 
     res.json({
       success: true,
       title: detail.title || title,
       author: detail.author || author,
-      chapterTitle: firstChapter.title || "Chapter 1",
-      chapterIndex: firstChapter.index,
+      chapterTitle: targetChapter.title || `Chapter ${targetChapter.index}`,
+      chapterIndex: targetChapter.index,
       totalChapters: detail.chapters.length,
       content: chapterBody,
       novelUrl: detail.novelUrl || novelUrl,
@@ -2487,6 +2497,27 @@ app.post("/api/store/peek-chapter", requireAuthMiddleware, async (req, res) => {
   } catch (err: any) {
     console.error("Peek chapter error:", err);
     res.status(500).json({ error: err.message || "Failed to peek novel chapter." });
+  }
+});
+
+// Dedicated Chapter Fetch Endpoint for rapid chapter navigation
+app.post("/api/store/fetch-chapter", requireAuthMiddleware, async (req, res) => {
+  try {
+    const { chapterUrl, chapterTitle } = req.body;
+    if (!chapterUrl) {
+      res.status(400).json({ error: "Missing 'chapterUrl' parameter." });
+      return;
+    }
+
+    const content = await fetchChapterText(chapterUrl);
+    res.json({
+      success: true,
+      chapterTitle: chapterTitle || "Chapter",
+      content,
+    });
+  } catch (err: any) {
+    console.error("Fetch chapter error:", err);
+    res.status(500).json({ error: err.message || "Failed to fetch chapter text." });
   }
 });
 

@@ -31,6 +31,8 @@ import {
   ArrowUpDown,
   BookMarked,
   Trash2,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 import { ChapterItem, StoreNovelDetail } from "./StoreView";
 
@@ -279,6 +281,16 @@ let cachedFeedState: {
   scrollY: number;
 } | null = null;
 
+// Multi-query in-memory LRU client cache for instantaneous filter switching
+interface ClientExploreCacheEntry {
+  items: ExploreNovelItem[];
+  total: number;
+  hasMore: boolean;
+  timestamp: number;
+}
+const clientExploreCache = new Map<string, ClientExploreCacheEntry>();
+const CLIENT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes cache per combination
+
 export const ExploreView: React.FC<ExploreViewProps> = ({
   onImportNovel,
   getAuthHeaders,
@@ -311,6 +323,9 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isLoadingMore, setIsLoadingMore] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // AbortController ref to cancel obsolete queries immediately on fast tapping
+  const activeAbortControllerRef = useRef<AbortController | null>(null);
 
   // View Mode: Cards vs Compact List
   const [viewMode, setViewMode] = useState<"cards" | "compact">(() => {
@@ -443,33 +458,82 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   // Background prefetching ref to avoid duplicate prefetch calls
   const prefetchedPages = useRef<Set<number>>(new Set());
 
-  // Fetch explore collection
-  const fetchExploreFeed = async (pageIdx = 1, append = false) => {
+  // Fetch explore collection with instant client cache & AbortController
+  const fetchExploreFeed = async (
+    pageIdx = 1,
+    append = false,
+    overrideFilters?: {
+      site?: string;
+      year?: string;
+      orientation?: string;
+      tags?: string[];
+      query?: string;
+      sort?: "points" | "likes" | "recent" | "chapters";
+    }
+  ) => {
     setHasSearched(true);
+    const site = overrideFilters?.site ?? selectedSite;
+    const year = overrideFilters?.year ?? selectedYear;
+    const orientation = overrideFilters?.orientation ?? selectedOrientation;
+    const tags = overrideFilters?.tags ?? selectedTags;
+    const query = overrideFilters?.query ?? searchQuery;
+    const sort = overrideFilters?.sort ?? sortBy;
+
+    const cacheKey = `c:${site}:${year}:${orientation}:${tags.slice().sort().join(",")}:${query.trim().toLowerCase()}:${sort}:${pageIdx}`;
+    const cached = clientExploreCache.get(cacheKey);
+    const now = Date.now();
+
+    // 1. Instant cache hit
+    if (!append && cached && now - cached.timestamp < CLIENT_CACHE_TTL_MS) {
+      setItems(sortNovelItems(cached.items, sort));
+      setTotalAvailable(cached.total);
+      setHasMore(cached.hasMore);
+      setPage(pageIdx);
+      setIsLoading(false);
+      setIsLoadingMore(false);
+      setErrorMessage(null);
+      return;
+    }
+
+    // 2. Abort any previous pending request to prevent network freezing
+    if (activeAbortControllerRef.current) {
+      activeAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    activeAbortControllerRef.current = controller;
+
     if (append) {
       setIsLoadingMore(true);
     } else {
       setIsLoading(true);
       prefetchedPages.current.clear();
-      setItems([]);
+      // Keep existing items if available so UI doesn't violently flicker, while setting isLoading indicator
     }
     setErrorMessage(null);
 
+    // 8-second client safety timeout
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, 8000);
+
     try {
       const params = new URLSearchParams({
-        site: selectedSite,
-        year: selectedYear,
-        orientation: selectedOrientation,
-        tag: selectedTags.length > 0 ? selectedTags.join(",") : "all",
-        tags: selectedTags.join(","),
-        q: searchQuery,
-        sort: sortBy,
+        site,
+        year,
+        orientation,
+        tag: tags.length > 0 ? tags.join(",") : "all",
+        tags: tags.join(","),
+        q: query,
+        sort,
         page: String(pageIdx),
       });
 
       const res = await fetch(`/api/store/explore?${params.toString()}`, {
         headers: getAuthHeaders(),
+        signal: controller.signal,
       });
+
+      clearTimeout(timeoutId);
 
       const contentType = res.headers.get("content-type") || "";
       if (!contentType.includes("application/json")) {
@@ -477,8 +541,8 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
         console.warn("Explore non-JSON response:", res.status, text.slice(0, 100));
         throw new Error(
           res.status === 502 || res.status === 503 || res.status === 504
-            ? "Server is busy or restarting. Please tap Search to retry."
-            : `Received invalid response from server (HTTP ${res.status}). Please tap Search to try again.`
+            ? "Server is busy. Tap Search to retry."
+            : `Server returned HTTP ${res.status}. Tap Search to retry.`
         );
       }
 
@@ -494,56 +558,46 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
       const data = await res.json();
       const newItems: ExploreNovelItem[] = data.items || [];
       const totalCount = data.total ?? newItems.length;
+      const moreAvailable = data.hasMore ?? (newItems.length === 50);
+
       setTotalAvailable(totalCount);
-      setHasMore(data.hasMore ?? (newItems.length === 50));
+      setHasMore(moreAvailable);
 
       if (append) {
         setItems((prev) => {
           const seen = new Set(prev.map((i) => `${i.title}_${i.author}`));
           const filtered = newItems.filter((i) => !seen.has(`${i.title}_${i.author}`));
           const combined = [...prev, ...filtered];
-          return sortNovelItems(combined, sortBy);
+          return sortNovelItems(combined, sort);
         });
       } else {
-        setItems(sortNovelItems(newItems, sortBy));
+        setItems(sortNovelItems(newItems, sort));
       }
       setPage(pageIdx);
 
-      // Save to module cache if not append
+      // Save to client cache
+      clientExploreCache.set(cacheKey, {
+        items: newItems,
+        total: totalCount,
+        hasMore: moreAvailable,
+        timestamp: now,
+      });
+
+      // Save to module state
       if (!append && newItems.length > 0) {
         cachedFeedState = {
           items: newItems,
-          filters: {
-            site: selectedSite,
-            year: selectedYear,
-            orientation: selectedOrientation,
-            tags: selectedTags,
-            query: searchQuery,
-            sort: sortBy,
-          },
+          filters: { site, year, orientation, tags, query, sort },
           page: pageIdx,
           scrollY: typeof window !== "undefined" ? window.scrollY : 0,
         };
       }
-
-      // Smart background prefetching of next page into server cache
-      const nextPage = pageIdx + 1;
-      if (!prefetchedPages.current.has(nextPage)) {
-        prefetchedPages.current.add(nextPage);
-        const nextParams = new URLSearchParams({
-          site: selectedSite,
-          year: selectedYear,
-          orientation: selectedOrientation,
-          tag: selectedTags.length > 0 ? selectedTags.join(",") : "all",
-          tags: selectedTags.join(","),
-          q: searchQuery,
-          sort: sortBy,
-          page: String(nextPage),
-        });
-        // Silent background prefetch
-        fetch(`/api/store/explore?${nextParams.toString()}`, { headers: getAuthHeaders() }).catch(() => {});
-      }
     } catch (err: any) {
+      clearTimeout(timeoutId);
+      if (err.name === "AbortError") {
+        // Request was aborted by user filter switch or timeout
+        return;
+      }
       console.error("Explore feed fetch error:", err);
       let msg = err?.message || "Failed to load novels. Please check your connection.";
       if (msg.includes("<!doctype") || msg.includes("is not valid JSON") || msg.includes("Unexpected token")) {
@@ -555,6 +609,13 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
       setIsLoadingMore(false);
     }
   };
+
+  // Auto-load 2026 explore feed on initial mount if empty
+  useEffect(() => {
+    if (!cachedFeedState && items.length === 0 && !hasSearched) {
+      fetchExploreFeed(1, false);
+    }
+  }, []);
 
   // Restore scroll position or state if returning to Explore tab
   useEffect(() => {
@@ -711,6 +772,69 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
       }));
     }
   };
+
+  // Navigate to Next / Previous / Specific Chapter in Peek Drawer
+  const handlePeekNavigateChapter = async (targetIndex: number) => {
+    if (!peekState.allChapters || peekState.allChapters.length === 0) return;
+    if (targetIndex < 1 || targetIndex > peekState.allChapters.length) return;
+
+    const targetChapter = peekState.allChapters[targetIndex - 1];
+    setPeekState((prev) => ({
+      ...prev,
+      isLoading: true,
+      chapterIndex: targetIndex,
+      chapterTitle: targetChapter.title || `Chapter ${targetIndex}`,
+      error: null,
+    }));
+
+    try {
+      const res = await fetch("/api/store/fetch-chapter", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify({
+          chapterUrl: targetChapter.url,
+          chapterTitle: targetChapter.title,
+        }),
+      });
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.error || "Failed to load chapter.");
+      }
+
+      const data = await res.json();
+      setPeekState((prev) => ({
+        ...prev,
+        isLoading: false,
+        chapterTitle: data.chapterTitle || targetChapter.title || `Chapter ${targetIndex}`,
+        content: data.content || "No chapter content found.",
+      }));
+
+      // Scroll reader container to top
+      const scrollContainer = document.getElementById("peek-reader-body");
+      if (scrollContainer) {
+        scrollContainer.scrollTo({ top: 0, behavior: "smooth" });
+      }
+    } catch (err: any) {
+      setPeekState((prev) => ({
+        ...prev,
+        isLoading: false,
+        error: err.message || "Failed to load chapter text.",
+      }));
+    }
+  };
+
+  // Clean split paragraphs for the reader to ensure proper paragraph spacing
+  const peekParagraphs = useMemo(() => {
+    if (!peekState.content) return [];
+    return peekState.content
+      .split(/\r?\n+/)
+      .map((p) => p.trim())
+      .filter(Boolean);
+  }, [peekState.content]);
 
   // Direct 1-Click Import (Always imports ALL chapters as requested by user)
   const handleDirectImport = async (item: ExploreNovelItem) => {
@@ -1028,7 +1152,9 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                   onClick={() => {
                     setSelectedSite(st.id);
                     if (st.id === "aiqu226" || st.id === "52shuku" || st.id === "fuxsb") {
-                      if (sortBy === "points") setSortBy("likes");
+                      if (sortBy === "points") {
+                        setSortBy("likes");
+                      }
                     }
                   }}
                   className={`px-2.5 py-1 rounded-lg text-xs font-medium whitespace-nowrap transition cursor-pointer ${
@@ -1051,7 +1177,9 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                 <button
                   key={yr.id}
                   type="button"
-                  onClick={() => setSelectedYear(yr.id)}
+                  onClick={() => {
+                    setSelectedYear(yr.id);
+                  }}
                   className={`px-2 py-1 rounded-lg text-xs font-medium whitespace-nowrap transition cursor-pointer ${
                     active
                       ? "bg-purple-600 text-white font-bold shadow-xs"
@@ -1075,7 +1203,9 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                 <button
                   key={ori.id}
                   type="button"
-                  onClick={() => setSelectedOrientation(ori.id)}
+                  onClick={() => {
+                    setSelectedOrientation(ori.id);
+                  }}
                   className={`px-3 py-1 rounded-full text-xs font-medium whitespace-nowrap transition cursor-pointer ${
                     active
                       ? "bg-purple-600 text-white font-bold shadow-xs"
@@ -1112,7 +1242,10 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                   <button
                     key={opt.id}
                     type="button"
-                    onClick={() => setSortBy(opt.id as any)}
+                    onClick={() => {
+                      setSortBy(opt.id as any);
+                      setItems((prev) => sortNovelItems(prev, opt.id as any));
+                    }}
                     className={`px-2 py-0.8 rounded-md text-xs font-semibold transition cursor-pointer ${
                       active
                         ? "bg-purple-600 text-white font-bold"
@@ -1137,7 +1270,9 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
               {selectedTags.length > 0 && (
                 <button
                   type="button"
-                  onClick={() => setSelectedTags([])}
+                  onClick={() => {
+                    setSelectedTags([]);
+                  }}
                   className="text-xs text-purple-600 dark:text-purple-400 font-semibold hover:underline cursor-pointer"
                 >
                   Clear All ({selectedTags.length})
@@ -1152,7 +1287,17 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                   <button
                     key={t.id}
                     type="button"
-                    onClick={() => toggleTag(t.id)}
+                    onClick={() => {
+                      let nextTags: string[] = [];
+                      if (t.id === "all") {
+                        nextTags = [];
+                      } else if (selectedTags.includes(t.id)) {
+                        nextTags = selectedTags.filter((x) => x !== t.id);
+                      } else {
+                        nextTags = [...selectedTags, t.id];
+                      }
+                      setSelectedTags(nextTags);
+                    }}
                     className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition cursor-pointer ${
                       active
                         ? isAll
@@ -1666,80 +1811,152 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
         </div>
       )}
 
-      {/* Slide-Over Drawer: Chapter 1 Quick Peek */}
+      {/* Slide-Over Drawer: Quick Chapter Peek & Reader */}
       {peekState.isOpen && (
         <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/60 backdrop-blur-xs animate-in fade-in">
           <div className="w-full max-w-xl bg-white dark:bg-slate-900 h-full shadow-2xl flex flex-col border-l border-purple-200 dark:border-purple-900/50 animate-in slide-in-from-right duration-200">
             {/* Header */}
             <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-start justify-between gap-3 bg-purple-50/50 dark:bg-purple-950/30">
-              <div>
-                <span className="text-[10px] font-bold uppercase tracking-wider text-purple-600 dark:text-purple-400">
-                  Quick Chapter 1 Preview
-                </span>
-                <h3 className="text-base font-bold text-slate-900 dark:text-white leading-tight">
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 mb-0.5">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-purple-600 dark:text-purple-400 bg-purple-100 dark:bg-purple-900/50 px-2 py-0.5 rounded-md">
+                    Quick Peek • Ch {peekState.chapterIndex} of {peekState.totalChapters || peekState.allChapters?.length || 1}
+                  </span>
+                </div>
+                <h3 className="text-base font-bold text-slate-900 dark:text-white leading-tight truncate">
                   {peekState.item?.title}
                 </h3>
-                <p className="text-xs text-slate-500 mt-0.5">
+                <p className="text-xs text-slate-500 mt-0.5 truncate">
                   Author: <span className="font-semibold text-slate-700 dark:text-slate-300">{peekState.item?.author}</span>
-                  {peekState.totalChapters > 0 && ` • Total ${peekState.totalChapters} Chapters`}
+                  {peekState.totalChapters > 0 && ` • ${peekState.totalChapters} Chapters`}
                 </p>
               </div>
 
-              <button
-                type="button"
-                onClick={() => setPeekState((prev) => ({ ...prev, isOpen: false }))}
-                className="p-1 rounded-lg text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
-              >
-                <X className="h-5 w-5" />
-              </button>
+              <div className="flex items-center gap-1">
+                {/* Header Chapter Nav Arrows */}
+                <button
+                  type="button"
+                  onClick={() => handlePeekNavigateChapter(peekState.chapterIndex - 1)}
+                  disabled={peekState.isLoading || peekState.chapterIndex <= 1}
+                  title="Previous Chapter"
+                  className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none cursor-pointer"
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handlePeekNavigateChapter(peekState.chapterIndex + 1)}
+                  disabled={
+                    peekState.isLoading ||
+                    (Boolean(peekState.allChapters) && peekState.chapterIndex >= (peekState.allChapters?.length || 1))
+                  }
+                  title="Next Chapter"
+                  className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none cursor-pointer"
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPeekState((prev) => ({ ...prev, isOpen: false }))}
+                  className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer ml-1"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
             </div>
 
-            {/* Body Text */}
-            <div className="flex-1 p-5 overflow-y-auto space-y-4 text-sm leading-relaxed text-slate-800 dark:text-slate-200 font-serif">
+            {/* Reader Body with distinct paragraph spacing */}
+            <div
+              id="peek-reader-body"
+              className="flex-1 p-5 overflow-y-auto space-y-4 text-sm leading-relaxed text-slate-800 dark:text-slate-200 font-serif"
+            >
               {peekState.isLoading ? (
-                <div className="py-24 text-center text-slate-400 space-y-3">
+                <div className="py-28 text-center text-slate-400 space-y-3">
                   <Loader2 className="h-8 w-8 animate-spin text-purple-600 mx-auto" />
-                  <p className="text-xs font-sans">Fetching Chapter 1 text from source archive...</p>
+                  <p className="text-xs font-sans">
+                    Loading {peekState.chapterTitle || `Chapter ${peekState.chapterIndex}`} text from source archive...
+                  </p>
                 </div>
               ) : peekState.error ? (
-                <div className="p-4 rounded-xl bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 text-xs font-sans">
-                  <strong>Notice:</strong> {peekState.error}
+                <div className="p-4 rounded-xl bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 text-xs font-sans space-y-2">
+                  <p><strong>Notice:</strong> {peekState.error}</p>
+                  <button
+                    type="button"
+                    onClick={() => handlePeekNavigateChapter(peekState.chapterIndex)}
+                    className="px-3 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-sans cursor-pointer"
+                  >
+                    Retry Loading Chapter
+                  </button>
                 </div>
               ) : (
                 <>
                   <div className="text-center pb-3 border-b border-slate-100 dark:border-slate-800 font-sans">
-                    <h4 className="text-sm font-bold text-purple-700 dark:text-purple-300">
+                    <h4 className="text-base font-bold text-purple-700 dark:text-purple-300">
                       {peekState.chapterTitle}
                     </h4>
                   </div>
-                  <div className="whitespace-pre-wrap leading-loose">
-                    {peekState.content}
+                  <div className="space-y-4 font-serif text-[15px] leading-relaxed text-slate-800 dark:text-slate-200">
+                    {peekParagraphs.map((para, idx) => (
+                      <p
+                        key={idx}
+                        className="leading-relaxed mb-3.5 tracking-normal text-slate-800 dark:text-slate-200 font-serif text-[15px]"
+                      >
+                        {para}
+                      </p>
+                    ))}
                   </div>
                 </>
               )}
             </div>
 
-            {/* Footer with One-Click Import ALL */}
-            <div className="p-4 border-t border-slate-100 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/80 flex items-center justify-between gap-3">
-              <button
-                type="button"
-                onClick={() => setPeekState((prev) => ({ ...prev, isOpen: false }))}
-                className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 cursor-pointer"
-              >
-                Close Preview
-              </button>
-
-              {peekState.item && (
+            {/* Footer with Next Chapter & One-Click Import ALL */}
+            <div className="p-3.5 border-t border-slate-100 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/80 flex flex-wrap items-center justify-between gap-2.5">
+              <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => handleDirectImport(peekState.item!)}
-                  disabled={isImporting}
-                  className="inline-flex items-center gap-1.5 px-5 py-2 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold shadow-md cursor-pointer"
+                  onClick={() => handlePeekNavigateChapter(peekState.chapterIndex - 1)}
+                  disabled={peekState.isLoading || peekState.chapterIndex <= 1}
+                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl text-xs font-semibold text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none cursor-pointer"
                 >
-                  {isImporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                  <span>Import All Chapters ({peekState.totalChapters || "Complete"})</span>
+                  <ChevronLeft className="h-3.5 w-3.5" />
+                  <span>Prev Ch</span>
                 </button>
-              )}
+
+                <button
+                  type="button"
+                  onClick={() => handlePeekNavigateChapter(peekState.chapterIndex + 1)}
+                  disabled={
+                    peekState.isLoading ||
+                    (Boolean(peekState.allChapters) && peekState.chapterIndex >= (peekState.allChapters?.length || 1))
+                  }
+                  className="inline-flex items-center gap-1 px-3.5 py-1.5 rounded-xl bg-purple-100 dark:bg-purple-900/50 text-purple-700 dark:text-purple-300 hover:bg-purple-200 dark:hover:bg-purple-900 text-xs font-bold disabled:opacity-30 disabled:pointer-events-none cursor-pointer"
+                >
+                  <span>Next Chapter (Ch {peekState.chapterIndex + 1})</span>
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </button>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setPeekState((prev) => ({ ...prev, isOpen: false }))}
+                  className="px-3 py-1.5 rounded-xl text-xs font-semibold text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-800 cursor-pointer"
+                >
+                  Close
+                </button>
+
+                {peekState.item && (
+                  <button
+                    type="button"
+                    onClick={() => handleDirectImport(peekState.item!)}
+                    disabled={isImporting}
+                    className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold shadow-md cursor-pointer"
+                  >
+                    {isImporting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+                    <span>Import All ({peekState.totalChapters || "Complete"})</span>
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>
