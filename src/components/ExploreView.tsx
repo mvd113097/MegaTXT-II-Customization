@@ -511,10 +511,10 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     }
     setErrorMessage(null);
 
-    // 8-second client safety timeout
+    // 22-second client safety timeout for deep multi-page crawling
     const timeoutId = setTimeout(() => {
       controller.abort();
-    }, 8000);
+    }, 22000);
 
     try {
       const params = new URLSearchParams({
