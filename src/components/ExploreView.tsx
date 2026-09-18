@@ -190,13 +190,15 @@ export function getAugmentedCardTags(item: ExploreNovelItem): string[] {
 
   const addTag = (raw: string) => {
     if (!raw) return;
-    const lower = raw.trim().toLowerCase();
-    const canonical = TAG_CANONICAL_MAP[lower] || TAG_CANONICAL_MAP[raw.trim()] || raw.trim();
+    const cleanRaw = raw.replace(/^[#＃\s]+/, "").trim();
+    if (!cleanRaw) return;
+    const lower = cleanRaw.toLowerCase();
+    const canonical = TAG_CANONICAL_MAP[lower] || TAG_CANONICAL_MAP[cleanRaw] || cleanRaw;
     const cLower = canonical.toLowerCase();
     if (cLower === "dmxs" || cLower === "all" || cLower === "general" || cLower === "unknown") return;
     if (!seen.has(cLower)) {
       seen.add(cLower);
-      result.push(canonical);
+      result.push(canonical.replace(/^[#＃\s]+/, "").trim());
     }
   };
 
@@ -1700,12 +1702,14 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                   </div>
 
                   {/* File Size Information */}
-                  <div className="flex items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400 mb-2.5 px-0.5">
-                    <span className="font-semibold text-slate-600 dark:text-slate-300">TXT File Size:</span>
-                    <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold border border-emerald-200/70 dark:border-emerald-800/50">
-                      💾 {item.fileSize || "1.95 MB"}
-                    </span>
-                  </div>
+                  {item.fileSize && (
+                    <div className="flex items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400 mb-2.5 px-0.5">
+                      <span className="font-semibold text-slate-600 dark:text-slate-300">TXT File Size:</span>
+                      <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold border border-emerald-200/70 dark:border-emerald-800/50">
+                        💾 {item.fileSize}
+                      </span>
+                    </div>
+                  )}
 
                   {/* Action Bar */}
                   <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
