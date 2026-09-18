@@ -404,15 +404,37 @@ export const StoreView: React.FC<StoreViewProps> = ({
       items.sort((a, b) => {
         const diff = (b.likes || 0) - (a.likes || 0);
         if (diff !== 0) return diff;
-        return (b.points || 0) - (a.points || 0);
+        const pDiff = (b.points || 0) - (a.points || 0);
+        if (pDiff !== 0) return pDiff;
+        if (a.rating !== undefined || b.rating !== undefined) {
+          const aR = a.rating ?? 0;
+          const bR = b.rating ?? 0;
+          if (bR !== aR) return bR - aR;
+          return (b.ratingCount || 0) - (a.ratingCount || 0);
+        }
+        return (b.year || 0) - (a.year || 0);
       });
     } else if (sortBy === "year") {
       items.sort((a, b) => (b.year || 0) - (a.year || 0));
     } else if (sortBy === "points") {
       items.sort((a, b) => {
+        if ((a.points || 0) === 0 && (b.points || 0) === 0 && (a.rating !== undefined || b.rating !== undefined)) {
+          const aR = a.rating ?? 0;
+          const bR = b.rating ?? 0;
+          if (bR !== aR) return bR - aR;
+          return (b.ratingCount || 0) - (a.ratingCount || 0);
+        }
         const diff = (b.points || 0) - (a.points || 0);
         if (diff !== 0) return diff;
-        return (b.likes || 0) - (a.likes || 0);
+        const lDiff = (b.likes || 0) - (a.likes || 0);
+        if (lDiff !== 0) return lDiff;
+        if (a.rating !== undefined || b.rating !== undefined) {
+          const aR = a.rating ?? 0;
+          const bR = b.rating ?? 0;
+          if (bR !== aR) return bR - aR;
+          return (b.ratingCount || 0) - (a.ratingCount || 0);
+        }
+        return (b.year || 0) - (a.year || 0);
       });
     }
 

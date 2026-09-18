@@ -243,6 +243,12 @@ function sortNovelItems(
     });
   } else if (sort === "points") {
     sorted.sort((a, b) => {
+      if ((a.points || 0) === 0 && (b.points || 0) === 0 && (a.rating !== undefined || b.rating !== undefined)) {
+        const aR = a.rating ?? 0;
+        const bR = b.rating ?? 0;
+        if (bR !== aR) return bR - aR;
+        return (b.ratingCount || 0) - (a.ratingCount || 0);
+      }
       const aPoints = a.points || 0;
       const bPoints = b.points || 0;
       const pDiff = bPoints - aPoints;

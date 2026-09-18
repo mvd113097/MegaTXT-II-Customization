@@ -612,6 +612,8 @@ export default function App() {
     setIsRunning(false);
     setIsPaused(false);
     setSession(null);
+    setServerCloudJob(null);
+    chunksRef.current = [];
     localStorage.removeItem(STORAGE_KEY);
 
     try {

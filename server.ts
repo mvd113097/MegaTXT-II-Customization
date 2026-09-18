@@ -16,6 +16,7 @@ import {
   saveChunkToFirestore,
   saveChunksBatchToFirestore,
   loadAllJobsFromFirestore,
+  deleteJobFromFirestore,
   mergeMonotonicJob,
 } from "./server/firestoreStorage";
 
@@ -760,6 +761,85 @@ function mergeMonotonicCloudJobs(jobA: CloudJob, jobB: CloudJob): CloudJob {
   };
 }
 
+async function deleteJobCompletely(jobToDelete: CloudJob | null, sessionId?: string) {
+  if (sessionId) {
+    cloudJobs.delete(sessionId);
+    saveJobToDisk(sessionId, null);
+  }
+
+  if (!jobToDelete) {
+    for (const key of Array.from(cloudJobs.keys())) {
+      cloudJobs.delete(key);
+      saveJobToDisk(key, null);
+    }
+    if (fs.existsSync(CLOUD_JOB_FILE)) {
+      try { fs.unlinkSync(CLOUD_JOB_FILE); } catch {}
+    }
+    return;
+  }
+
+  const targetId = jobToDelete.id;
+  const targetFileName = jobToDelete.fileName ? jobToDelete.fileName.trim().toLowerCase() : "";
+
+  // 1. Remove from in-memory map all keys that point to this job ID or file name
+  for (const [sKey, j] of Array.from(cloudJobs.entries())) {
+    if (j.id === targetId || (targetFileName && j.fileName && j.fileName.trim().toLowerCase() === targetFileName)) {
+      cloudJobs.delete(sKey);
+      saveJobToDisk(sKey, null);
+    }
+  }
+
+  // 2. Clear legacy_default if it matched
+  if (cloudJobs.has("legacy_default")) {
+    const leg = cloudJobs.get("legacy_default");
+    if (!leg || leg.id === targetId || (targetFileName && leg.fileName && leg.fileName.trim().toLowerCase() === targetFileName)) {
+      cloudJobs.delete("legacy_default");
+      saveJobToDisk("legacy_default", null);
+    }
+  }
+
+  // 3. Delete root CLOUD_JOB_FILE if present
+  if (fs.existsSync(CLOUD_JOB_FILE)) {
+    try {
+      const data = fs.readFileSync(CLOUD_JOB_FILE, "utf-8");
+      const parsed = JSON.parse(data);
+      if (!parsed || parsed.id === targetId || (targetFileName && parsed.fileName && parsed.fileName.trim().toLowerCase() === targetFileName)) {
+        fs.unlinkSync(CLOUD_JOB_FILE);
+      }
+    } catch {
+      try { fs.unlinkSync(CLOUD_JOB_FILE); } catch {}
+    }
+  }
+
+  // 4. Delete disk job files in JOBS_DIR matching targetId or filename
+  try {
+    if (fs.existsSync(JOBS_DIR)) {
+      const files = fs.readdirSync(JOBS_DIR);
+      for (const f of files) {
+        if (!f.endsWith(".json")) continue;
+        const fullPath = path.join(JOBS_DIR, f);
+        try {
+          const content = fs.readFileSync(fullPath, "utf-8");
+          if (content.includes(targetId) || (targetFileName && content.toLowerCase().includes(targetFileName))) {
+            fs.unlinkSync(fullPath);
+          }
+        } catch {}
+      }
+    }
+  } catch (err) {
+    console.warn("Error deleting job files from disk:", err);
+  }
+
+  // 5. Delete from Firestore database
+  if (targetId) {
+    try {
+      await deleteJobFromFirestore(targetId);
+    } catch (err: any) {
+      console.warn(`[Storage] Firestore job delete note for ${targetId}:`, err?.message);
+    }
+  }
+}
+
 function setJobForSession(sessionId: string, job: CloudJob | null) {
   if (job) {
     job.sessionId = sessionId;
@@ -793,8 +873,10 @@ function setJobForSession(sessionId: string, job: CloudJob | null) {
       console.warn(`[Storage] Firestore initial chunks batch sync note for ${finalJob.id}:`, err.message);
     });
   } else {
-    cloudJobs.delete(sessionId);
-    saveJobToDisk(sessionId, null);
+    const existing = cloudJobs.get(sessionId) || null;
+    deleteJobCompletely(existing, sessionId).catch((err) => {
+      console.warn("Error deleting job in setJobForSession:", err);
+    });
   }
 }
 
@@ -2068,13 +2150,13 @@ app.post("/api/cloud-job/resume", requireAuthMiddleware, (req, res) => {
 });
 
 // Stop and clear cloud job
-app.post("/api/cloud-job/stop", requireAuthMiddleware, (req, res) => {
+app.post("/api/cloud-job/stop", requireAuthMiddleware, async (req, res) => {
   const sessionId = getSessionId(req);
   const targetJob = getJobForSession(req);
   if (targetJob) {
     targetJob.status = "idle";
-    setJobForSession(targetJob.sessionId || sessionId, null);
   }
+  await deleteJobCompletely(targetJob, sessionId);
   res.json({ success: true, message: "Cloud job removed." });
 });
 

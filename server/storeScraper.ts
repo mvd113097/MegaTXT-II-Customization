@@ -380,14 +380,15 @@ async function searchDmxs(query: string): Promise<StoreSearchResult[]> {
         }
       });
 
-      // Fetch authentic ratings in parallel
+      // Fetch authentic ratings in parallel for all rawItems (up to 30)
+      const itemsToRate = rawItems.slice(0, 30);
       const ratings = await Promise.all(
-        rawItems.slice(0, 15).map((item) =>
+        itemsToRate.map((item) =>
           item.articleId ? fetchDmxsRating(item.articleId, item.category || "cycs") : Promise.resolve(null)
         )
       );
 
-      rawItems.slice(0, 15).forEach((item, idx) => {
+      itemsToRate.forEach((item, idx) => {
         const rData = ratings[idx];
         results.push({
           id: `dmxs_${idx}_${Date.now()}`,
@@ -402,6 +403,17 @@ async function searchDmxs(query: string): Promise<StoreSearchResult[]> {
           ratingCount: rData?.ratingCount,
           likes: 0,
         });
+      });
+
+      // Sort dmxs search results strictly from highest rating (5.0) to lowest (0.0)
+      results.sort((a, b) => {
+        const aR = a.rating ?? 0;
+        const bR = b.rating ?? 0;
+        if (bR !== aR) return bR - aR;
+        const aRC = a.ratingCount ?? 0;
+        const bRC = b.ratingCount ?? 0;
+        if (bRC !== aRC) return bRC - aRC;
+        return (b.year || 0) - (a.year || 0);
       });
 
       if (results.length > 0) break;
@@ -4672,8 +4684,8 @@ async function scrapeDmxsExplore(options: ExploreFilterOptions): Promise<Explore
     });
   }
 
-  // 7. Fetch authentic ratings for novels that don't have them in HTML (up to 12 items, non-blocking fallback)
-  const novelsToRate = yearFiltered.slice(0, 12);
+  // 7. Fetch authentic ratings for novels that don't have them in HTML (up to 40 items in parallel, non-blocking fallback)
+  const novelsToRate = yearFiltered.slice(0, 40);
   await Promise.allSettled(
     novelsToRate.map(async (n) => {
       if (n.rating !== undefined) return;

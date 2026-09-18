@@ -4,6 +4,7 @@ import {
   doc,
   setDoc,
   getDoc,
+  deleteDoc,
   collection,
   getDocs,
   writeBatch,
@@ -440,3 +441,38 @@ export async function loadAllJobsFromFirestore(): Promise<Map<string, CloudJob>>
 
   return result;
 }
+
+/**
+ * Permanently delete a job and all its chunks from Firestore
+ */
+export async function deleteJobFromFirestore(jobId: string): Promise<boolean> {
+  if (!isCloudStorageAvailable()) return false;
+  const db = initFirestore();
+  if (!db || !jobId) return false;
+
+  try {
+    const chunksRef = collection(db, "translation_jobs", jobId, "chunks");
+    const chunksSnap = await getDocs(chunksRef);
+    if (!chunksSnap.empty) {
+      const BATCH_SIZE = 100;
+      const docs = chunksSnap.docs;
+      for (let i = 0; i < docs.length; i += BATCH_SIZE) {
+        const slice = docs.slice(i, i + BATCH_SIZE);
+        const batch = writeBatch(db);
+        for (const d of slice) {
+          batch.delete(d.ref);
+        }
+        await batch.commit();
+      }
+    }
+
+    const jobRef = doc(db, "translation_jobs", jobId);
+    await deleteDoc(jobRef);
+    console.log(`[FirestoreStorage] Deleted job ${jobId} and its chunk subcollection from Firestore`);
+    return true;
+  } catch (err: any) {
+    handleFirestoreError(`deleteJobFromFirestore(${jobId})`, err);
+    return false;
+  }
+}
+
