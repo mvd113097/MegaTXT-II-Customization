@@ -1312,16 +1312,20 @@ export async function fetchNovelTOC(
   // Special handling for DMXS (dmxs.org)
   if (chapters.length === 0 && novelUrl.includes("dmxs.org")) {
     let index = 1;
+    const seenUrls = new Set<string>();
     $("a").each((_, el) => {
       const href = $(el).attr("href");
       const chTitle = $(el).text().trim();
       if (href && href.includes("/view/") && href.endsWith(".html")) {
         const fullUrl = href.startsWith("http") ? href : `https://www.dmxs.org${href}`;
-        chapters.push({
-          index: index++,
-          title: chTitle || `第 ${index} 章`,
-          url: fullUrl,
-        });
+        if (!seenUrls.has(fullUrl) && chTitle !== "在线阅读") {
+          seenUrls.add(fullUrl);
+          chapters.push({
+            index: index++,
+            title: chTitle || `第 ${index} 章`,
+            url: fullUrl,
+          });
+        }
       }
     });
   }
@@ -1590,9 +1594,19 @@ export async function fetchChapterText(chapterUrl: string): Promise<string> {
     ).remove();
 
     // Select chapter content container
-    let content = $(
-      ".read_chapterDetail, .readDetail, .article-content, #content, #chaptercontent, .read-content, .txtcontent, .content, #txtcontent, #view"
-    ).text();
+    let content = "";
+    if ($(".read_chapterDetail p, .readDetail p").length > 0) {
+      const lines: string[] = [];
+      $(".read_chapterDetail p, .readDetail p").each((_, el) => {
+        const t = $(el).text().trim();
+        if (t) lines.push(t);
+      });
+      content = lines.join("\n\n");
+    } else {
+      content = $(
+        ".read_chapterDetail, .readDetail, .article-content, #content, #chaptercontent, .read-content, .txtcontent, .content, #txtcontent, #view"
+      ).text();
+    }
 
     if (!content.trim()) {
       content = $("body").text();
@@ -1756,6 +1770,7 @@ export function isNoCpNovel(title: string, summary: string = "", category: strin
 // JJWXC Official Tag ID Mapping for bookbase.php
 export const JJWXC_TAG_ID_MAP: Record<string, number> = {
   "末世": 81,
+  "天灾": 81,
   "种田": 66,
   "种田文": 66,
   "空间": 74,
@@ -1925,17 +1940,39 @@ async function scrapeJjwxcExplore(options: ExploreFilterOptions): Promise<Explor
     "https://www.jjwxc.net/topten.php?orderstr=3",  // 半年榜 (Half-Year Leaderboard)
   ];
 
+  const yearParam =
+    options.year && options.year !== "all" && options.year !== "older" && /^\d{4}$/.test(options.year)
+      ? `&fbsj${options.year}=${options.year}`
+      : "";
+
   const bookbaseUrls: string[] = [];
   if (tagId) {
-    bookbaseUrls.push(`https://www.jjwxc.net/bookbase.php?bq=${tagId}${xx !== 0 ? `&xx=${xx}` : ""}&sortType=${sortType}`);
+    bookbaseUrls.push(`https://www.jjwxc.net/bookbase.php?bq=${tagId}${xx !== 0 ? `&xx=${xx}` : ""}${yearParam}&sortType=${sortType}`);
+  } else if (rawTag) {
+    const hexTag = gbkEncodeHex(rawTag);
+    bookbaseUrls.push(`https://www.jjwxc.net/bookbase.php?searchkeywords=${hexTag}${xx !== 0 ? `&xx=${xx}` : ""}${yearParam}&sortType=${sortType}`);
   }
   if (rawQuery) {
     const hexQuery = gbkEncodeHex(rawQuery);
-    bookbaseUrls.push(`https://www.jjwxc.net/bookbase.php?searchkeywords=${hexQuery}${xx !== 0 ? `&xx=${xx}` : ""}&sortType=${sortType}`);
+    bookbaseUrls.push(`https://www.jjwxc.net/bookbase.php?searchkeywords=${hexQuery}${xx !== 0 ? `&xx=${xx}` : ""}${yearParam}&sortType=${sortType}`);
   }
 
-  // 1. Scrape TopTen ranking tables
-  for (const url of toptenUrls) {
+  // Always query JJWXC bookbase for orientation / year filters so BL (纯爱), No CP, and specific years return rich results
+  if (xx !== 0 || yearParam || bookbaseUrls.length === 0) {
+    if (xx !== 0) {
+      bookbaseUrls.push(`https://www.jjwxc.net/bookbase.php?xx=${xx}${yearParam}&sortType=${sortType}`);
+      bookbaseUrls.push(`https://www.jjwxc.net/bookbase.php?xx=${xx}${yearParam}&sortType=${sortType}&page=2`);
+    } else {
+      // All orientations: include both Pure Love (BL, xx=2) and Het (言情, xx=1)
+      bookbaseUrls.push(`https://www.jjwxc.net/bookbase.php?xx=2${yearParam}&sortType=${sortType}`);
+      bookbaseUrls.push(`https://www.jjwxc.net/bookbase.php?xx=1${yearParam}&sortType=${sortType}`);
+      bookbaseUrls.push(`https://www.jjwxc.net/bookbase.php?xx=5${yearParam}&sortType=${sortType}`);
+    }
+  }
+
+  // 1. Scrape TopTen ranking tables (Note: JJWXC topten.php is exclusively BG / 言情, so skip when BL or No CP is requested)
+  if (options.orientation !== "bl" && options.orientation !== "no_cp") {
+    for (const url of toptenUrls) {
     try {
       const res = await axios.get(url, {
         responseType: "arraybuffer",
@@ -2029,6 +2066,7 @@ async function scrapeJjwxcExplore(options: ExploreFilterOptions): Promise<Explor
     } catch (e: any) {
       console.warn(`JJWXC topten error for ${url}:`, e.message);
     }
+  }
   }
 
   // 2. Scrape Bookbase search URLs if specified
@@ -4227,12 +4265,53 @@ export interface ReadableMirrorResult {
   fileSize?: string;
 }
 
+function calculateMirrorMatchScore(mirror: ReadableMirrorResult, targetTitle: string, targetAuthor?: string): number {
+  let score = 0;
+  const cleanTargetTitle = targetTitle.toLowerCase().replace(/[《》\s【】\[\]（）()_·\-—]/g, "");
+  const cleanMirrorTitle = (mirror.title || "").toLowerCase().replace(/[《》\s【】\[\]（）()_·\-—]/g, "");
+  const cleanTargetAuthor = (targetAuthor || "").toLowerCase().replace(/[\s·]/g, "");
+  const cleanMirrorAuthor = (mirror.author || "").toLowerCase().replace(/[\s·]/g, "");
+
+  // Title matching
+  if (cleanMirrorTitle === cleanTargetTitle) {
+    score += 120;
+  } else if (cleanMirrorTitle.startsWith(cleanTargetTitle) || cleanMirrorTitle.endsWith(cleanTargetTitle)) {
+    score += 65;
+  } else if (cleanMirrorTitle.includes(cleanTargetTitle)) {
+    score += 40;
+  }
+
+  // Author matching
+  if (cleanTargetAuthor && cleanMirrorAuthor) {
+    if (cleanMirrorAuthor === cleanTargetAuthor) {
+      score += 90;
+    } else if (cleanMirrorAuthor.includes(cleanTargetAuthor) || cleanTargetAuthor.includes(cleanMirrorAuthor)) {
+      score += 55;
+    } else {
+      // Different author entirely - penalize to avoid grabbing wrong book sharing generic title words
+      score -= 70;
+    }
+  }
+
+  // Penalize titles with excessive extra words if target is concise
+  if (cleanMirrorTitle.length > cleanTargetTitle.length + 6 && cleanMirrorTitle !== cleanTargetTitle) {
+    score -= 25;
+  }
+
+  // Prefer mirrors with file sizes or high chapter counts
+  if (mirror.fileSize && mirror.fileSize.includes("MB")) {
+    score += 10;
+  }
+
+  return score;
+}
+
 export async function findNovelMirrors(title: string, author?: string): Promise<ReadableMirrorResult[]> {
   try {
     const cleanTitle = title.replace(/^《|》$/g, "").replace(/\[.*?\]|\(.*?\)|【.*?】/g, "").trim();
     const searchResults = await searchStoreNovels(cleanTitle, "all");
     
-    // Sort mirrors by best title & author match
+    // Convert to readable mirrors
     const mirrors: ReadableMirrorResult[] = searchResults.map((r) => ({
       siteId: r.siteId,
       siteName: getShortSiteName(r.siteId, r.siteName),
@@ -4242,6 +4321,13 @@ export async function findNovelMirrors(title: string, author?: string): Promise<
       latestChapter: r.latestChapter,
       fileSize: r.fileSize,
     }));
+
+    // Sort mirrors by best title & author match accuracy
+    mirrors.sort((a, b) => {
+      const scoreA = calculateMirrorMatchScore(a, cleanTitle, author);
+      const scoreB = calculateMirrorMatchScore(b, cleanTitle, author);
+      return scoreB - scoreA;
+    });
 
     return mirrors;
   } catch (err: any) {

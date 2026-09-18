@@ -228,6 +228,7 @@ export default function App() {
   const [charsTranslatedInRun, setCharsTranslatedInRun] = useState(0);
 
   // Refs for queue management
+  const userHasResetRef = useRef(false);
   const stopRequestedRef = useRef(false);
   const pauseRequestedRef = useRef(false);
   const activeRequestsRef = useRef(0);
@@ -306,18 +307,31 @@ export default function App() {
   // 1. Password Unlock: forceFullText=true instantly populates 50k+ translated words without page refresh
   // 2. Tab Visibility / Focus: ~2 KB lightweight sync when returning after Telegram notifications
   // 3. Manual Sync Button: pulls latest progress in milliseconds with live benchmark toast
-  const syncCloudProgress = async (forceFullText: boolean = false, showFeedbackToast: boolean = false) => {
+  const syncCloudProgress = async (
+    forceFullText: boolean = false,
+    showFeedbackToast: boolean = false,
+    explicitNovelFileName?: string
+  ) => {
     const startTimeMs = performance.now();
     setIsSyncingProgress(true);
     try {
+      const headers = getAuthHeaders();
+      if (explicitNovelFileName) {
+        userHasResetRef.current = false;
+        headers["x-novel-filename"] = encodeURIComponent(explicitNovelFileName);
+      }
       const url = forceFullText ? "/api/cloud-job/status?full=true" : "/api/cloud-job/status";
       const res = await fetch(url, {
-        headers: getAuthHeaders(),
+        headers,
       });
       const data = await res.json();
       const elapsedMs = Math.round(performance.now() - startTimeMs);
 
       if (data.hasJob && data.job) {
+        if (userHasResetRef.current && !explicitNovelFileName) {
+          // User intentionally reset or deleted their translation; do not auto-resurrect unwanted novels
+          return;
+        }
         const sJob = data.job;
         setServerCloudJob(sJob);
         const sortedChunks = sJob.chunks ? [...sJob.chunks].sort((a: any, b: any) => a.index - b.index) : [];
@@ -592,6 +606,7 @@ export default function App() {
       lastUpdated: Date.now(),
     };
 
+    userHasResetRef.current = false;
     setSession(newSession);
     chunksRef.current = rawChunks;
     setIsRunning(false);
@@ -600,14 +615,18 @@ export default function App() {
     setCharsTranslatedInRun(0);
   };
 
-  // Reset workspace
-  const handleReset = async () => {
+  // Reset workspace / permanently delete novel translation
+  const handleReset = async (novelNameToDelete?: string) => {
     if (
       isRunning &&
-      !window.confirm("Translation is in progress. Are you sure you want to stop and reset?")
+      !window.confirm("Translation is in progress. Are you sure you want to stop and delete?")
     ) {
       return;
     }
+    const targetNovel = novelNameToDelete || session?.fileName || serverCloudJob?.fileName;
+    const targetJobId = serverCloudJob?.id;
+
+    userHasResetRef.current = true;
     stopRequestedRef.current = true;
     setIsRunning(false);
     setIsPaused(false);
@@ -617,9 +636,20 @@ export default function App() {
     localStorage.removeItem(STORAGE_KEY);
 
     try {
-      await fetch("/api/cloud-job/stop", {
+      await fetch("/api/cloud-job/delete", {
         method: "POST",
-        headers: getAuthHeaders(),
+        headers: {
+          ...getAuthHeaders(),
+          ...(targetNovel ? { "x-novel-filename": encodeURIComponent(targetNovel) } : {}),
+        },
+        body: JSON.stringify({
+          fileName: targetNovel,
+          jobId: targetJobId,
+        }),
+      });
+      setToastData({
+        message: targetNovel ? `Permanently removed "${targetNovel}".` : "Workspace cleared.",
+        type: "success",
       });
     } catch {
       // ignore
@@ -1428,6 +1458,8 @@ Export Timestamp: ${new Date().toLocaleString()}
         session={session}
         onDownloadProgress={handleDownloadProgress}
         onReset={handleReset}
+        getAuthHeaders={getAuthHeaders}
+        onSelectNovel={(fileName) => syncCloudProgress(true, true, fileName)}
       />
 
       {/* Terminology & Glossary Modal */}

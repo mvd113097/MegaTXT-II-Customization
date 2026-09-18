@@ -17,6 +17,8 @@ import {
   saveChunksBatchToFirestore,
   loadAllJobsFromFirestore,
   deleteJobFromFirestore,
+  deleteJobByFileNameFromFirestore,
+  deleteAllJobsFromFirestore,
   mergeMonotonicJob,
 } from "./server/firestoreStorage";
 
@@ -640,20 +642,27 @@ function getJobForSession(req: express.Request): CloudJob | null {
     }
   }
 
-  // Fallback 1: check legacy_default
+  // Fallbacks: Only allowed if allowFallback is not false and only for actively RUNNING jobs
+  const allowFallback = req.query.allowFallback !== "false" && req.headers["x-allow-fallback"] !== "false";
+  if (!allowFallback) {
+    return null;
+  }
+
+  // Fallback 1: check legacy_default ONLY if running
   if (cloudJobs.has("legacy_default")) {
-    return cloudJobs.get("legacy_default")!;
+    const leg = cloudJobs.get("legacy_default")!;
+    if (leg.status === "running" && !isSyntheticOrTestJob(leg)) {
+      return leg;
+    }
   }
 
-  // Fallback 2: if only 1 job exists across all sessions, return it
-  if (cloudJobs.size === 1) {
-    return cloudJobs.values().next().value!;
-  }
-
-  // Fallback 3: Return the most recently active running or completed job
-  if (cloudJobs.size > 0) {
-    const all = Array.from(cloudJobs.values()).sort((a, b) => (b.lastActiveAt || 0) - (a.lastActiveAt || 0));
-    return all[0] || null;
+  // Fallback 2: Check for any actively running non-test job
+  const activeRunning = Array.from(cloudJobs.values()).filter(
+    (j) => j.status === "running" && !isSyntheticOrTestJob(j)
+  );
+  if (activeRunning.length > 0) {
+    activeRunning.sort((a, b) => (b.lastActiveAt || 0) - (a.lastActiveAt || 0));
+    return activeRunning[0];
   }
 
   return null;
@@ -748,13 +757,15 @@ function mergeMonotonicCloudJobs(jobA: CloudJob, jobB: CloudJob): CloudJob {
   const completedCount = mergedChunks.filter((c) => c.status === "completed" && !!c.englishText?.trim()).length;
   const isFullyCompleted = completedCount === mergedChunks.length && mergedChunks.length > 0;
 
-  let finalStatus: CloudJob["status"] = "running";
+  let finalStatus: CloudJob["status"] = "idle";
   if (isFullyCompleted) {
     finalStatus = "completed";
-  } else if (jobA.status === "paused" && jobB.status === "paused") {
+  } else if (jobA.status === "running" || jobB.status === "running") {
+    finalStatus = "running";
+  } else if (jobA.status === "paused" || jobB.status === "paused") {
     finalStatus = "paused";
   } else {
-    finalStatus = "running";
+    finalStatus = jobA.status || jobB.status || "idle";
   }
 
   return {
@@ -774,49 +785,93 @@ function mergeMonotonicCloudJobs(jobA: CloudJob, jobB: CloudJob): CloudJob {
   };
 }
 
-async function deleteJobCompletely(jobToDelete: CloudJob | null, sessionId?: string) {
-  if (sessionId) {
-    cloudJobs.delete(sessionId);
-    saveJobToDisk(sessionId, null);
-  }
-
-  if (!jobToDelete) {
-    for (const key of Array.from(cloudJobs.keys())) {
-      cloudJobs.delete(key);
-      saveJobToDisk(key, null);
+async function deleteJobCompletely(
+  jobToDelete: CloudJob | null,
+  sessionId?: string,
+  explicitFileName?: string,
+  explicitJobId?: string,
+  clearAll: boolean = false
+) {
+  if (clearAll) {
+    console.log("[Storage] Authoritative clearAll requested: obliterating all cloud jobs and archives.");
+    for (const j of cloudJobs.values()) {
+      j.status = "idle";
     }
-    if (fs.existsSync(CLOUD_JOB_FILE)) {
-      try { fs.unlinkSync(CLOUD_JOB_FILE); } catch {}
-    }
+    cloudJobs.clear();
+    try {
+      if (fs.existsSync(CLOUD_JOB_FILE)) fs.unlinkSync(CLOUD_JOB_FILE);
+    } catch {}
+    try {
+      if (fs.existsSync(JOBS_DIR)) {
+        const files = fs.readdirSync(JOBS_DIR);
+        for (const f of files) {
+          if (f.endsWith(".json")) {
+            try { fs.unlinkSync(path.join(JOBS_DIR, f)); } catch {}
+          }
+        }
+      }
+    } catch {}
+    await deleteAllJobsFromFirestore().catch(() => {});
     return;
   }
 
-  const targetId = jobToDelete.id;
-  const targetFileName = jobToDelete.fileName ? jobToDelete.fileName.trim().toLowerCase() : "";
+  const targetIds = new Set<string>();
+  const targetFileNames = new Set<string>();
 
-  // 1. Remove from in-memory map all keys that point to this job ID or file name
+  if (jobToDelete?.id) targetIds.add(jobToDelete.id.trim());
+  if (explicitJobId && typeof explicitJobId === "string" && explicitJobId.trim()) targetIds.add(explicitJobId.trim());
+
+  if (jobToDelete?.fileName) targetFileNames.add(jobToDelete.fileName.trim().toLowerCase());
+  if (explicitFileName && typeof explicitFileName === "string" && explicitFileName.trim()) {
+    targetFileNames.add(explicitFileName.trim().toLowerCase());
+  }
+
+  // Also check if sessionId in cloudJobs has a job
+  if (sessionId && cloudJobs.has(sessionId)) {
+    const sj = cloudJobs.get(sessionId)!;
+    if (sj.id) targetIds.add(sj.id.trim());
+    if (sj.fileName) targetFileNames.add(sj.fileName.trim().toLowerCase());
+  }
+
+  console.log(`[Storage] Deleting job completely. Target IDs: [${Array.from(targetIds).join(", ")}], FileNames: [${Array.from(targetFileNames).join(", ")}], SessionId: ${sessionId || "none"}`);
+
+  // 1. In-memory: Abort and remove matching jobs from cloudJobs
   for (const [sKey, j] of Array.from(cloudJobs.entries())) {
-    if (j.id === targetId || (targetFileName && j.fileName && j.fileName.trim().toLowerCase() === targetFileName)) {
+    const jName = (j.fileName || "").trim().toLowerCase();
+    const isIdMatch = targetIds.has(j.id);
+    const isNameMatch = targetFileNames.has(jName);
+    const isSessionMatch = sessionId && sKey === sessionId;
+
+    if (isIdMatch || isNameMatch || isSessionMatch) {
+      j.status = "idle";
       cloudJobs.delete(sKey);
       saveJobToDisk(sKey, null);
     }
   }
 
-  // 2. Clear legacy_default if it matched
+  if (sessionId) {
+    cloudJobs.delete(sessionId);
+    saveJobToDisk(sessionId, null);
+  }
+
+  // 2. Clear legacy_default if it matches
   if (cloudJobs.has("legacy_default")) {
-    const leg = cloudJobs.get("legacy_default");
-    if (!leg || leg.id === targetId || (targetFileName && leg.fileName && leg.fileName.trim().toLowerCase() === targetFileName)) {
+    const leg = cloudJobs.get("legacy_default")!;
+    const legName = (leg.fileName || "").trim().toLowerCase();
+    if (targetIds.has(leg.id) || targetFileNames.has(legName)) {
+      leg.status = "idle";
       cloudJobs.delete("legacy_default");
       saveJobToDisk("legacy_default", null);
     }
   }
 
-  // 3. Delete root CLOUD_JOB_FILE if present
+  // 3. Delete root CLOUD_JOB_FILE if present and matches
   if (fs.existsSync(CLOUD_JOB_FILE)) {
     try {
       const data = fs.readFileSync(CLOUD_JOB_FILE, "utf-8");
       const parsed = JSON.parse(data);
-      if (!parsed || parsed.id === targetId || (targetFileName && parsed.fileName && parsed.fileName.trim().toLowerCase() === targetFileName)) {
+      const pName = (parsed?.fileName || "").trim().toLowerCase();
+      if (!parsed || (parsed.id && targetIds.has(parsed.id)) || (pName && targetFileNames.has(pName))) {
         fs.unlinkSync(CLOUD_JOB_FILE);
       }
     } catch {
@@ -824,17 +879,50 @@ async function deleteJobCompletely(jobToDelete: CloudJob | null, sessionId?: str
     }
   }
 
-  // 4. Delete disk job files in JOBS_DIR matching targetId or filename
+  // 4. Delete disk files in JOBS_DIR matching any targetId or targetFileName
   try {
     if (fs.existsSync(JOBS_DIR)) {
       const files = fs.readdirSync(JOBS_DIR);
       for (const f of files) {
         if (!f.endsWith(".json")) continue;
         const fullPath = path.join(JOBS_DIR, f);
+
+        // Check archive files matching target novel
+        let matchedArchive = false;
+        for (const tName of targetFileNames) {
+          const safeNovel = sanitizeSessionKey(tName);
+          if (f === `archive_${safeNovel}.json`) {
+            try { fs.unlinkSync(fullPath); } catch {}
+            matchedArchive = true;
+            console.log(`[Storage] Unlinked archive file: ${f}`);
+            break;
+          }
+        }
+        if (matchedArchive) continue;
+
         try {
           const content = fs.readFileSync(fullPath, "utf-8");
-          if (content.includes(targetId) || (targetFileName && content.toLowerCase().includes(targetFileName))) {
+          let shouldDelete = false;
+
+          for (const tid of targetIds) {
+            if (content.includes(tid)) {
+              shouldDelete = true;
+              break;
+            }
+          }
+          if (!shouldDelete) {
+            const lower = content.toLowerCase();
+            for (const tName of targetFileNames) {
+              if (lower.includes(tName)) {
+                shouldDelete = true;
+                break;
+              }
+            }
+          }
+
+          if (shouldDelete) {
             fs.unlinkSync(fullPath);
+            console.log(`[Storage] Unlinked job file: ${f}`);
           }
         } catch {}
       }
@@ -843,12 +931,20 @@ async function deleteJobCompletely(jobToDelete: CloudJob | null, sessionId?: str
     console.warn("Error deleting job files from disk:", err);
   }
 
-  // 5. Delete from Firestore database
-  if (targetId) {
+  // 5. Delete matching jobs from Firestore
+  for (const tid of targetIds) {
     try {
-      await deleteJobFromFirestore(targetId);
+      await deleteJobFromFirestore(tid);
     } catch (err: any) {
-      console.warn(`[Storage] Firestore job delete note for ${targetId}:`, err?.message);
+      console.warn(`[Storage] Firestore delete error for job ID ${tid}:`, err?.message);
+    }
+  }
+
+  for (const tName of targetFileNames) {
+    try {
+      await deleteJobByFileNameFromFirestore(tName);
+    } catch (err: any) {
+      console.warn(`[Storage] Firestore delete error for fileName ${tName}:`, err?.message);
     }
   }
 }
@@ -2163,15 +2259,107 @@ app.post("/api/cloud-job/resume", requireAuthMiddleware, (req, res) => {
   res.json({ success: true, status: "running" });
 });
 
-// Stop and clear cloud job
+// Stop and clear cloud job permanently
 app.post("/api/cloud-job/stop", requireAuthMiddleware, async (req, res) => {
   const sessionId = getSessionId(req);
+  const body = req.body || {};
+  const explicitFileName = body.fileName || (req.headers["x-novel-filename"] ? decodeURIComponent(req.headers["x-novel-filename"] as string) : "");
+  const explicitJobId = body.jobId;
+  const clearAll = body.clearAll === true;
+
   const targetJob = getJobForSession(req);
   if (targetJob) {
     targetJob.status = "idle";
   }
-  await deleteJobCompletely(targetJob, sessionId);
-  res.json({ success: true, message: "Cloud job removed." });
+  await deleteJobCompletely(targetJob, sessionId, explicitFileName, explicitJobId, clearAll);
+  res.json({
+    success: true,
+    message: clearAll ? "All cloud jobs and archives removed." : "Cloud job removed permanently.",
+  });
+});
+
+// Explicit permanent deletion endpoint
+app.post("/api/cloud-job/delete", requireAuthMiddleware, async (req, res) => {
+  const sessionId = getSessionId(req);
+  const body = req.body || {};
+  const explicitFileName = body.fileName || (req.headers["x-novel-filename"] ? decodeURIComponent(req.headers["x-novel-filename"] as string) : "");
+  const explicitJobId = body.jobId;
+  const clearAll = body.clearAll === true;
+
+  const targetJob = getJobForSession(req);
+  if (targetJob) {
+    targetJob.status = "idle";
+  }
+  await deleteJobCompletely(targetJob, sessionId, explicitFileName, explicitJobId, clearAll);
+  res.json({
+    success: true,
+    message: clearAll ? "All translation records removed." : "Novel translation deleted permanently.",
+  });
+});
+
+// List all distinct novels currently saved or translating on the server
+app.get("/api/cloud-job/list", requireAuthMiddleware, (req, res) => {
+  const novelMap = new Map<string, any>();
+
+  // 1. Gather from in-memory cloudJobs
+  for (const job of cloudJobs.values()) {
+    if (isSyntheticOrTestJob(job)) continue;
+    const name = job.fileName || "novel.txt";
+    const key = name.trim().toLowerCase();
+    const completed = (job.chunks || []).filter((c) => c.status === "completed" && !!c.englishText?.trim()).length;
+    const total = (job.chunks || []).length;
+    const wordCount = (job.chunks || []).reduce((acc, c) => acc + (c.englishText ? countEnglishWords(c.englishText) : (c.wordCount || 0)), 0);
+
+    if (!novelMap.has(key) || (job.lastActiveAt || 0) > (novelMap.get(key).lastActiveAt || 0)) {
+      novelMap.set(key, {
+        id: job.id,
+        sessionId: job.sessionId,
+        fileName: job.fileName,
+        status: job.status,
+        completedChunks: completed,
+        totalChunks: total,
+        wordCount,
+        lastActiveAt: job.lastActiveAt || job.startedAt || Date.now(),
+        startedAt: job.startedAt || Date.now(),
+      });
+    }
+  }
+
+  // 2. Also inspect disk JOBS_DIR for archived or other completed novel records
+  try {
+    if (fs.existsSync(JOBS_DIR)) {
+      const files = fs.readdirSync(JOBS_DIR);
+      for (const f of files) {
+        if (!f.endsWith(".json")) continue;
+        try {
+          const content = fs.readFileSync(path.join(JOBS_DIR, f), "utf-8");
+          const parsed = JSON.parse(content);
+          if (parsed && parsed.fileName && !isSyntheticOrTestJob(parsed)) {
+            const key = parsed.fileName.trim().toLowerCase();
+            if (!novelMap.has(key)) {
+              const completed = (parsed.chunks || []).filter((c: any) => c.status === "completed" && !!c.englishText?.trim()).length;
+              const total = parsed.chunks ? parsed.chunks.length : 0;
+              const wordCount = (parsed.chunks || []).reduce((acc: number, c: any) => acc + (c.englishText ? countEnglishWords(c.englishText) : (c.wordCount || 0)), 0);
+              novelMap.set(key, {
+                id: parsed.id || f.replace(".json", ""),
+                sessionId: parsed.sessionId || "disk",
+                fileName: parsed.fileName,
+                status: parsed.status || (completed === total && total > 0 ? "completed" : "idle"),
+                completedChunks: completed,
+                totalChunks: total,
+                wordCount,
+                lastActiveAt: parsed.lastActiveAt || parsed.startedAt || Date.now(),
+                startedAt: parsed.startedAt || Date.now(),
+              });
+            }
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  const novels = Array.from(novelMap.values()).sort((a, b) => (b.lastActiveAt || 0) - (a.lastActiveAt || 0));
+  res.json({ success: true, novels });
 });
 
 // Sync manual edit to a chunk or retry outcome
@@ -2696,7 +2884,13 @@ app.post("/api/store/import-novel", requireAuthMiddleware, async (req, res) => {
 
     let targetChapters = chapters;
     if (!targetChapters || targetChapters.length === 0) {
-      const toc = await fetchNovelTOC(novelUrl, siteId || "general");
+      let toc = await fetchNovelTOC(novelUrl, siteId || "general", title);
+      if ((!toc.chapters || toc.chapters.length === 0) && siteId === "jjwxc") {
+        const mirrors = await findNovelMirrors(title || "", req.body.author || "");
+        if (mirrors.length > 0) {
+          toc = await fetchNovelTOC(mirrors[0].novelUrl, mirrors[0].siteId, title, req.body.author);
+        }
+      }
       targetChapters = toc.chapters;
     }
 

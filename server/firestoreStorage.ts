@@ -193,13 +193,15 @@ export function reconcileAuthoritativeJob(fsJob: CloudJob, diskJob?: CloudJob | 
   const totalCount = reconciledChunks.length;
   const isAllDone = completedCount === totalCount && totalCount > 0;
 
-  let finalStatus: CloudJob["status"] = "running";
+  let finalStatus: CloudJob["status"] = "idle";
   if (isAllDone) {
     finalStatus = "completed";
-  } else if (fsJob.status === "paused" && diskJob.status === "paused") {
+  } else if (fsJob.status === "running" || diskJob?.status === "running") {
+    finalStatus = "running";
+  } else if (fsJob.status === "paused" || diskJob?.status === "paused") {
     finalStatus = "paused";
   } else {
-    finalStatus = "running";
+    finalStatus = fsJob.status || diskJob?.status || "idle";
   }
 
   return {
@@ -477,5 +479,58 @@ export async function deleteJobFromFirestore(jobId: string): Promise<boolean> {
     handleFirestoreError(`deleteJobFromFirestore(${jobId})`, err);
     return false;
   }
+}
+
+/**
+ * Permanently delete all jobs and their chunks matching a novel filename from Firestore
+ */
+export async function deleteJobByFileNameFromFirestore(fileName: string): Promise<number> {
+  if (!isCloudStorageAvailable()) return 0;
+  const db = initFirestore();
+  if (!db || !fileName) return 0;
+
+  const targetName = fileName.trim().toLowerCase();
+  let deletedCount = 0;
+
+  try {
+    const jobsRef = collection(db, "translation_jobs");
+    const snapshot = await getDocs(jobsRef);
+    for (const docSnap of snapshot.docs) {
+      const data = docSnap.data();
+      const docFileName = (data.fileName || "").trim().toLowerCase();
+      if (docFileName === targetName) {
+        await deleteJobFromFirestore(docSnap.id);
+        deletedCount++;
+      }
+    }
+  } catch (err: any) {
+    handleFirestoreError(`deleteJobByFileNameFromFirestore(${fileName})`, err);
+  }
+
+  return deletedCount;
+}
+
+/**
+ * Permanently delete ALL jobs from Firestore
+ */
+export async function deleteAllJobsFromFirestore(): Promise<number> {
+  if (!isCloudStorageAvailable()) return 0;
+  const db = initFirestore();
+  if (!db) return 0;
+
+  let deletedCount = 0;
+  try {
+    const jobsRef = collection(db, "translation_jobs");
+    const snapshot = await getDocs(jobsRef);
+    for (const docSnap of snapshot.docs) {
+      if (docSnap.id.startsWith("_")) continue; // preserve health ping
+      await deleteJobFromFirestore(docSnap.id);
+      deletedCount++;
+    }
+  } catch (err: any) {
+    handleFirestoreError("deleteAllJobsFromFirestore", err);
+  }
+
+  return deletedCount;
 }
 
