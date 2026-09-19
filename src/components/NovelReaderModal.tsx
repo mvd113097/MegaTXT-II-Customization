@@ -32,6 +32,9 @@ import {
   HelpCircle,
   Bookmark,
   BookmarkCheck,
+  MoreHorizontal,
+  Radio,
+  RotateCw,
 } from "lucide-react";
 import {
   getCachedChapter,
@@ -90,6 +93,11 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
   onImportNovel,
   onUpdateChapterIndex,
 }) => {
+  // Unique ID for IndexedDB caching (declared before any state initialization)
+  const novelId = useMemo(() => {
+    return `${siteId}_${novelTitle}`.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, "_");
+  }, [siteId, novelTitle]);
+
   // Current Chapter State
   const [currentChapterIndex, setCurrentChapterIndex] = useState<number>(initialChapterIndex);
   const [chapterTitle, setChapterTitle] = useState<string>(`Chapter ${initialChapterIndex}`);
@@ -111,6 +119,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
     lineHeight: "normal",
     fontFamily: "serif",
     bilingualMode: "english",
+    ttsEngine: "browser-native",
     ttsRate: 1.0,
     ttsPitch: 1.0,
     autoAdvanceTts: true,
@@ -118,6 +127,8 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
 
   // UI Panels
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
+  const [showTopMoreMenu, setShowTopMoreMenu] = useState(false);
+  const topMoreMenuRef = useRef<HTMLDivElement | null>(null);
   const [showChapterDrawer, setShowChapterDrawer] = useState(false);
   const [showTtsPlayer, setShowTtsPlayer] = useState(true);
   const [showTranslateModal, setShowTranslateModal] = useState(false);
@@ -129,11 +140,33 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
   const [sleepTimerMinutes, setSleepTimerMinutes] = useState<number | "end-of-chapter" | null>(null);
   const [sleepTimerRemainingSec, setSleepTimerRemainingSec] = useState<number | null>(null);
 
+  // Dismiss 3-dots dropdown menu on outside click or tap
+  useEffect(() => {
+    if (!showTopMoreMenu) return;
+    const handleClickOutside = (e: MouseEvent | TouchEvent) => {
+      if (topMoreMenuRef.current && !topMoreMenuRef.current.contains(e.target as Node)) {
+        setShowTopMoreMenu(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("touchstart", handleClickOutside, { passive: true });
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("touchstart", handleClickOutside);
+    };
+  }, [showTopMoreMenu]);
+
   // Library / Bookmark State
   const [isInLibrary, setIsInLibrary] = useState<boolean>(() => {
     const books = getLocalLibraryBooks();
     return books.some((b) => b.id === novelId || (b.title === novelTitle && (b.author === author || !author)));
   });
+
+  // Sync library status whenever novel changes
+  useEffect(() => {
+    const books = getLocalLibraryBooks();
+    setIsInLibrary(books.some((b) => b.id === novelId || (b.title === novelTitle && (b.author === author || !author))));
+  }, [novelId, novelTitle, author]);
 
   const handleToggleLibrary = () => {
     if (isInLibrary) {
@@ -162,15 +195,32 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
   const [activeParagraphIndex, setActiveParagraphIndex] = useState<number>(-1);
   const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [selectedVoice, setSelectedVoice] = useState<SpeechSynthesisVoice | null>(null);
+  const selectedVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const [ttsFeedbackMessage, setTtsFeedbackMessage] = useState<string | null>(null);
+  const [isTestingVoice, setIsTestingVoice] = useState(false);
+  const [isRefreshingVoices, setIsRefreshingVoices] = useState(false);
+
+  // Helper to consistently choose and sync voice
+  const setChosenVoice = (voice: SpeechSynthesisVoice | null) => {
+    setSelectedVoice(voice);
+    selectedVoiceRef.current = voice;
+    if (voice) {
+      updatePrefs({ ttsVoiceName: voice.name });
+    }
+  };
 
   // Refs for zero-delay instant execution & state synchronization
   const activeParagraphIndexRef = useRef<number>(-1);
   const ttsParagraphsRef = useRef<string[]>([]);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const testUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
+  const currentAudioChunksRef = useRef<string[]>([]);
+  const currentChunkIndexRef = useRef<number>(0);
   const readerBodyRef = useRef<HTMLDivElement | null>(null);
   const sleepTimerIdRef = useRef<any>(null);
   const pendingTtsStartRef = useRef(false);
+  const ttsSessionIdRef = useRef<number>(0);
 
   // Draggable Floating Button Position State
   // Default: bottom: 92px (comfortably above bottom navigation bar's 64px), right: 16px
@@ -221,84 +271,120 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
     }
   }, [initialChapterIndex, allChapters]);
 
-  // Voice Initialization: Prioritize Standard Google US Female Voice (English Only)
-  useEffect(() => {
+  // Find the optimal Google US Female / Android voice
+  const findGoogleUsFemaleVoice = useCallback((voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null => {
+    if (!voices || voices.length === 0) return null;
+
+    // 1. Android Speech Services by Google / Google US voice with highest priority
+    const googleAndroidUs = voices.find((v) => {
+      const n = (v.name || "").toLowerCase();
+      const uri = (v.voiceURI || "").toLowerCase();
+      const lang = (v.lang || "").toLowerCase().replace("_", "-");
+      const isEn = lang === "en-us" || lang.startsWith("en");
+      return (
+        isEn &&
+        (n.includes("google") || uri.includes("google") || uri.includes("com.google") || n.includes("sfg") || uri.includes("sfg"))
+      );
+    });
+    if (googleAndroidUs) return googleAndroidUs;
+
+    // 2. Strict Google US English (Standard Google TTS voice in Chrome/Android)
+    const googleUs = voices.find((v) => {
+      const n = (v.name || "").toLowerCase();
+      const uri = (v.voiceURI || "").toLowerCase();
+      const lang = (v.lang || "").toLowerCase().replace("_", "-");
+      return (
+        (n.includes("google") || uri.includes("google")) &&
+        (lang === "en-us" || n.includes("us english") || n.includes("united states") || n.includes("us female"))
+      );
+    });
+    if (googleUs) return googleUs;
+
+    // 3. Any Google English voice
+    const googleAnyEn = voices.find((v) => {
+      const n = (v.name || "").toLowerCase();
+      const uri = (v.voiceURI || "").toLowerCase();
+      const lang = (v.lang || "").toLowerCase();
+      return (n.includes("google") || uri.includes("google")) && lang.startsWith("en");
+    });
+    if (googleAnyEn) return googleAnyEn;
+
+    // 4. Known natural high-quality US female voices (Jenny, Aria, Samantha, Victoria, Zira)
+    const usFemale = voices.find((v) => {
+      const n = (v.name || "").toLowerCase();
+      const lang = (v.lang || "").toLowerCase().replace("_", "-");
+      return (
+        (lang === "en-us" || lang.startsWith("en")) &&
+        (n.includes("jenny") ||
+          n.includes("aria") ||
+          n.includes("samantha") ||
+          n.includes("victoria") ||
+          n.includes("natural") ||
+          n.includes("female") ||
+          n.includes("zira"))
+      );
+    });
+    if (usFemale) return usFemale;
+
+    // 5. Any en-US voice
+    const anyUs = voices.find((v) => (v.lang || "").toLowerCase().replace("_", "-") === "en-us");
+    if (anyUs) return anyUs;
+
+    // 6. Any English voice
+    const anyEn = voices.find((v) => (v.lang || "").toLowerCase().startsWith("en"));
+    return anyEn || voices[0] || null;
+  }, []);
+
+  // Comprehensive voice refresher supporting Android Chrome / mobile WebViews
+  const refreshVoices = useCallback((showFeedback = false) => {
     if (typeof window === "undefined" || !window.speechSynthesis) return;
 
-    const findGoogleUsFemaleVoice = (voices: SpeechSynthesisVoice[]) => {
-      if (!voices || voices.length === 0) return null;
+    if (showFeedback) setIsRefreshingVoices(true);
 
-      // 1. Strict Google US English Female (Standard Google TTS voice in Chrome/Android)
-      const googleUs = voices.find(
-        (v) =>
-          v.name.toLowerCase().includes("google") &&
-          (v.lang.toLowerCase().replace("_", "-") === "en-us" ||
-            v.name.toLowerCase().includes("us english") ||
-            v.name.toLowerCase().includes("us female"))
-      );
-      if (googleUs) return googleUs;
-
-      // 2. Any Google English voice
-      const googleAnyEn = voices.find(
-        (v) => v.name.toLowerCase().includes("google") && v.lang.toLowerCase().startsWith("en")
-      );
-      if (googleAnyEn) return googleAnyEn;
-
-      // 3. Known natural high-quality US female voices (Jenny, Aria, Samantha, Victoria, Zira)
-      const usFemale = voices.find(
-        (v) =>
-          (v.lang.toLowerCase().replace("_", "-") === "en-us") &&
-          (v.name.toLowerCase().includes("jenny") ||
-            v.name.toLowerCase().includes("aria") ||
-            v.name.toLowerCase().includes("samantha") ||
-            v.name.toLowerCase().includes("victoria") ||
-            v.name.toLowerCase().includes("natural") ||
-            v.name.toLowerCase().includes("female") ||
-            v.name.toLowerCase().includes("zira"))
-      );
-      if (usFemale) return usFemale;
-
-      // 4. Any en-US voice
-      const anyUs = voices.find(
-        (v) => v.lang.toLowerCase().replace("_", "-") === "en-us"
-      );
-      if (anyUs) return anyUs;
-
-      // 5. Any English voice
-      const anyEn = voices.find((v) => v.lang.toLowerCase().startsWith("en"));
-      return anyEn || voices[0] || null;
-    };
-
-    const loadVoices = () => {
+    try {
       const allVoices = window.speechSynthesis.getVoices();
-      if (!allVoices || allVoices.length === 0) return;
+      if (!allVoices || allVoices.length === 0) {
+        if (showFeedback) {
+          setTimeout(() => setIsRefreshingVoices(false), 600);
+        }
+        return;
+      }
 
-      // Filter to English-only voices as requested by user ("i dont need other language voices")
+      // Filter to English voices; if none found, keep all voices so dropdown is never empty
       const englishVoices = allVoices.filter(
-        (v) => v.lang && v.lang.toLowerCase().startsWith("en")
+        (v) =>
+          v.lang &&
+          (v.lang.toLowerCase().startsWith("en") ||
+            v.lang.toLowerCase().includes("en-") ||
+            v.lang.toLowerCase().includes("eng"))
       );
       const filteredVoices = englishVoices.length > 0 ? englishVoices : allVoices;
 
-      // Sort with Google US English / Google English at top, followed by natural US female
+      // Sort with Google US English / Google English at top, followed by other voices
       filteredVoices.sort((a, b) => {
+        const aName = (a.name || "").toLowerCase();
+        const bName = (b.name || "").toLowerCase();
+        const aUri = (a.voiceURI || "").toLowerCase();
+        const bUri = (b.voiceURI || "").toLowerCase();
+        const aLang = (a.lang || "").toLowerCase().replace("_", "-");
+        const bLang = (b.lang || "").toLowerCase().replace("_", "-");
+
         const aIsGoogleUs =
-          a.name.toLowerCase().includes("google") &&
-          (a.lang.toLowerCase().includes("us") || a.name.toLowerCase().includes("us english"));
+          (aName.includes("google") || aUri.includes("google") || aName.includes("sfg")) &&
+          (aLang === "en-us" || aName.includes("us english") || aName.includes("united states"));
         const bIsGoogleUs =
-          b.name.toLowerCase().includes("google") &&
-          (b.lang.toLowerCase().includes("us") || b.name.toLowerCase().includes("us english"));
+          (bName.includes("google") || bUri.includes("google") || bName.includes("sfg")) &&
+          (bLang === "en-us" || bName.includes("us english") || bName.includes("united states"));
         if (aIsGoogleUs && !bIsGoogleUs) return -1;
         if (!aIsGoogleUs && bIsGoogleUs) return 1;
 
-        const aIsGoogle = a.name.toLowerCase().includes("google");
-        const bIsGoogle = b.name.toLowerCase().includes("google");
+        const aIsGoogle = aName.includes("google") || aUri.includes("google");
+        const bIsGoogle = bName.includes("google") || bUri.includes("google");
         if (aIsGoogle && !bIsGoogle) return -1;
         if (!aIsGoogle && bIsGoogle) return 1;
 
-        const aIsUs =
-          a.lang.toLowerCase().includes("us") || a.lang.toLowerCase().replace("_", "-") === "en-us";
-        const bIsUs =
-          b.lang.toLowerCase().includes("us") || b.lang.toLowerCase().replace("_", "-") === "en-us";
+        const aIsUs = aLang === "en-us" || aName.includes("us");
+        const bIsUs = bLang === "en-us" || bName.includes("us");
         if (aIsUs && !bIsUs) return -1;
         if (!aIsUs && bIsUs) return 1;
 
@@ -312,24 +398,120 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
         if (saved?.ttsVoiceName) {
           const matchedSaved = filteredVoices.find((v) => v.name === saved.ttsVoiceName);
           if (matchedSaved) {
-            setSelectedVoice(matchedSaved);
+            setChosenVoice(matchedSaved);
+            if (showFeedback) setIsRefreshingVoices(false);
             return;
           }
         }
         const matched = findGoogleUsFemaleVoice(filteredVoices);
-        if (matched) setSelectedVoice(matched);
+        if (matched) {
+          setChosenVoice(matched);
+        } else if (filteredVoices.length > 0) {
+          setChosenVoice(filteredVoices[0]);
+        }
+        if (showFeedback) setIsRefreshingVoices(false);
       });
+    } catch (e) {
+      console.warn("Error refreshing voices:", e);
+      if (showFeedback) setIsRefreshingVoices(false);
+    }
+  }, [findGoogleUsFemaleVoice]);
+
+  // Voice Initialization with multi-stage polling for Android browsers
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.speechSynthesis) return;
+
+    refreshVoices();
+
+    const handleVoicesChanged = () => {
+      refreshVoices();
     };
 
-    loadVoices();
-    window.speechSynthesis.onvoiceschanged = loadVoices;
+    try {
+      window.speechSynthesis.addEventListener("voiceschanged", handleVoicesChanged);
+      window.speechSynthesis.onvoiceschanged = handleVoicesChanged;
+    } catch {}
+
+    // Android Chrome & WebViews often take several ticks to asynchronously register TTS engines
+    const timers = [80, 200, 500, 1000, 2000, 4000].map((delay) =>
+      setTimeout(() => {
+        refreshVoices();
+      }, delay)
+    );
 
     return () => {
+      timers.forEach((t) => clearTimeout(t));
       if (window.speechSynthesis) {
-        window.speechSynthesis.onvoiceschanged = null;
+        try {
+          window.speechSynthesis.removeEventListener("voiceschanged", handleVoicesChanged);
+          window.speechSynthesis.onvoiceschanged = null;
+        } catch {}
       }
     };
-  }, []);
+  }, [refreshVoices]);
+
+  // Test selected speech voice with clean mobile-safe execution
+  const testVoiceAudio = useCallback(() => {
+    if (typeof window === "undefined" || !window.speechSynthesis || prefs.ttsEngine === "google-classic") {
+      // Clean audio playback sample for browsers without window.speechSynthesis or using Google Cloud Audio
+      setIsTestingVoice(true);
+      if (!audioPlayerRef.current) {
+        audioPlayerRef.current = new Audio();
+      }
+      const audio = audioPlayerRef.current;
+      audio.playbackRate = prefs.ttsRate || 1.0;
+      const targetLang = prefs.cloudVoiceLang || "en";
+      audio.src = `/api/tts/google-audio?text=${encodeURIComponent("Google Text-to-Speech Cloud Audio Stream is active.")}&lang=${encodeURIComponent(targetLang)}`;
+      audio.onended = () => setIsTestingVoice(false);
+      audio.onerror = () => setIsTestingVoice(false);
+      audio.play().catch(() => setIsTestingVoice(false));
+      return;
+    }
+
+    try {
+      if (window.speechSynthesis.paused) {
+        window.speechSynthesis.resume();
+      }
+      if (window.speechSynthesis.speaking) {
+        window.speechSynthesis.cancel();
+      }
+
+      const liveVoices = window.speechSynthesis.getVoices();
+      const targetVoice = selectedVoiceRef.current || selectedVoice || (liveVoices.length > 0 ? liveVoices[0] : null);
+
+      const sample = new SpeechSynthesisUtterance("Google Text-to-Speech is active with this voice.");
+      testUtteranceRef.current = sample;
+
+      if (targetVoice) {
+        sample.voice = targetVoice;
+        sample.lang = targetVoice.lang || "en-US";
+      } else {
+        sample.lang = "en-US";
+      }
+      sample.rate = prefs.ttsRate || 1.0;
+      sample.pitch = prefs.ttsPitch || 1.0;
+
+      setIsTestingVoice(true);
+
+      sample.onstart = () => {
+        setIsTestingVoice(true);
+      };
+      sample.onend = () => {
+        setIsTestingVoice(false);
+        testUtteranceRef.current = null;
+      };
+      sample.onerror = (e) => {
+        console.warn("Test voice utterance error:", e);
+        setIsTestingVoice(false);
+        testUtteranceRef.current = null;
+      };
+
+      window.speechSynthesis.speak(sample);
+    } catch (err) {
+      console.error("Test voice execution error:", err);
+      setIsTestingVoice(false);
+    }
+  }, [selectedVoice, prefs.ttsRate, prefs.ttsPitch]);
 
   // Sleep Timer Interval Ticker
   useEffect(() => {
@@ -358,11 +540,6 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
       setSleepTimerRemainingSec(null);
     }
   }, [sleepTimerMinutes]);
-
-  // Unique ID for IndexedDB caching
-  const novelId = useMemo(() => {
-    return `${siteId}_${novelTitle}`.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, "_");
-  }, [siteId, novelTitle]);
 
   // Clean Paragraphs for Display
   const chineseParagraphs = useMemo(() => {
@@ -626,6 +803,18 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
         setEnglishContent(data.englishContent);
         updatePrefs({ bilingualMode: "english" });
 
+        const newParas = data.englishContent
+          .split(/\r?\n+/)
+          .map((p: string) => p.trim())
+          .filter((p: string) => p.length > 0);
+        ttsParagraphsRef.current = newParas;
+        setActiveParagraphIndex(0);
+        activeParagraphIndexRef.current = 0;
+
+        if (readerBodyRef.current) {
+          readerBodyRef.current.scrollTo({ top: 0, behavior: "smooth" });
+        }
+
         // Save translation directly to IndexedDB cache
         await setCachedChapter(novelId, currentChapterIndex, {
           chapterIndex: currentChapterIndex,
@@ -647,30 +836,207 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
   // QuickNovel Zero-Delay TTS & Paragraph Highlighting Engine
   // -------------------------------------------------------------
 
-  const stopTts = useCallback(() => {
-    if (typeof window !== "undefined" && window.speechSynthesis) {
-      window.speechSynthesis.cancel();
+  // -------------------------------------------------------------
+  // QuickNovel Zero-Delay TTS & Paragraph Highlighting Engine
+  // Supports: Authentic Google Classic US Female Voice Audio Stream
+  // and Browser SpeechSynthesis fallback with full sentence chunking
+  // -------------------------------------------------------------
+
+  const splitIntoTtsSentences = (text: string, maxLen = 160): string[] => {
+    if (!text) return [];
+    if (text.length <= maxLen) return [text];
+    const sentences = text.match(/[^.!?;\n\u3002\uff01\uff1f]+[.!?;\n\u3002\uff01\uff1f]*/g) || [text];
+    const chunks: string[] = [];
+    let curr = "";
+
+    for (const s of sentences) {
+      if ((curr + " " + s).trim().length <= maxLen) {
+        curr = (curr + " " + s).trim();
+      } else {
+        if (curr) chunks.push(curr);
+        if (s.length <= maxLen) {
+          curr = s.trim();
+        } else {
+          const words = s.split(/([,，、\s]+)/);
+          curr = "";
+          for (const w of words) {
+            if ((curr + w).trim().length <= maxLen) {
+              curr += w;
+            } else {
+              if (curr.trim()) chunks.push(curr.trim());
+              curr = w;
+            }
+          }
+        }
+      }
     }
+    if (curr.trim()) chunks.push(curr.trim());
+    return chunks.filter((c) => c.trim().length > 0);
+  };
+
+  const stopTts = useCallback(() => {
+    // Increment session ID so all active and pending audio/speech callbacks immediately abort
+    ttsSessionIdRef.current += 1;
+    pendingTtsStartRef.current = false;
+
+    if (audioPlayerRef.current) {
+      try {
+        // Strip event listeners before resetting source to avoid spurious onerror fallback triggers
+        audioPlayerRef.current.onended = null;
+        audioPlayerRef.current.onerror = null;
+        audioPlayerRef.current.pause();
+        audioPlayerRef.current.removeAttribute("src");
+        audioPlayerRef.current.load();
+      } catch {}
+    }
+    currentAudioChunksRef.current = [];
+    currentChunkIndexRef.current = 0;
+
+    if (utteranceRef.current) {
+      utteranceRef.current.onend = null;
+      utteranceRef.current.onerror = null;
+      utteranceRef.current = null;
+    }
+
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {}
+    }
+
     setIsTtsPlaying(false);
     setIsTtsPaused(false);
     setActiveParagraphIndex(-1);
     activeParagraphIndexRef.current = -1;
-    pendingTtsStartRef.current = false;
   }, []);
 
-  const speakParagraphAtIndex = useCallback(
-    (index: number) => {
+  const playBrowserSpeechFallback = useCallback(
+    (text: string, index: number, sessionId: number) => {
+      if (sessionId !== ttsSessionIdRef.current) return;
+
       if (typeof window === "undefined" || !window.speechSynthesis) {
-        setTtsFeedbackMessage("Text-to-speech is not supported in this browser.");
-        setTimeout(() => setTtsFeedbackMessage(null), 3000);
+        const chunks = splitIntoTtsSentences(text, 160);
+        currentAudioChunksRef.current = chunks;
+        playGoogleAudioChunk(chunks, 0, index, sessionId);
+        return;
+      }
+      const isChinese = /[\u4e00-\u9fa5]/.test(text);
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = isChinese ? "zh-CN" : "en-US";
+      
+      // On Android Chrome, match live voice from getVoices() to avoid stale references
+      const liveVoices = typeof window !== "undefined" && window.speechSynthesis ? window.speechSynthesis.getVoices() : [];
+      const targetVoiceName = selectedVoiceRef.current?.name || selectedVoice?.name || prefs.ttsVoiceName;
+      const matchedVoice = liveVoices.find((v) => v.name === targetVoiceName) || selectedVoiceRef.current || selectedVoice;
+      if (matchedVoice) {
+        utterance.voice = matchedVoice;
+        utterance.lang = matchedVoice.lang;
+      }
+      utterance.rate = prefs.ttsRate || 1.0;
+      utterance.pitch = prefs.ttsPitch || 1.0;
+
+      utterance.onend = () => {
+        if (sessionId !== ttsSessionIdRef.current) return;
+        speakParagraphAtIndex(index + 1);
+      };
+
+      utterance.onerror = (e) => {
+        if (sessionId !== ttsSessionIdRef.current) return;
+        if (e.error !== "interrupted" && e.error !== "canceled") {
+          console.warn("Browser Speech Synthesis Error:", e.error);
+          // Advance gracefully to next paragraph if a paragraph fails
+          speakParagraphAtIndex(index + 1);
+        }
+      };
+
+      try {
+        if (window.speechSynthesis.paused) {
+          window.speechSynthesis.resume();
+        }
+        if (window.speechSynthesis.speaking) {
+          window.speechSynthesis.cancel();
+        }
+      } catch {}
+
+      utteranceRef.current = utterance;
+      try {
+        // Direct synchronous call preserves mobile touch gesture authorization
+        window.speechSynthesis.speak(utterance);
+      } catch (err) {
+        console.warn("Direct speech synthesis speak error:", err);
+        speakParagraphAtIndex(index + 1);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [selectedVoice, prefs.ttsRate, prefs.ttsPitch]
+  );
+
+  const playGoogleAudioChunk = useCallback(
+    (chunks: string[], chunkIdx: number, paragraphIdx: number, sessionId: number) => {
+      if (sessionId !== ttsSessionIdRef.current) return;
+
+      if (chunkIdx >= chunks.length) {
+        // Entire paragraph finished, advance to next paragraph seamlessly
+        speakParagraphAtIndex(paragraphIdx + 1);
         return;
       }
 
-      const paragraphs = ttsParagraphsRef.current;
+      currentChunkIndexRef.current = chunkIdx;
+      const chunkText = chunks[chunkIdx];
+      const isChinese = /[\u4e00-\u9fa5]/.test(chunkText);
+      const lang = isChinese ? "zh-CN" : (prefs.cloudVoiceLang || "en");
+      const audioUrl = `/api/tts/google-audio?text=${encodeURIComponent(chunkText)}&lang=${encodeURIComponent(lang)}`;
+
+      if (!audioPlayerRef.current) {
+        audioPlayerRef.current = new Audio();
+      }
+      const audio = audioPlayerRef.current;
+      audio.playbackRate = prefs.ttsRate || 1.0;
+
+      audio.onended = () => {
+        if (sessionId !== ttsSessionIdRef.current) return;
+        playGoogleAudioChunk(chunks, chunkIdx + 1, paragraphIdx, sessionId);
+      };
+
+      audio.onerror = (err) => {
+        if (sessionId !== ttsSessionIdRef.current) return;
+        console.warn("Google TTS audio streaming error:", err);
+        // Only retry with browser speech if not already in an error state
+        if (typeof window !== "undefined" && window.speechSynthesis) {
+          try {
+            const ut = new SpeechSynthesisUtterance(chunks.slice(chunkIdx).join(" "));
+            ut.lang = lang === "zh-CN" ? "zh-CN" : "en-US";
+            if (selectedVoiceRef.current || selectedVoice) {
+              ut.voice = (selectedVoiceRef.current || selectedVoice)!;
+            }
+            ut.onend = () => {
+              if (sessionId === ttsSessionIdRef.current) {
+                speakParagraphAtIndex(paragraphIdx + 1);
+              }
+            };
+            window.speechSynthesis.speak(ut);
+          } catch {}
+        }
+      };
+
+      audio.src = audioUrl;
+      audio.play().catch((playErr) => {
+        if (sessionId !== ttsSessionIdRef.current) return;
+        console.warn("Google TTS audio playback blocked or error:", playErr);
+      });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [prefs.ttsRate]
+  );
+
+  const speakParagraphAtIndex = useCallback(
+    (index: number) => {
+      const sessionId = ++ttsSessionIdRef.current;
+      const paragraphs = ttsParagraphsRef.current.length > 0 ? ttsParagraphsRef.current : displayParagraphs;
       if (!paragraphs || paragraphs.length === 0) {
-        if (isLoadingChapter) {
+        if (isLoadingChapter || isTranslatingSingleChapter) {
           pendingTtsStartRef.current = true;
-          setTtsFeedbackMessage("Chapter is loading... TTS will begin in a moment.");
+          setTtsFeedbackMessage("Chapter is preparing... TTS will begin in a moment.");
           setTimeout(() => setTtsFeedbackMessage(null), 3000);
           return;
         }
@@ -704,7 +1070,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
       const rawText = paragraphs[index] || "";
       const text = rawText.trim();
       if (!text) {
-        // Skip empty whitespace paragraphs instantly
+        // Skip empty whitespace paragraphs
         speakParagraphAtIndex(index + 1);
         return;
       }
@@ -723,98 +1089,18 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
         }
       });
 
-      // 3. Language & Voice Matching
-      const isChinese = /[\u4e00-\u9fa5]/.test(text);
-
-      let currentVoices = availableVoices;
-      if (!currentVoices || currentVoices.length === 0) {
-        try {
-          const fresh = window.speechSynthesis.getVoices();
-          if (fresh && fresh.length > 0) {
-            currentVoices = fresh;
-            setAvailableVoices(fresh);
-          }
-        } catch {}
-      }
-
-      let voiceToUse: SpeechSynthesisVoice | null = null;
-      if (isChinese) {
-        if (selectedVoice && selectedVoice.lang && selectedVoice.lang.toLowerCase().startsWith("zh")) {
-          voiceToUse = selectedVoice;
-        } else if (currentVoices && currentVoices.length > 0) {
-          voiceToUse =
-            currentVoices.find((v) => v.lang && (v.lang.toLowerCase() === "zh-cn" || v.lang.toLowerCase() === "zh_cn")) ||
-            currentVoices.find((v) => v.lang && v.lang.toLowerCase().startsWith("zh")) ||
-            currentVoices.find((v) => v.name.toLowerCase().includes("chinese") || v.name.includes("普通话") || v.name.includes("中文")) ||
-            null;
-        }
+      // 3. Choice of Audio Engine: Device Google TTS / Browser Synthesis vs Google Cloud Audio Stream
+      if (prefs.ttsEngine === "browser-native") {
+        playBrowserSpeechFallback(text, index, sessionId);
       } else {
-        if (selectedVoice && selectedVoice.lang && selectedVoice.lang.toLowerCase().startsWith("en")) {
-          voiceToUse = selectedVoice;
-        } else if (currentVoices && currentVoices.length > 0) {
-          voiceToUse =
-            currentVoices.find((v) => v.lang && (v.lang.toLowerCase() === "en-us" || v.lang.toLowerCase() === "en_us")) ||
-            currentVoices.find((v) => v.lang && v.lang.toLowerCase().startsWith("en")) ||
-            null;
-        }
+        // Split text into natural sentence chunks for authentic Google Audio
+        const chunks = splitIntoTtsSentences(text, 160);
+        currentAudioChunksRef.current = chunks;
+        playGoogleAudioChunk(chunks, 0, index, sessionId);
       }
-
-      // 4. Create Utterance with explicit language
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = isChinese ? "zh-CN" : "en-US";
-      if (voiceToUse) {
-        utterance.voice = voiceToUse;
-      }
-      utterance.rate = prefs.ttsRate || 1.0;
-      utterance.pitch = prefs.ttsPitch || 1.0;
-
-      utterance.onend = () => {
-        const nextIdx = index + 1;
-        speakParagraphAtIndex(nextIdx);
-      };
-
-      utterance.onerror = (e) => {
-        if (e.error !== "interrupted" && e.error !== "canceled") {
-          console.warn("TTS Error:", e);
-          if (utterance.voice && e.error !== "not-allowed") {
-            setTimeout(() => {
-              const fallback = new SpeechSynthesisUtterance(text);
-              fallback.lang = isChinese ? "zh-CN" : "en-US";
-              fallback.rate = prefs.ttsRate || 1.0;
-              fallback.pitch = prefs.ttsPitch || 1.0;
-              fallback.onend = () => speakParagraphAtIndex(index + 1);
-              utteranceRef.current = fallback;
-              (window as any).__megatextActiveUtterance = fallback;
-              window.speechSynthesis.speak(fallback);
-            }, 30);
-          }
-        }
-      };
-
-      // 5. Safely cancel preceding audio and prevent Android Chrome race condition
-      if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
-        window.speechSynthesis.cancel();
-      }
-      if (window.speechSynthesis.paused) {
-        window.speechSynthesis.resume();
-      }
-
-      utteranceRef.current = utterance;
-      (window as any).__megatextActiveUtterance = utterance;
-
-      setTimeout(() => {
-        try {
-          window.speechSynthesis.speak(utterance);
-        } catch (err) {
-          console.warn("Speech synthesis speak error:", err);
-        }
-      }, 20);
     },
     [
-      selectedVoice,
-      availableVoices,
-      prefs.ttsRate,
-      prefs.ttsPitch,
+      prefs.ttsEngine,
       prefs.autoAdvanceTts,
       currentChapterIndex,
       chapterList.length,
@@ -823,31 +1109,45 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
       loadChapter,
       stopTts,
       isLoadingChapter,
+      isTranslatingSingleChapter,
+      displayParagraphs,
+      playBrowserSpeechFallback,
+      playGoogleAudioChunk,
     ]
   );
 
   // Instant 0ms Play / Pause Handler
   const togglePlayPauseTts = () => {
-    if (typeof window === "undefined" || !window.speechSynthesis) return;
-
     if (isTtsPlaying) {
       if (isTtsPaused) {
-        // Resume instantly
+        // Resume instantly from the active paragraph
         setIsTtsPaused(false);
-        if (window.speechSynthesis.paused) {
-          window.speechSynthesis.resume();
-        } else {
-          // If browser lost state, restart from active paragraph
-          const target = activeParagraphIndexRef.current >= 0 ? activeParagraphIndexRef.current : 0;
-          speakParagraphAtIndex(target);
+        const currentList = ttsParagraphsRef.current.length > 0 ? ttsParagraphsRef.current : displayParagraphs;
+        let currentIndex = activeParagraphIndexRef.current;
+        if (currentIndex < 0 || currentIndex >= currentList.length) {
+          currentIndex = 0;
         }
+        speakParagraphAtIndex(currentIndex);
       } else {
-        // Pause instantly
+        // Pause instantly without altering voice engine or state
         setIsTtsPaused(true);
-        window.speechSynthesis.pause();
+        if (audioPlayerRef.current) {
+          try {
+            audioPlayerRef.current.pause();
+          } catch {}
+        }
+        if (typeof window !== "undefined" && window.speechSynthesis) {
+          try {
+            window.speechSynthesis.cancel();
+          } catch {}
+        }
       }
     } else {
-      const startIndex = activeParagraphIndexRef.current >= 0 ? activeParagraphIndexRef.current : 0;
+      const currentList = ttsParagraphsRef.current.length > 0 ? ttsParagraphsRef.current : displayParagraphs;
+      let startIndex = activeParagraphIndexRef.current;
+      if (startIndex < 0 || startIndex >= currentList.length) {
+        startIndex = 0;
+      }
       speakParagraphAtIndex(startIndex);
     }
   };
@@ -996,7 +1296,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           <span className="absolute -inset-1.5 rounded-full bg-purple-500/25 animate-ping pointer-events-none" />
         )}
 
-        <div className="relative flex items-center bg-slate-900/95 backdrop-blur-md text-white rounded-full p-1.5 shadow-2xl border border-purple-500/30 ring-1 ring-white/10 hover:border-purple-400/60 transition-colors">
+        <div className="relative flex items-center bg-slate-900 text-white rounded-full p-1.5 shadow-2xl border border-purple-500/30 ring-1 ring-white/10 hover:border-purple-400/60 transition-colors">
           {/* Main draggable button to restore reader */}
           <button
             type="button"
@@ -1038,10 +1338,14 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                   localStorage.setItem("megatext_reader_bubble_pos", JSON.stringify(bubblePos));
                 } catch {}
               } else {
+                // Tapping should directly restore reader view (close drawers & menus)
+                setShowChapterDrawer(false);
+                setShowSettingsMenu(false);
+                setShowTopMoreMenu(false);
                 onToggleMinimize();
               }
             }}
-            title={`Reader Minimized (${novelTitle} · Ch ${currentChapterIndex}) - Tap to open or drag to move`}
+            title={`Reader Minimized (${novelTitle} · Ch ${currentChapterIndex}) - Tap to open reader or drag to move`}
             className="flex items-center gap-2 pl-2 pr-3 py-1 cursor-grab active:cursor-grabbing group touch-none"
           >
             <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-purple-600 via-indigo-600 to-purple-500 text-white flex items-center justify-center shrink-0 shadow-inner group-hover:scale-105 transition-transform">
@@ -1071,27 +1375,13 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
               togglePlayPauseTts();
             }}
             title={isTtsPlaying && !isTtsPaused ? "Pause TTS" : "Play TTS"}
-            className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center cursor-pointer transition-colors active:scale-95 shrink-0 ml-1"
+            className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center cursor-pointer transition-colors active:scale-95 shrink-0 ml-1 mr-1"
           >
             {isTtsPlaying && !isTtsPaused ? (
               <Pause className="h-4 w-4 fill-current" />
             ) : (
               <Play className="h-4 w-4 fill-current ml-0.5" />
             )}
-          </button>
-
-          {/* Close Reader Dismiss Button */}
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              stopTts();
-              onClose();
-            }}
-            title="Close Reader"
-            className="w-7 h-7 rounded-full bg-slate-800 text-slate-400 hover:text-white hover:bg-rose-600 flex items-center justify-center cursor-pointer transition-colors active:scale-90 shrink-0 ml-1"
-          >
-            <X className="h-3.5 w-3.5" />
           </button>
         </div>
       </div>
@@ -1110,7 +1400,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
         {/* QuickNovel App Bar (Header) */}
         {/* ========================================================= */}
         <header
-          className={`px-3 sm:px-5 py-2.5 shrink-0 flex items-center justify-between gap-2 sm:gap-3 border-b ${themeClasses.border} ${themeClasses.navBg} backdrop-blur-md`}
+          className={`relative z-50 px-3 sm:px-5 py-2.5 shrink-0 flex items-center justify-between gap-2 sm:gap-3 border-b ${themeClasses.border} ${themeClasses.navBg} backdrop-blur-md`}
         >
           {/* Left: Back / Close & Novel Info */}
           <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -1145,22 +1435,8 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
             </div>
           </div>
 
-          {/* Right Action Controls (Clean, uncluttered, with all settings under the gear icon) */}
+          {/* Right Action Controls (Clean, uncluttered, with 3-horizontal-dots menu and Minimize button) */}
           <div className="flex items-center gap-1 sm:gap-2 shrink-0">
-            {/* Library / Bookmark Toggle */}
-            <button
-              type="button"
-              onClick={handleToggleLibrary}
-              title={isInLibrary ? "Saved in Library (Click to remove)" : "Bookmark & Save to Library"}
-              className={`p-2 sm:p-2.5 rounded-xl transition cursor-pointer flex items-center justify-center active:scale-95 ${
-                isInLibrary
-                  ? "bg-purple-600 text-white shadow-xs"
-                  : `${themeClasses.buttonBg} hover:text-purple-600`
-              }`}
-            >
-              <Bookmark className={`h-5 w-5 ${isInLibrary ? "fill-current" : ""}`} />
-            </button>
-
             {/* Chapters Table of Contents */}
             <button
               type="button"
@@ -1171,41 +1447,113 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
               <List className="h-5 w-5" />
             </button>
 
-            {/* Minimize Reader (Minimizes to floating open book bubble at bottom-right) */}
+            {/* 3 Horizontal Dots Menu (Holds Settings, Translation, Library, and Close) */}
+            <div className="relative z-50" ref={topMoreMenuRef}>
+              <button
+                id="reader-top-more-menu-btn"
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowTopMoreMenu(!showTopMoreMenu);
+                }}
+                title="More Options & Settings"
+                className={`p-2 sm:p-2.5 rounded-xl transition cursor-pointer flex items-center justify-center active:scale-95 ${
+                  showTopMoreMenu || showSettingsMenu
+                    ? "bg-purple-600 text-white shadow-sm"
+                    : `${themeClasses.buttonBg} hover:text-purple-600`
+                }`}
+              >
+                <MoreHorizontal className="h-5 w-5" />
+              </button>
+
+              {/* 3-Dots Dropdown Menu (Solid 100% Opaque, z-[9999], Direct Tap Handlers) */}
+              {showTopMoreMenu && (
+                <div
+                  onClick={(e) => e.stopPropagation()}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  className="absolute right-0 top-full mt-2 w-64 rounded-2xl shadow-[0_20px_50px_rgba(0,0,0,0.45)] border border-purple-200 dark:border-purple-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 p-2 z-[9999] animate-in fade-in zoom-in-95 duration-100 divide-y divide-purple-100 dark:divide-purple-900/50 select-none ring-1 ring-black/10"
+                  style={{
+                    backgroundColor: prefs.theme === "oled" ? "#09090b" : prefs.theme === "slate" ? "#0f172a" : "#ffffff",
+                    color: prefs.theme === "oled" || prefs.theme === "slate" ? "#f8fafc" : "#0f172a",
+                    opacity: 1,
+                  }}
+                >
+                  <div className="pb-1.5 space-y-1.5">
+                    <button
+                      type="button"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowSettingsMenu(true);
+                        setShowTopMoreMenu(false);
+                      }}
+                      className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left font-bold text-xs cursor-pointer transition bg-purple-50 dark:bg-slate-800 hover:bg-purple-600 hover:text-white dark:hover:bg-purple-600 dark:hover:text-white group text-slate-900 dark:text-slate-100"
+                    >
+                      <Settings className="h-4.5 w-4.5 shrink-0 text-purple-600 dark:text-purple-400 group-hover:text-white" />
+                      <span className="flex-1">Reader & Voice Settings</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowTranslateModal(true);
+                        setShowTopMoreMenu(false);
+                      }}
+                      className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left font-bold text-xs cursor-pointer transition bg-purple-50 dark:bg-slate-800 hover:bg-purple-600 hover:text-white dark:hover:bg-purple-600 dark:hover:text-white group text-slate-900 dark:text-slate-100"
+                    >
+                      <Languages className="h-4.5 w-4.5 shrink-0 text-indigo-500 dark:text-indigo-400 group-hover:text-white" />
+                      <span className="flex-1">Translation Scope</span>
+                    </button>
+                  </div>
+
+                  <div className="pt-1.5 space-y-1.5">
+                    <button
+                      type="button"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleToggleLibrary();
+                        setShowTopMoreMenu(false);
+                      }}
+                      className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left font-semibold text-xs cursor-pointer transition bg-slate-100 dark:bg-slate-800 hover:bg-purple-600 hover:text-white dark:hover:bg-purple-600 dark:hover:text-white group text-slate-800 dark:text-slate-200"
+                    >
+                      <Bookmark className={`h-4.5 w-4.5 shrink-0 group-hover:text-white ${isInLibrary ? "fill-purple-600 text-purple-600 dark:fill-purple-400 dark:text-purple-400" : "text-purple-600 dark:text-purple-400"}`} />
+                      <span className="flex-1">{isInLibrary ? "Remove from Library" : "Bookmark to Library"}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowTopMoreMenu(false);
+                        stopTts();
+                        onClose();
+                      }}
+                      className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left font-semibold text-xs cursor-pointer transition bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-600 hover:text-white group text-rose-700 dark:text-rose-300"
+                    >
+                      <X className="h-4.5 w-4.5 shrink-0 group-hover:text-white" />
+                      <span className="flex-1">Close Reader</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Minimize Reader Button (Replaced X next to 3-dots) */}
             <button
               type="button"
-              onClick={onToggleMinimize}
-              title="Minimize to Floating Book Bubble"
-              className={`p-2 sm:p-2.5 rounded-xl ${themeClasses.buttonBg} transition cursor-pointer text-purple-600 dark:text-purple-400 active:scale-95 flex items-center justify-center`}
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowTopMoreMenu(false);
+                onToggleMinimize();
+              }}
+              title="Minimize Reader"
+              className={`p-2 sm:p-2.5 rounded-xl ${themeClasses.buttonBg} hover:text-purple-600 hover:bg-purple-500/15 transition cursor-pointer active:scale-95 flex items-center justify-center`}
             >
               <Minimize2 className="h-5 w-5" />
-            </button>
-
-            {/* Gear Icon (All Settings: Text size, Fonts, TTS Voice, 1.3x Speed, Sleep Timer, Translation) */}
-            <button
-              type="button"
-              onClick={() => setShowSettingsMenu(!showSettingsMenu)}
-              title="Settings"
-              className={`p-2 sm:p-2.5 rounded-xl transition cursor-pointer flex items-center justify-center active:scale-95 ${
-                showSettingsMenu
-                  ? "bg-purple-600 text-white shadow-sm"
-                  : `${themeClasses.buttonBg} hover:text-purple-600`
-              }`}
-            >
-              <Settings className="h-5 w-5" />
-            </button>
-
-            {/* Close Reader */}
-            <button
-              type="button"
-              onClick={() => {
-                stopTts();
-                onClose();
-              }}
-              title="Close Reader"
-              className={`p-2 sm:p-2.5 rounded-xl ${themeClasses.buttonBg} hover:bg-rose-500/20 hover:text-rose-600 transition cursor-pointer active:scale-95 flex items-center justify-center`}
-            >
-              <X className="h-5 w-5" />
             </button>
           </div>
         </header>
@@ -1215,32 +1563,46 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
         {/* ========================================================= */}
         {showSettingsMenu && (
           <div
-            className={`border-b ${themeClasses.border} ${themeClasses.cardBg} animate-in slide-in-from-top-2 text-xs select-none`}
+            className={`border-b ${themeClasses.border} ${themeClasses.cardBg} animate-in slide-in-from-top-2 text-xs flex flex-col max-h-[75vh] sm:max-h-[60vh] z-30 shadow-lg`}
           >
-            {/* QuickNovel Navigation Tabs */}
-            <div className="flex items-center border-b border-black/5 dark:border-white/5 px-4 pt-2 gap-2 overflow-x-auto">
-              {[
-                { id: "text", label: "Text" },
-                { id: "voice", label: "Voice / TTS" },
-                { id: "translation", label: "Translation" },
-                { id: "general", label: "General" },
-              ].map((tab) => (
-                <button
-                  key={tab.id}
-                  type="button"
-                  onClick={() => setSettingsTab(tab.id as any)}
-                  className={`px-3 py-1.5 font-bold rounded-t-lg transition border-b-2 ${
-                    settingsTab === tab.id
-                      ? "border-purple-600 text-purple-600 dark:text-purple-400 bg-black/5 dark:bg-white/5"
-                      : "border-transparent opacity-60 hover:opacity-100"
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              ))}
+            {/* QuickNovel Navigation Tabs + Close / Back to Reading Button */}
+            <div className="shrink-0 flex items-center justify-between border-b border-black/5 dark:border-white/5 px-3 sm:px-4 pt-2 gap-2 overflow-x-auto">
+              <div className="flex items-center gap-1.5 sm:gap-2">
+                {[
+                  { id: "text", label: "Text" },
+                  { id: "voice", label: "Voice / TTS" },
+                  { id: "translation", label: "Translation" },
+                  { id: "general", label: "General" },
+                ].map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setSettingsTab(tab.id as any)}
+                    className={`px-3 py-1.5 font-bold rounded-t-lg transition border-b-2 cursor-pointer ${
+                      settingsTab === tab.id
+                        ? "border-purple-600 text-purple-600 dark:text-purple-400 bg-black/5 dark:bg-white/5"
+                        : "border-transparent opacity-60 hover:opacity-100"
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Explicit Close / Back to Chapter Button */}
+              <button
+                type="button"
+                onClick={() => setShowSettingsMenu(false)}
+                className="shrink-0 mb-1 flex items-center gap-1 px-2.5 py-1 rounded-lg bg-black/5 dark:bg-white/10 hover:bg-rose-500/15 hover:text-rose-600 transition cursor-pointer font-bold text-xs active:scale-95"
+                title="Close settings and return to reading"
+              >
+                <X className="h-4 w-4" />
+                <span className="hidden sm:inline">Close</span>
+              </button>
             </div>
 
-            <div className="p-4">
+            {/* Scrollable Content Container with touch-pan-y for smooth mobile scroll */}
+            <div className="flex-1 overflow-y-auto overscroll-contain p-4 space-y-4 touch-pan-y">
               {/* Tab 1: Text Settings */}
               {settingsTab === "text" && (
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -1344,48 +1706,197 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
               {/* Tab 2: Voice Settings (Standard Google US Voice Priority & Fine-grained Speed Options) */}
               {settingsTab === "voice" && (
                 <div className="space-y-4">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div className="space-y-1.5">
-                      <div className="flex items-center justify-between">
-                        <span className="font-bold block opacity-75">Voice Actor (English)</span>
-                        <span className="text-[10px] text-purple-600 dark:text-purple-400 font-semibold">
-                          Google US Standard
-                        </span>
+                  {/* Voice Engine Selection */}
+                  <div className="space-y-2">
+                    <span className="font-bold block opacity-75">Text-to-Speech Engine</span>
+                    {typeof window !== "undefined" && !("speechSynthesis" in window && !!window.speechSynthesis) && (
+                      <div className="p-2.5 rounded-xl bg-purple-500/10 border border-purple-500/30 text-purple-700 dark:text-purple-300 text-xs font-semibold flex items-start gap-2">
+                        <span>💡 <strong>Soul Browser Compatibility:</strong> Device Speech Synthesis is disabled in Soul Browser. Your reader will automatically play audio using <strong>Google Cloud Audio Stream</strong> seamlessly.</span>
                       </div>
-                      <select
-                        value={selectedVoice?.name || ""}
-                        onChange={(e) => {
-                          const v = availableVoices.find((x) => x.name === e.target.value);
-                          if (v) {
-                            setSelectedVoice(v);
-                            updatePrefs({ ttsVoiceName: v.name });
+                    )}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          updatePrefs({ ttsEngine: "browser-native" });
+                          if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
+                            speakParagraphAtIndex(activeParagraphIndexRef.current);
+                          }
+                        }}
+                        className={`p-3 rounded-xl border text-left cursor-pointer transition ${
+                          prefs.ttsEngine === "browser-native"
+                            ? "bg-purple-600/10 border-purple-500 text-purple-700 dark:text-purple-300 font-bold"
+                            : `${themeClasses.buttonBg} border-transparent opacity-70 hover:opacity-100`
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <Radio className={`h-4 w-4 ${prefs.ttsEngine === "browser-native" ? "text-purple-600" : ""}`} />
+                          <span className="text-xs font-bold">Device / Android Google TTS</span>
+                        </div>
+                        <p className="text-[11px] opacity-75 mt-1 font-normal leading-tight">
+                          Uses your phone's built-in Google Text-to-Speech voices (Speech Services by Google).
+                        </p>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          updatePrefs({ ttsEngine: "google-classic" });
+                          if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
+                            speakParagraphAtIndex(activeParagraphIndexRef.current);
+                          }
+                        }}
+                        className={`p-3 rounded-xl border text-left cursor-pointer transition ${
+                          prefs.ttsEngine !== "browser-native"
+                            ? "bg-purple-600/10 border-purple-500 text-purple-700 dark:text-purple-300 font-bold"
+                            : `${themeClasses.buttonBg} border-transparent opacity-70 hover:opacity-100`
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <Radio className={`h-4 w-4 ${prefs.ttsEngine !== "browser-native" ? "text-purple-600" : ""}`} />
+                          <span className="text-xs font-bold">Google Cloud Audio Stream</span>
+                        </div>
+                        <p className="text-[11px] opacity-75 mt-1 font-normal leading-tight">
+                          Server-streamed audio from Google Translate TTS service.
+                        </p>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    {prefs.ttsEngine === "browser-native" && typeof window !== "undefined" && "speechSynthesis" in window && !!window.speechSynthesis ? (
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold block opacity-75">Voice Actor (English)</span>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => refreshVoices(true)}
+                              className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-black/5 dark:bg-white/5 hover:bg-purple-600/10 text-xs font-semibold opacity-80 hover:opacity-100 transition cursor-pointer active:scale-95"
+                              title="Re-scan device voices"
+                            >
+                              <RotateCw className={`h-3 w-3 ${isRefreshingVoices ? "animate-spin text-purple-600" : ""}`} />
+                              <span className="text-[11px]">{isRefreshingVoices ? "Scanning..." : "Refresh"}</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={testVoiceAudio}
+                              disabled={isTestingVoice}
+                              className={`flex items-center gap-1 px-2.5 py-0.5 rounded-md font-bold text-[11px] transition cursor-pointer active:scale-95 ${
+                                isTestingVoice
+                                  ? "bg-purple-600 text-white animate-pulse"
+                                  : "bg-purple-600/10 hover:bg-purple-600/20 text-purple-600 dark:text-purple-400"
+                              }`}
+                              title="Listen to sample of chosen voice"
+                            >
+                              <Volume2 className={`h-3.5 w-3.5 ${isTestingVoice ? "animate-bounce" : ""}`} />
+                              <span>{isTestingVoice ? "Playing..." : "Test Voice"}</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        <select
+                          value={selectedVoice?.name || ""}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            if (!val) {
+                              setChosenVoice(null);
+                              updatePrefs({ ttsVoiceName: "" });
+                              return;
+                            }
+                            const v = availableVoices.find((x) => x.name === val);
+                            if (v) {
+                              setChosenVoice(v);
+                              if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
+                                speakParagraphAtIndex(activeParagraphIndexRef.current);
+                              }
+                            }
+                          }}
+                          className={`w-full rounded-lg ${themeClasses.buttonBg} px-2.5 py-2 font-semibold text-xs focus:outline-none truncate border ${themeClasses.border}`}
+                        >
+                          {availableVoices.length === 0 ? (
+                            <option value="">System Default Voice (Android/Device)</option>
+                          ) : (
+                            <>
+                              <option value="">Default Android System Voice (Auto)</option>
+                              {availableVoices.map((v, i) => {
+                                const nameLower = (v.name || "").toLowerCase();
+                                const uriLower = (v.voiceURI || "").toLowerCase();
+                                const isGoogle =
+                                  nameLower.includes("google") ||
+                                  uriLower.includes("google") ||
+                                  uriLower.includes("com.google") ||
+                                  nameLower.includes("sfg");
+                                const isUs =
+                                  v.lang.toLowerCase().includes("us") ||
+                                  nameLower.includes("us") ||
+                                  nameLower.includes("united states");
+                                let tag = "";
+                                if (isGoogle && isUs) tag = " ★ (Google US Standard)";
+                                else if (isGoogle) tag = " (Google)";
+                                else if (
+                                  nameLower.includes("natural") ||
+                                  nameLower.includes("jenny") ||
+                                  nameLower.includes("aria") ||
+                                  nameLower.includes("samantha")
+                                )
+                                  tag = " (Natural)";
+
+                                return (
+                                  <option key={`${v.name}_${i}`} value={v.name}>
+                                    {v.name} ({v.lang}){tag}
+                                  </option>
+                                );
+                              })}
+                            </>
+                          )}
+                        </select>
+                      </div>
+                    ) : (
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold block opacity-75">Cloud Voice Accent & Style</span>
+                          <button
+                            type="button"
+                            onClick={testVoiceAudio}
+                            disabled={isTestingVoice}
+                            className={`flex items-center gap-1 px-2.5 py-0.5 rounded-md font-bold text-[11px] transition cursor-pointer active:scale-95 ${
+                              isTestingVoice
+                                ? "bg-purple-600 text-white animate-pulse"
+                                : "bg-purple-600/10 hover:bg-purple-600/20 text-purple-600 dark:text-purple-400"
+                            }`}
+                            title="Listen to sample of chosen voice"
+                          >
+                            <Volume2 className={`h-3.5 w-3.5 ${isTestingVoice ? "animate-bounce" : ""}`} />
+                            <span>{isTestingVoice ? "Playing..." : "Test Voice"}</span>
+                          </button>
+                        </div>
+
+                        <select
+                          value={prefs.cloudVoiceLang || "en"}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            updatePrefs({ cloudVoiceLang: val });
                             if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
                               speakParagraphAtIndex(activeParagraphIndexRef.current);
                             }
-                          }
-                        }}
-                        className={`w-full rounded-lg ${themeClasses.buttonBg} px-2.5 py-2 font-semibold text-xs focus:outline-none truncate`}
-                      >
-                        {availableVoices.map((v, i) => {
-                          const nameLower = v.name.toLowerCase();
-                          const isGoogle = nameLower.includes("google");
-                          const isUs = v.lang.toLowerCase().includes("us") || nameLower.includes("us");
-                          let tag = "";
-                          if (isGoogle && isUs) tag = " ★ (Google US Standard)";
-                          else if (isGoogle) tag = " (Google)";
-                          else if (nameLower.includes("natural") || nameLower.includes("jenny") || nameLower.includes("aria") || nameLower.includes("samantha")) tag = " (Natural)";
-                          
-                          return (
-                            <option key={i} value={v.name}>
-                              {v.name} [{v.lang}]{tag}
-                            </option>
-                          );
-                        })}
-                      </select>
-                      <p className="text-[10.5px] opacity-60">
-                        Defaulted to the clean Google Text-to-Speech US English voice. Other foreign language voices have been filtered out.
-                      </p>
-                    </div>
+                          }}
+                          className={`w-full rounded-lg ${themeClasses.buttonBg} px-2.5 py-2 font-semibold text-xs focus:outline-none truncate border ${themeClasses.border}`}
+                        >
+                          <option value="en">🇺🇸 Google US English (Standard - Closest to Voice I)</option>
+                          <option value="en-GB">🇬🇧 Google UK English (British Accent)</option>
+                          <option value="en-AU">🇦🇺 Google Australian English</option>
+                          <option value="en-IN">🇮🇳 Google Indian English</option>
+                          <option value="zh-CN">🇨🇳 Google Chinese Mandarin (Simplified)</option>
+                          <option value="zh-TW">🇹🇼 Google Chinese Mandarin (Traditional)</option>
+                          <option value="ja">🇯🇵 Google Japanese</option>
+                          <option value="ko">🇰🇷 Google Korean</option>
+                          <option value="es">🇪🇸 Google Spanish</option>
+                          <option value="fr">🇫🇷 Google French</option>
+                        </select>
+                      </div>
+                    )}
 
                     <div className="space-y-1.5">
                       <span className="font-bold block opacity-75">Auto-advance Next Chapter</span>
@@ -1413,7 +1924,8 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                           onClick={() => {
                             const newRate = Math.max(0.5, Math.round((prefs.ttsRate - 0.05) * 100) / 100);
                             updatePrefs({ ttsRate: newRate });
-                            if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
+                            if (audioPlayerRef.current) audioPlayerRef.current.playbackRate = newRate;
+                            if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
                               speakParagraphAtIndex(activeParagraphIndexRef.current);
                             }
                           }}
@@ -1430,7 +1942,8 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                           onClick={() => {
                             const newRate = Math.min(2.5, Math.round((prefs.ttsRate + 0.05) * 100) / 100);
                             updatePrefs({ ttsRate: newRate });
-                            if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
+                            if (audioPlayerRef.current) audioPlayerRef.current.playbackRate = newRate;
+                            if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
                               speakParagraphAtIndex(activeParagraphIndexRef.current);
                             }
                           }}
@@ -1452,7 +1965,8 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                             type="button"
                             onClick={() => {
                               updatePrefs({ ttsRate: rate });
-                              if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
+                              if (audioPlayerRef.current) audioPlayerRef.current.playbackRate = rate;
+                              if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
                                 speakParagraphAtIndex(activeParagraphIndexRef.current);
                               }
                             }}
@@ -1479,7 +1993,8 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                         onChange={(e) => {
                           const newRate = parseFloat(e.target.value);
                           updatePrefs({ ttsRate: newRate });
-                          if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
+                          if (audioPlayerRef.current) audioPlayerRef.current.playbackRate = newRate;
+                          if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
                             speakParagraphAtIndex(activeParagraphIndexRef.current);
                           }
                         }}
@@ -1491,6 +2006,105 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                         <span className="font-bold text-purple-600 dark:text-purple-400">1.35x-1.45x</span>
                         <span>2.0x</span>
                         <span>2.5x</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* TTS Voice Pitch Setting */}
+                  <div className="space-y-2.5 pt-2 border-t border-black/5 dark:border-white/5">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <span className="font-bold block opacity-75">Voice Pitch / Tone</span>
+                        <span className="text-[10px] opacity-60">Adjust voice tone depth or treble</span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const newPitch = Math.max(0.5, Math.round(((prefs.ttsPitch || 1.0) - 0.05) * 100) / 100);
+                            updatePrefs({ ttsPitch: newPitch });
+                            if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
+                              speakParagraphAtIndex(activeParagraphIndexRef.current);
+                            }
+                          }}
+                          className={`px-2 py-0.5 rounded ${themeClasses.buttonBg} hover:bg-purple-500/20 active:scale-95 font-mono font-bold text-[11px] cursor-pointer`}
+                          title="Lower voice pitch by 0.05"
+                        >
+                          -0.05
+                        </button>
+                        <span className="text-purple-600 dark:text-purple-400 font-mono font-bold text-xs px-2 py-0.5 rounded bg-purple-500/10 border border-purple-500/20">
+                          {Number(prefs.ttsPitch || 1.0).toFixed(2).replace(/\.00$/, ".0").replace(/0$/, "")}x
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const newPitch = Math.min(1.6, Math.round(((prefs.ttsPitch || 1.0) + 0.05) * 100) / 100);
+                            updatePrefs({ ttsPitch: newPitch });
+                            if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
+                              speakParagraphAtIndex(activeParagraphIndexRef.current);
+                            }
+                          }}
+                          className={`px-2 py-0.5 rounded ${themeClasses.buttonBg} hover:bg-purple-500/20 active:scale-95 font-mono font-bold text-[11px] cursor-pointer`}
+                          title="Raise voice pitch by 0.05"
+                        >
+                          +0.05
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Pitch presets */}
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {[
+                        { label: "Deep (0.8x)", val: 0.8 },
+                        { label: "Warm (0.9x)", val: 0.9 },
+                        { label: "Standard (1.0x)", val: 1.0 },
+                        { label: "Bright (1.1x)", val: 1.1 },
+                        { label: "Crisp (1.2x)", val: 1.2 },
+                      ].map((item) => {
+                        const isSelected = Math.abs((prefs.ttsPitch || 1.0) - item.val) < 0.03;
+                        return (
+                          <button
+                            key={item.val}
+                            type="button"
+                            onClick={() => {
+                              updatePrefs({ ttsPitch: item.val });
+                              if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
+                                speakParagraphAtIndex(activeParagraphIndexRef.current);
+                              }
+                            }}
+                            className={`px-2.5 py-1 rounded-lg text-xs font-bold transition cursor-pointer active:scale-95 ${
+                              isSelected
+                                ? "bg-purple-600 text-white shadow-xs ring-2 ring-purple-400/40 font-black"
+                                : `${themeClasses.buttonBg} opacity-80 hover:opacity-100 hover:text-purple-600`
+                            }`}
+                          >
+                            {item.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {/* Pitch slider */}
+                    <div className="space-y-1 pt-1">
+                      <input
+                        type="range"
+                        min="0.5"
+                        max="1.5"
+                        step="0.05"
+                        value={prefs.ttsPitch || 1.0}
+                        onChange={(e) => {
+                          const newPitch = parseFloat(e.target.value);
+                          updatePrefs({ ttsPitch: newPitch });
+                          if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
+                            speakParagraphAtIndex(activeParagraphIndexRef.current);
+                          }
+                        }}
+                        className="w-full accent-purple-600 cursor-pointer"
+                      />
+                      <div className="flex justify-between text-[10px] opacity-50 font-mono px-0.5">
+                        <span>0.5x (Deep Bass)</span>
+                        <span className="font-bold text-purple-600 dark:text-purple-400">1.0x (Standard)</span>
+                        <span>1.5x (High Treble)</span>
                       </div>
                     </div>
                   </div>
@@ -1608,6 +2222,21 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                   </div>
                 </div>
               )}
+            </div>
+
+            {/* Settings Sheet Footer */}
+            <div className="shrink-0 px-4 py-2.5 border-t border-black/5 dark:border-white/5 bg-black/[0.02] dark:bg-white/[0.02] flex items-center justify-between gap-3">
+              <span className="text-[11px] opacity-60 font-sans">
+                Reader preferences save automatically
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowSettingsMenu(false)}
+                className="px-3.5 py-1.5 rounded-xl bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs transition cursor-pointer active:scale-95 shadow-xs flex items-center gap-1.5"
+              >
+                <Check className="h-3.5 w-3.5" />
+                <span>Return to Reading</span>
+              </button>
             </div>
           </div>
         )}
@@ -1948,15 +2577,25 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                 <span className="text-[10px] font-bold tracking-tight mt-0.5">Chapters</span>
               </button>
 
-              {/* 4. read_action_settings: Reading Settings (Gear Icon) */}
+              {/* 4. read_action_library: Bookmark / Library Toggle */}
               <button
                 type="button"
-                onClick={() => setShowSettingsMenu(!showSettingsMenu)}
-                className="flex flex-col items-center justify-center w-full h-full text-zinc-700 dark:text-zinc-200 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-black/5 dark:hover:bg-white/5 active:bg-black/10 dark:active:bg-white/10 transition-colors cursor-pointer select-none group"
-                title="Settings & Font Formatting"
+                onClick={handleToggleLibrary}
+                className={`flex flex-col items-center justify-center w-full h-full transition-colors cursor-pointer select-none group ${
+                  isInLibrary
+                    ? "text-purple-600 dark:text-purple-400 font-bold bg-purple-500/10"
+                    : "text-zinc-700 dark:text-zinc-200 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-black/5 dark:hover:bg-white/5 active:bg-black/10 dark:active:bg-white/10"
+                }`}
+                title={isInLibrary ? "Saved in Library (Click to remove)" : "Bookmark & Save to Library"}
               >
-                <Settings className="h-5 w-5 sm:h-6 sm:w-6 transition-transform group-active:scale-90" />
-                <span className="text-[10px] font-bold tracking-tight mt-0.5">Settings</span>
+                <Bookmark
+                  className={`h-5 w-5 sm:h-6 sm:w-6 transition-transform group-active:scale-90 ${
+                    isInLibrary ? "fill-current" : ""
+                  }`}
+                />
+                <span className="text-[10px] font-bold tracking-tight mt-0.5">
+                  {isInLibrary ? "In Library" : "Library"}
+                </span>
               </button>
             </div>
           )}

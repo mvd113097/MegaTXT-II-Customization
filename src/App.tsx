@@ -24,6 +24,7 @@ import {
   getSessionFromIdb,
   saveSessionToIdb,
   clearSessionFromIdb,
+  getLocalLibraryBooks,
 } from "./utils/indexedDbStorage";
 import {
   PagodaHeaderIllustration,
@@ -208,7 +209,7 @@ export default function App() {
   );
 
   // Modals & Navigation
-  const [activeNavTab, setActiveNavTab] = useState<"home" | "library" | "store" | "explore" | "history" | "settings">("home");
+  const [activeNavTab, setActiveNavTab] = useState<"home" | "library" | "store" | "explore" | "history">("home");
   const [storeSearchTrigger, setStoreSearchTrigger] = useState<{ query: string; timestamp: number } | null>(null);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [isGlossaryOpen, setIsGlossaryOpen] = useState(false);
@@ -240,6 +241,21 @@ export default function App() {
           return parsed.readerNovel;
         }
       }
+      // Fallback: check personal library for the last-read novel
+      const libraryBooks = getLocalLibraryBooks();
+      if (libraryBooks && libraryBooks.length > 0) {
+        const lastBook = libraryBooks[0];
+        return {
+          novelTitle: lastBook.title,
+          author: lastBook.author,
+          coverUrl: lastBook.coverUrl,
+          novelUrl: lastBook.novelUrl,
+          siteId: lastBook.siteId,
+          chapterIndex: lastBook.currentChapterIndex || 1,
+          totalChapters: lastBook.totalChapters || 1,
+          allChapters: lastBook.allChapters,
+        };
+      }
     } catch (e) {
       console.warn("Could not restore reader novel from localStorage:", e);
     }
@@ -259,18 +275,8 @@ export default function App() {
     return false;
   });
 
-  const [isReaderMinimized, setIsReaderMinimized] = useState<boolean>(() => {
-    try {
-      const saved = localStorage.getItem(READER_SESSION_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (typeof parsed?.isReaderMinimized === "boolean") {
-          return parsed.isReaderMinimized;
-        }
-      }
-    } catch {}
-    return false;
-  });
+  // Minimized reader is always visible when a novel has been loaded / read
+  const [isReaderMinimized, setIsReaderMinimized] = useState<boolean>(true);
 
   // Sync reader state to localStorage
   useEffect(() => {
@@ -281,17 +287,15 @@ export default function App() {
           JSON.stringify({
             readerNovel,
             isReaderOpen,
-            isReaderMinimized,
+            isReaderMinimized: true,
             timestamp: Date.now(),
           })
         );
-      } else {
-        localStorage.removeItem(READER_SESSION_KEY);
       }
     } catch (e) {
       console.warn("Could not save reader session to localStorage:", e);
     }
-  }, [readerNovel, isReaderOpen, isReaderMinimized]);
+  }, [readerNovel, isReaderOpen]);
 
   const handleOpenReader = (novel: ActiveReaderNovel) => {
     setReaderNovel(novel);
@@ -300,22 +304,9 @@ export default function App() {
   };
 
   const handleCloseReader = () => {
+    // When reader full-modal closes, keep the floating minimized bubble visible always
     setIsReaderOpen(false);
-    setIsReaderMinimized(false);
-    // When explicitly closed by user, update session so it won't auto-reopen on next reload
-    try {
-      if (readerNovel) {
-        localStorage.setItem(
-          READER_SESSION_KEY,
-          JSON.stringify({
-            readerNovel,
-            isReaderOpen: false,
-            isReaderMinimized: false,
-            timestamp: Date.now(),
-          })
-        );
-      }
-    } catch {}
+    setIsReaderMinimized(true);
   };
 
   const handleOpenCurrentSessionReader = () => {
@@ -335,12 +326,10 @@ export default function App() {
     });
   };
 
-  const handleBottomNavChange = (tab: "home" | "library" | "store" | "explore" | "history" | "settings") => {
+  const handleBottomNavChange = (tab: "home" | "library" | "store" | "explore" | "history") => {
     setActiveNavTab(tab);
     if (tab === "history") {
       setIsHistoryOpen(true);
-    } else if (tab === "settings") {
-      setIsTelegramSettingsOpen(true);
     }
   };
   const [toastData, setToastData] = useState<{
@@ -1474,6 +1463,7 @@ Export Timestamp: ${new Date().toLocaleString()}
         onReset={handleReset}
         onOpenGlossary={() => setIsGlossaryOpen(true)}
         onOpenTelegramSettings={() => setIsTelegramSettingsOpen(true)}
+        onOpenSettings={() => setIsTelegramSettingsOpen(true)}
         glossaryCount={glossary.length}
         theme={theme}
         onToggleTheme={toggleTheme}

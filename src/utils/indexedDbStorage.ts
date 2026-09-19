@@ -175,7 +175,9 @@ export interface ReaderPreferences {
   lineHeight: "compact" | "normal" | "relaxed";
   fontFamily: "serif" | "sans" | "mono";
   bilingualMode: "english" | "dual" | "chinese";
+  ttsEngine?: "google-classic" | "browser-native";
   ttsVoiceName?: string;
+  cloudVoiceLang?: string;
   ttsRate: number;
   ttsPitch: number;
   autoAdvanceTts: boolean;
@@ -187,6 +189,8 @@ const DEFAULT_READER_PREFERENCES: ReaderPreferences = {
   lineHeight: "normal",
   fontFamily: "serif",
   bilingualMode: "english",
+  ttsEngine: "browser-native",
+  cloudVoiceLang: "en",
   ttsRate: 1.0,
   ttsPitch: 1.0,
   autoAdvanceTts: true,
@@ -194,7 +198,15 @@ const DEFAULT_READER_PREFERENCES: ReaderPreferences = {
 
 export async function getReaderPreferences(): Promise<ReaderPreferences> {
   const prefs = await idbGet<ReaderPreferences>(STORES.READER_SETTINGS, "preferences");
-  return { ...DEFAULT_READER_PREFERENCES, ...(prefs || {}) };
+  const hasSpeechSynthesis = typeof window !== "undefined" && "speechSynthesis" in window && !!window.speechSynthesis;
+  const defaultEngine: "browser-native" | "google-classic" = hasSpeechSynthesis ? "browser-native" : "google-classic";
+  
+  const resolvedPrefs: ReaderPreferences = { ...DEFAULT_READER_PREFERENCES, ttsEngine: defaultEngine, ...(prefs || {}) };
+  // If user previously had browser-native saved but is now in a browser without SpeechSynthesis (e.g. Soul Browser), auto fallback to google-classic
+  if (!hasSpeechSynthesis && resolvedPrefs.ttsEngine === "browser-native") {
+    resolvedPrefs.ttsEngine = "google-classic";
+  }
+  return resolvedPrefs;
 }
 
 export async function saveReaderPreferences(prefs: Partial<ReaderPreferences>): Promise<void> {

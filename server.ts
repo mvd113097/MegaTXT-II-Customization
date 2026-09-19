@@ -2967,6 +2967,43 @@ app.post("/api/store/import-novel", requireAuthMiddleware, async (req, res) => {
   }
 });
 
+// Authentic Google Text-to-Speech Audio Stream Proxy (100% Classic Google US Female Voice)
+app.get("/api/tts/google-audio", async (req, res) => {
+  const text = (req.query.text as string) || "";
+  const lang = (req.query.lang as string) || "en";
+  if (!text.trim()) {
+    res.status(400).send("Text is required");
+    return;
+  }
+  try {
+    const cleanText = text.trim().slice(0, 200);
+    const googleTtsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&tl=${encodeURIComponent(
+      lang
+    )}&client=tw-ob&q=${encodeURIComponent(cleanText)}`;
+
+    const audioRes = await fetch(googleTtsUrl, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Referer: "https://translate.google.com/",
+      },
+    });
+
+    if (!audioRes.ok) {
+      res.status(audioRes.status).send("Failed to stream Google TTS audio.");
+      return;
+    }
+
+    const arrayBuffer = await audioRes.arrayBuffer();
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.send(Buffer.from(arrayBuffer));
+  } catch (err: any) {
+    console.error("Google TTS Audio Error:", err);
+    res.status(500).send(err.message || "Google TTS stream error");
+  }
+});
+
 // Cache for prepared downloads to support sandboxed iframe downloads
 interface StoredDownload {
   filename: string;
