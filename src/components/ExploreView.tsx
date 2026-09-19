@@ -93,6 +93,15 @@ interface ExploreViewProps {
   onImportNovel: (title: string, rawText: string) => void;
   getAuthHeaders: () => Record<string, string>;
   onSearchStore?: (keyword: string) => void;
+  onOpenReader?: (novel: {
+    novelTitle: string;
+    author?: string;
+    coverUrl?: string;
+    novelUrl?: string;
+    siteId?: string;
+    chapterIndex?: number;
+    totalChapters?: number;
+  }) => void;
 }
 
 const SITE_OPTIONS = [
@@ -303,6 +312,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   onImportNovel,
   getAuthHeaders,
   onSearchStore,
+  onOpenReader,
 }) => {
   // Initialize state from module cache if available
   const [selectedSite, setSelectedSite] = useState<string>(
@@ -1495,14 +1505,28 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                           <Bookmark className={`h-3.5 w-3.5 ${bookmarked ? "fill-rose-500 text-rose-500" : ""}`} />
                         </button>
 
-                        {/* Quick Peek Chapter 1 */}
+                        {/* Read Novel Button */}
                         <button
                           type="button"
-                          onClick={() => handleOpenPeek(item)}
-                          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-purple-200 dark:border-purple-800 bg-purple-50/50 dark:bg-slate-800 text-xs font-semibold text-purple-700 dark:text-purple-300 hover:bg-purple-100 transition cursor-pointer"
+                          onClick={() => {
+                            if (onOpenReader) {
+                              onOpenReader({
+                                novelTitle: item.title,
+                                author: item.author,
+                                coverUrl: item.coverUrl,
+                                novelUrl: item.novelUrl,
+                                siteId: item.siteId,
+                                chapterIndex: 1,
+                                totalChapters: item.chapterCount || 0,
+                              });
+                            } else {
+                              handleOpenPeek(item);
+                            }
+                          }}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-purple-200 dark:border-purple-800 bg-purple-50/70 dark:bg-purple-950/40 text-xs font-bold text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-900/60 shadow-2xs transition cursor-pointer"
                         >
-                          <Eye className="h-3 w-3" />
-                          <span>Peek Ch 1</span>
+                          <BookOpen className="h-3.5 w-3.5" />
+                          <span>Read</span>
                         </button>
 
                         {/* Download / Import ALL */}
@@ -1743,14 +1767,28 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                     </div>
 
                     <div className="flex items-center gap-1.5">
-                      {/* Peek Ch 1 Button */}
+                      {/* Read Novel Button */}
                       <button
                         type="button"
-                        onClick={() => handleOpenPeek(item)}
-                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-purple-200 dark:border-purple-800 bg-purple-50/60 dark:bg-slate-800 text-[11px] sm:text-xs font-semibold text-purple-700 dark:text-purple-300 hover:bg-purple-100 transition cursor-pointer"
+                        onClick={() => {
+                          if (onOpenReader) {
+                            onOpenReader({
+                              novelTitle: item.title,
+                              author: item.author,
+                              coverUrl: item.coverUrl,
+                              novelUrl: item.novelUrl,
+                              siteId: item.siteId,
+                              chapterIndex: 1,
+                              totalChapters: item.chapterCount || 0,
+                            });
+                          } else {
+                            handleOpenPeek(item);
+                          }
+                        }}
+                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-purple-200 dark:border-purple-800 bg-purple-50/70 dark:bg-purple-950/40 text-[11px] sm:text-xs font-bold text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-900/60 shadow-2xs transition cursor-pointer"
                       >
-                        <Eye className="h-3 w-3 sm:h-3.5 sm:w-3.5" />
-                        <span>Peek Ch 1</span>
+                        <BookOpen className="h-3.5 w-3.5" />
+                        <span>Read</span>
                       </button>
 
                       {/* Select Mirrors / TOC */}
@@ -1823,7 +1861,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
 
       {/* Slide-Over Drawer: Quick Chapter Peek & Reader */}
       {peekState.isOpen && (
-        <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/60 backdrop-blur-xs animate-in fade-in">
+        <div className="fixed inset-0 z-[60] flex justify-end bg-slate-900/60 backdrop-blur-xs animate-in fade-in">
           <div className="w-full max-w-xl bg-white dark:bg-slate-900 h-full shadow-2xl flex flex-col border-l border-purple-200 dark:border-purple-900/50 animate-in slide-in-from-right duration-200">
             {/* Header */}
             <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-start justify-between gap-3 bg-purple-50/50 dark:bg-purple-950/30">
@@ -1920,7 +1958,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
             </div>
 
             {/* Footer with Next Chapter & One-Click Import ALL */}
-            <div className="p-3.5 border-t border-slate-100 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/80 flex flex-wrap items-center justify-between gap-2.5">
+            <div className="p-3.5 pb-20 sm:pb-3.5 border-t border-slate-100 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/80 flex flex-wrap items-center justify-between gap-2.5">
               <div className="flex items-center gap-2">
                 <button
                   type="button"

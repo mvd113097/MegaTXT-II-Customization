@@ -78,6 +78,16 @@ interface StoreViewProps {
   onImportNovel: (title: string, rawText: string) => void;
   getAuthHeaders: () => Record<string, string>;
   externalSearchTrigger?: { query: string; timestamp: number } | null;
+  onOpenReader?: (novel: {
+    novelTitle: string;
+    author?: string;
+    coverUrl?: string;
+    novelUrl?: string;
+    siteId?: string;
+    chapterIndex?: number;
+    totalChapters?: number;
+    allChapters?: Array<{ title: string; url: string; index?: number }>;
+  }) => void;
 }
 
 const SUPPORTED_SITES = [
@@ -152,6 +162,7 @@ export const StoreView: React.FC<StoreViewProps> = ({
   onImportNovel,
   getAuthHeaders,
   externalSearchTrigger,
+  onOpenReader,
 }) => {
   const savedState = getSavedStoreState();
 
@@ -914,6 +925,27 @@ export const StoreView: React.FC<StoreViewProps> = ({
                     <ExternalLink className="h-3 w-3" />
                   </a>
 
+                  {onOpenReader && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onOpenReader({
+                          novelTitle: novel.title,
+                          author: novel.author,
+                          coverUrl: novel.coverUrl,
+                          novelUrl: novel.novelUrl,
+                          siteId: novel.siteId,
+                          chapterIndex: 1,
+                          totalChapters: novel.chapterCount || 0,
+                        })
+                      }
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-purple-200 dark:border-purple-800 bg-purple-50/70 dark:bg-purple-950/40 text-xs font-bold text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-900/60 px-3 py-1.5 transition cursor-pointer shadow-2xs"
+                    >
+                      <BookOpen className="h-3.5 w-3.5" />
+                      <span>Read</span>
+                    </button>
+                  )}
+
                   <button
                     type="button"
                     onClick={() => handleSelectNovel(novel)}
@@ -1018,6 +1050,32 @@ export const StoreView: React.FC<StoreViewProps> = ({
 
                 {/* Import Action Buttons */}
                 <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+                  {onOpenReader && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onOpenReader({
+                          novelTitle: selectedNovel.title,
+                          author: selectedNovel.author,
+                          coverUrl: selectedNovel.coverUrl,
+                          novelUrl: selectedNovel.novelUrl,
+                          siteId: selectedNovel.siteId,
+                          chapterIndex: startChapter,
+                          totalChapters: selectedNovel.chapters.length,
+                          allChapters: selectedNovel.chapters.map((c, i) => ({
+                            title: c.title,
+                            url: c.url,
+                            index: i + 1,
+                          })),
+                        });
+                        setSelectedNovel(null);
+                      }}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-purple-200 dark:border-purple-800 bg-purple-50/80 dark:bg-purple-950/50 px-4 py-2 text-xs font-bold text-purple-700 dark:text-purple-300 hover:bg-purple-100 transition cursor-pointer"
+                    >
+                      <BookOpen className="h-4 w-4" />
+                      <span>Read in Reader Mode</span>
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => setSelectedNovel(null)}

@@ -18,6 +18,12 @@ import { ActiveTranslationView } from "./components/ActiveTranslationView";
 import { TranslationCompleteView } from "./components/TranslationCompleteView";
 import { StoreView } from "./components/StoreView";
 import { ExploreView } from "./components/ExploreView";
+import { NovelReaderModal } from "./components/NovelReaderModal";
+import {
+  getSessionFromIdb,
+  saveSessionToIdb,
+  clearSessionFromIdb,
+} from "./utils/indexedDbStorage";
 import {
   PagodaHeaderIllustration,
   SakuraFooterDecoration,
@@ -208,6 +214,47 @@ export default function App() {
   const [isExportOpen, setIsExportOpen] = useState(false);
   const [isTelegramSettingsOpen, setIsTelegramSettingsOpen] = useState(false);
 
+  // Reader & TTS State
+  interface ActiveReaderNovel {
+    novelTitle: string;
+    author?: string;
+    coverUrl?: string;
+    novelUrl?: string;
+    siteId?: string;
+    chapterIndex?: number;
+    totalChapters?: number;
+    allChapters?: Array<{ title: string; url: string; index?: number }>;
+    content?: string;
+    englishContent?: string;
+  }
+
+  const [readerNovel, setReaderNovel] = useState<ActiveReaderNovel | null>(null);
+  const [isReaderOpen, setIsReaderOpen] = useState(false);
+  const [isReaderMinimized, setIsReaderMinimized] = useState(false);
+
+  const handleOpenReader = (novel: ActiveReaderNovel) => {
+    setReaderNovel(novel);
+    setIsReaderOpen(true);
+    setIsReaderMinimized(false);
+  };
+
+  const handleOpenCurrentSessionReader = () => {
+    if (!session) return;
+    const cleanTitle = session.fileName.replace(/\.txt$/i, "");
+    handleOpenReader({
+      novelTitle: cleanTitle,
+      totalChapters: session.chunks.length,
+      chapterIndex: 1,
+      allChapters: session.chunks.map((c, idx) => ({
+        title: c.chapterTitle || `Chapter ${idx + 1}`,
+        url: "",
+        index: idx + 1,
+      })),
+      content: session.chunks[0]?.chineseText || "",
+      englishContent: session.chunks[0]?.englishText || "",
+    });
+  };
+
   const handleBottomNavChange = (tab: "home" | "store" | "explore" | "history" | "settings") => {
     setActiveNavTab(tab);
     if (tab === "history") {
@@ -241,14 +288,34 @@ export default function App() {
     }
   }, [session?.chunks]);
 
-  // Persist session changes to localStorage
+  // Load session from IndexedDB on startup (handles novels of any size, bypassing 5MB localStorage cap)
+  useEffect(() => {
+    getSessionFromIdb()
+      .then((saved) => {
+        if (saved) {
+          setSession((current) => {
+            const savedTime = saved.lastUpdated || saved.createdAt || 0;
+            const currentTime = current.lastUpdated || current.createdAt || 0;
+            if (!current || savedTime > currentTime) {
+              return saved;
+            }
+            return current;
+          });
+        }
+      })
+      .catch((err) => console.warn("IndexedDB session load skipped:", err));
+  }, []);
+
+  // Persist session changes to IndexedDB (unlimited quota) with localStorage backup
   useEffect(() => {
     if (session) {
+      saveSessionToIdb(session).catch((err) =>
+        console.warn("Failed to persist session to IndexedDB:", err)
+      );
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
       } catch (err) {
-        // LocalStorage may exceed quota for gigantic files (e.g. >5MB), handle gracefully
-        console.warn("LocalStorage storage quota exceeded or disabled", err);
+        // Expected when novel exceeds 5MB localStorage limit, handled safely by IndexedDB
       }
     }
   }, [session]);
@@ -634,6 +701,7 @@ export default function App() {
     setServerCloudJob(null);
     chunksRef.current = [];
     localStorage.removeItem(STORAGE_KEY);
+    clearSessionFromIdb().catch(() => {});
 
     try {
       await fetch("/api/cloud-job/delete", {
@@ -1332,7 +1400,7 @@ Export Timestamp: ${new Date().toLocaleString()}
       />
 
       {/* Main Screen Canvas */}
-      <main className={`flex-1 w-full mx-auto px-3 sm:px-4 pt-3 pb-24 relative z-10 ${
+      <main className={`flex-1 w-full mx-auto px-3 sm:px-4 pt-3 pb-24 relative ${
         activeNavTab === "store" || activeNavTab === "explore" ? "max-w-4xl" : "max-w-md"
       }`}>
         {/* Store Tab View */}
@@ -1344,6 +1412,7 @@ Export Timestamp: ${new Date().toLocaleString()}
             }}
             getAuthHeaders={getAuthHeaders}
             externalSearchTrigger={storeSearchTrigger}
+            onOpenReader={handleOpenReader}
           />
         </div>
 
@@ -1359,6 +1428,7 @@ Export Timestamp: ${new Date().toLocaleString()}
               setStoreSearchTrigger({ query: keyword, timestamp: Date.now() });
               setActiveNavTab("store");
             }}
+            onOpenReader={handleOpenReader}
           />
         </div>
 
@@ -1384,6 +1454,7 @@ Export Timestamp: ${new Date().toLocaleString()}
               onReset={handleReset}
               onSyncProgress={() => syncCloudProgress(false, true)}
               isSyncing={isSyncingProgress}
+              onOpenReader={handleOpenCurrentSessionReader}
             />
           ) : (
             /* Screen 2: Active Translation Screen (Reference Screen 2) */
@@ -1434,6 +1505,7 @@ Export Timestamp: ${new Date().toLocaleString()}
               lastDownloadedWords={lastDownloadedWordCount}
               onSyncProgress={() => syncCloudProgress(false, true)}
               isSyncing={isSyncingProgress}
+              onOpenReader={handleOpenCurrentSessionReader}
             />
           )}
         </div>
@@ -1537,6 +1609,43 @@ Export Timestamp: ${new Date().toLocaleString()}
             </div>
           )}
         </div>
+      )}
+      {/* Novel Reader Modal & Minimized Background Player */}
+      {readerNovel && (
+        <NovelReaderModal
+          isOpen={isReaderOpen}
+          isMinimized={isReaderMinimized}
+          onClose={() => {
+            setIsReaderOpen(false);
+            setIsReaderMinimized(false);
+          }}
+          onToggleMinimize={() => setIsReaderMinimized((prev) => !prev)}
+          novelTitle={readerNovel.novelTitle}
+          author={readerNovel.author}
+          coverUrl={readerNovel.coverUrl}
+          novelUrl={readerNovel.novelUrl}
+          siteId={readerNovel.siteId}
+          initialChapterIndex={readerNovel.chapterIndex || 1}
+          totalChapters={readerNovel.totalChapters || 1}
+          allChapters={readerNovel.allChapters}
+          initialContent={readerNovel.content}
+          initialEnglishContent={readerNovel.englishContent}
+          getAuthHeaders={getAuthHeaders}
+          sessionChunks={
+            session &&
+            session.fileName.replace(/\.txt$/i, "").trim().toLowerCase() ===
+              readerNovel.novelTitle.trim().toLowerCase()
+              ? session.chunks
+              : undefined
+          }
+          onImportNovel={() => {
+            if (readerNovel.novelTitle) {
+              setStoreSearchTrigger({ query: readerNovel.novelTitle, timestamp: Date.now() });
+              setActiveNavTab("store");
+              setIsReaderOpen(false);
+            }
+          }}
+        />
       )}
     </div>
   );

@@ -60,12 +60,11 @@ function getGeminiClient(): GoogleGenAI {
 // High reliability free-tier translation engine with multi-project quota pooling,
 // exponential backoff, and content-filter resilience.
 // Supported modern models per Google GenAI SDK guidelines:
-// gemini-3.1-flash-lite delivers ~3s high throughput and rock-solid availability.
+// gemini-3.8-flash and gemini-3.1-flash-lite deliver high throughput, fast translation, and excellent output quality.
 const FREE_TIER_MODELS = [
-  "gemini-3.1-flash-lite",
-  "gemini-flash-latest",
   "gemini-3.8-flash",
-  "gemini-3.1-pro-preview"
+  "gemini-3.1-flash-lite",
+  "gemini-flash-latest"
 ];
 
 // In-memory tracking of model availability and quota cooldowns
@@ -1932,7 +1931,7 @@ app.get("/api/health", (req, res) => {
     projectsSummary: summary,
     projects: projectsStatus,
     models: available,
-    primaryModel: available[0] || "gemini-3.5-flash",
+    primaryModel: available[0] || "gemini-3.8-flash",
     hasActiveCloudJob: !!getJobForSession(req),
     cloudJobStatus: getJobForSession(req)?.status || "idle",
   });
@@ -2802,6 +2801,37 @@ app.post("/api/store/fetch-chapter", requireAuthMiddleware, async (req, res) => 
   } catch (err: any) {
     console.error("Fetch chapter error:", err);
     res.status(500).json({ error: err.message || "Failed to fetch chapter text." });
+  }
+});
+
+// On-demand instant translation for a single chapter directly in Reader mode
+app.post("/api/store/translate-single-chapter", requireAuthMiddleware, async (req, res) => {
+  try {
+    const { content, chapterTitle, novelTitle } = req.body;
+    if (!content || !content.trim()) {
+      res.status(400).json({ error: "Missing 'content' parameter to translate." });
+      return;
+    }
+
+    const systemPrompt =
+      "You are an elite literary Chinese-to-English web novel translator. Translate faithfully into fluent, captivating English prose without conversational commentary. Preserve names, titles, and dialogue nuance naturally.";
+    const userPrompt = `Translate the following chapter into natural, immersive English:\n\nNovel: ${
+      novelTitle || "Web Novel"
+    }\nChapter: ${chapterTitle || "Chapter"}\n\nOriginal Text:\n"""\n${content.slice(
+      0,
+      15000
+    )}\n"""\n\nEnglish Translation:`;
+
+    const result = await generateWithQuotaScheduler(userPrompt, systemPrompt, 0, 5, 2000);
+    res.json({
+      success: true,
+      chapterTitle: chapterTitle || "Chapter",
+      englishContent: result.text.trim(),
+      modelUsed: result.modelUsed,
+    });
+  } catch (err: any) {
+    console.error("Translate single chapter error:", err);
+    res.status(500).json({ error: err.message || "Failed to translate chapter." });
   }
 });
 

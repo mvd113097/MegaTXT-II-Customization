@@ -1,0 +1,203 @@
+/**
+ * High-performance, quota-free IndexedDB storage for MegaText translator.
+ * Solves the ~5MB browser LocalStorage limit for massive 1,000,000+ character novels,
+ * caches reader chapters offline for maximum data saving, and stores settings.
+ */
+
+const DB_NAME = "megatext_idb_v1";
+const DB_VERSION = 1;
+
+const STORES = {
+  SESSIONS: "sessions",
+  CACHED_CHAPTERS: "cached_chapters",
+  READER_SETTINGS: "reader_settings",
+  GLOSSARY: "glossary_cache",
+};
+
+function openDatabase(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof window === "undefined" || !window.indexedDB) {
+      reject(new Error("IndexedDB is not supported in this environment."));
+      return;
+    }
+
+    const request = window.indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+
+      if (!db.objectStoreNames.contains(STORES.SESSIONS)) {
+        db.createObjectStore(STORES.SESSIONS);
+      }
+      if (!db.objectStoreNames.contains(STORES.CACHED_CHAPTERS)) {
+        // key format: `${novelId}__ch_${chapterIndex}`
+        db.createObjectStore(STORES.CACHED_CHAPTERS);
+      }
+      if (!db.objectStoreNames.contains(STORES.READER_SETTINGS)) {
+        db.createObjectStore(STORES.READER_SETTINGS);
+      }
+      if (!db.objectStoreNames.contains(STORES.GLOSSARY)) {
+        db.createObjectStore(STORES.GLOSSARY);
+      }
+    };
+
+    request.onsuccess = (event) => {
+      resolve((event.target as IDBOpenDBRequest).result);
+    };
+
+    request.onerror = (event) => {
+      reject((event.target as IDBOpenDBRequest).error);
+    };
+  });
+}
+
+/**
+ * Get an item from a specific IndexedDB store
+ */
+export async function idbGet<T>(storeName: string, key: string): Promise<T | null> {
+  try {
+    const db = await openDatabase();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, "readonly");
+      const store = tx.objectStore(storeName);
+      const req = store.get(key);
+
+      req.onsuccess = () => {
+        resolve((req.result as T) ?? null);
+      };
+      req.onerror = () => {
+        reject(req.error);
+      };
+    });
+  } catch (err) {
+    console.warn(`[IndexedDB] Failed to get ${key} from ${storeName}:`, err);
+    return null;
+  }
+}
+
+/**
+ * Save an item to a specific IndexedDB store
+ */
+export async function idbSet<T>(storeName: string, key: string, value: T): Promise<void> {
+  try {
+    const db = await openDatabase();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, "readwrite");
+      const store = tx.objectStore(storeName);
+      const req = store.put(value, key);
+
+      req.onsuccess = () => {
+        resolve();
+      };
+      req.onerror = () => {
+        reject(req.error);
+      };
+    });
+  } catch (err) {
+    console.warn(`[IndexedDB] Failed to set ${key} in ${storeName}:`, err);
+  }
+}
+
+/**
+ * Delete an item from a specific IndexedDB store
+ */
+export async function idbDelete(storeName: string, key: string): Promise<void> {
+  try {
+    const db = await openDatabase();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, "readwrite");
+      const store = tx.objectStore(storeName);
+      const req = store.delete(key);
+
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  } catch (err) {
+    console.warn(`[IndexedDB] Failed to delete ${key} from ${storeName}:`, err);
+  }
+}
+
+// ----------------------------------------------------
+// Specialized Session Storage Helpers
+// ----------------------------------------------------
+
+const ACTIVE_SESSION_KEY = "current_active_session";
+
+export async function saveSessionToIdb(session: any): Promise<void> {
+  await idbSet(STORES.SESSIONS, ACTIVE_SESSION_KEY, session);
+}
+
+export async function getSessionFromIdb(): Promise<any | null> {
+  return await idbGet(STORES.SESSIONS, ACTIVE_SESSION_KEY);
+}
+
+export async function clearSessionFromIdb(): Promise<void> {
+  await idbDelete(STORES.SESSIONS, ACTIVE_SESSION_KEY);
+}
+
+// ----------------------------------------------------
+// Specialized Chapter Offline Cache (Data Saver)
+// ----------------------------------------------------
+
+export interface CachedChapterData {
+  chapterIndex: number;
+  chapterTitle: string;
+  chineseContent: string;
+  englishContent?: string;
+  totalChapters?: number;
+  timestamp: number;
+}
+
+export async function getCachedChapter(novelId: string, chapterIndex: number): Promise<CachedChapterData | null> {
+  const key = `${novelId}__ch_${chapterIndex}`;
+  return await idbGet<CachedChapterData>(STORES.CACHED_CHAPTERS, key);
+}
+
+export async function setCachedChapter(
+  novelId: string,
+  chapterIndex: number,
+  data: Omit<CachedChapterData, "timestamp">
+): Promise<void> {
+  const key = `${novelId}__ch_${chapterIndex}`;
+  await idbSet<CachedChapterData>(STORES.CACHED_CHAPTERS, key, {
+    ...data,
+    timestamp: Date.now(),
+  });
+}
+
+// ----------------------------------------------------
+// Reader Settings Persistence
+// ----------------------------------------------------
+
+export interface ReaderPreferences {
+  theme: "sepia" | "oled" | "cream" | "slate" | "light";
+  fontSize: number;
+  lineHeight: "compact" | "normal" | "relaxed";
+  fontFamily: "serif" | "sans" | "mono";
+  bilingualMode: "english" | "dual" | "chinese";
+  ttsVoiceName?: string;
+  ttsRate: number;
+  ttsPitch: number;
+  autoAdvanceTts: boolean;
+}
+
+const DEFAULT_READER_PREFERENCES: ReaderPreferences = {
+  theme: "sepia",
+  fontSize: 17,
+  lineHeight: "normal",
+  fontFamily: "serif",
+  bilingualMode: "english",
+  ttsRate: 1.0,
+  ttsPitch: 1.0,
+  autoAdvanceTts: true,
+};
+
+export async function getReaderPreferences(): Promise<ReaderPreferences> {
+  const prefs = await idbGet<ReaderPreferences>(STORES.READER_SETTINGS, "preferences");
+  return { ...DEFAULT_READER_PREFERENCES, ...(prefs || {}) };
+}
+
+export async function saveReaderPreferences(prefs: Partial<ReaderPreferences>): Promise<void> {
+  const current = await getReaderPreferences();
+  await idbSet(STORES.READER_SETTINGS, "preferences", { ...current, ...prefs });
+}

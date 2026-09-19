@@ -30,6 +30,7 @@ import {
   TranslationMode,
   TextChunk,
 } from "../types";
+import { checkTranslationQuality } from "../utils/qualityGuard";
 
 interface ActiveTranslationViewProps {
   session: TranslationSession;
@@ -58,6 +59,7 @@ interface ActiveTranslationViewProps {
   lastDownloadedWords: number;
   onSyncProgress?: () => void;
   isSyncing?: boolean;
+  onOpenReader?: () => void;
 }
 
 function formatDuration(seconds: number): string {
@@ -99,6 +101,7 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
   lastDownloadedWords,
   onSyncProgress,
   isSyncing = false,
+  onOpenReader,
 }) => {
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | "completed" | "processing" | "pending">("all");
@@ -163,7 +166,20 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
             </div>
           </div>
 
-          <div className="shrink-0">
+          <div className="shrink-0 flex items-center gap-2">
+            {onOpenReader && (
+              <button
+                type="button"
+                onClick={onOpenReader}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold shadow-xs hover:shadow-purple-500/25 transition cursor-pointer"
+                title="Open novel chapters in Reader Mode with QuickNovel TTS"
+              >
+                <BookOpen className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">Read Novel (TTS)</span>
+                <span className="sm:hidden">Read</span>
+              </button>
+            )}
+
             {isRunning ? (
               <span className="inline-flex items-center gap-1.5 rounded-full bg-sky-50 dark:bg-sky-950/80 px-3 py-1 text-xs font-bold text-sky-700 dark:text-sky-300 border border-sky-200 dark:border-sky-800 shadow-2xs">
                 <span className="h-2 w-2 rounded-full bg-sky-500 animate-pulse" />
@@ -284,8 +300,10 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
                     ? `~${formatDuration(metrics.estimatedRemainingSeconds)}`
                     : "Calculating..."}
                 </div>
-                <div className="text-[10px] text-slate-500 dark:text-slate-400 font-medium leading-tight">
-                  remaining
+                <div className="text-[10px] text-slate-500 dark:text-slate-400 font-medium leading-tight truncate">
+                  {metrics.charsPerSecond > 0
+                    ? `~${Math.round(metrics.charsPerSecond * 60).toLocaleString()} c/min · remaining`
+                    : "remaining"}
                 </div>
               </div>
             </div>
@@ -501,6 +519,7 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
             const isDone = chunk.status === "completed";
             const isActive = chunk.status === "processing";
             const isError = chunk.status === "error";
+            const quality = isDone ? checkTranslationQuality(chunk.chineseText, chunk.englishText) : null;
 
             return (
               <div
@@ -508,13 +527,19 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
                 className={`flex items-center justify-between py-2 px-2 rounded-xl transition ${
                   isActive
                     ? "bg-purple-50/90 dark:bg-purple-950/40 border border-purple-200/80 dark:border-purple-800/60 shadow-2xs"
+                    : quality?.isFlagged
+                    ? "bg-amber-50/70 dark:bg-amber-950/30 border border-amber-200/60 dark:border-amber-800/40"
                     : "hover:bg-purple-50/40 dark:hover:bg-slate-800/40"
                 }`}
               >
                 <div className="flex items-center gap-2.5 min-w-0 flex-1 pr-2">
                   {isDone ? (
-                    <span className="flex h-4 w-4 items-center justify-center rounded-full bg-emerald-500 text-white shrink-0 text-[10px] font-bold">
-                      ✓
+                    <span
+                      className={`flex h-4 w-4 items-center justify-center rounded-full text-white shrink-0 text-[10px] font-bold ${
+                        quality?.isFlagged ? "bg-amber-500" : "bg-emerald-500"
+                      }`}
+                    >
+                      {quality?.isFlagged ? "!" : "✓"}
                     </span>
                   ) : isActive ? (
                     <span className="flex h-4 w-4 items-center justify-center rounded-full bg-purple-600 text-white shrink-0 text-[10px] font-bold animate-pulse">
@@ -545,12 +570,25 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
                           Translating
                         </span>
                       )}
+                      {quality?.isFlagged && (
+                        <span
+                          className="rounded-md bg-amber-200/80 dark:bg-amber-900/80 px-1.5 py-0.2 text-[9px] font-bold text-amber-900 dark:text-amber-200 uppercase tracking-wider"
+                          title={quality.reason}
+                        >
+                          Short / Summary
+                        </span>
+                      )}
                     </div>
                     <div className="text-[10px] text-slate-400 flex items-center gap-2">
                       <span>{chunk.charCount.toLocaleString()} chars</span>
                       {(chunk.wordCount || (chunk.englishText ? chunk.englishText.trim().split(/\s+/).filter(Boolean).length : 0)) > 0 ? (
                         <span>· {(chunk.wordCount || chunk.englishText!.trim().split(/\s+/).filter(Boolean).length).toLocaleString()} words</span>
                       ) : null}
+                      {quality?.isFlagged && (
+                        <span className="text-amber-600 dark:text-amber-400 font-semibold">
+                          · Ratio {quality.ratio}x
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -558,7 +596,9 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
                 <div className="flex items-center gap-2 shrink-0">
                   <span
                     className={`text-[11px] font-semibold ${
-                      isDone
+                      quality?.isFlagged
+                        ? "text-amber-600 dark:text-amber-400 font-bold"
+                        : isDone
                         ? "text-emerald-600 dark:text-emerald-400"
                         : isActive
                         ? "text-purple-600 dark:text-purple-400 font-bold"
@@ -567,16 +607,21 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
                         : "text-slate-400"
                     }`}
                   >
-                    {isDone ? "completed" : isActive ? "translating..." : isError ? "error" : "queued"}
+                    {quality?.isFlagged ? "flagged" : isDone ? "completed" : isActive ? "translating..." : isError ? "error" : "queued"}
                   </span>
 
-                  {!isDone && !isRunning && (
+                  {(!isDone || quality?.isFlagged) && !isRunning && (
                     <button
                       type="button"
                       onClick={() => onTranslateChunk(chunk.id)}
-                      className="rounded-lg border border-purple-200 dark:border-purple-800 px-2 py-0.5 text-[10px] font-bold text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-900/50 cursor-pointer"
+                      className={`rounded-lg border px-2 py-0.5 text-[10px] font-bold transition cursor-pointer ${
+                        quality?.isFlagged
+                          ? "border-amber-300 dark:border-amber-700 bg-amber-100/60 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200 hover:bg-amber-200/80"
+                          : "border-purple-200 dark:border-purple-800 text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-900/50"
+                      }`}
+                      title={quality?.isFlagged ? "Re-translate to prevent summary" : "Translate chunk"}
                     >
-                      Translate
+                      {quality?.isFlagged ? "Re-do" : "Translate"}
                     </button>
                   )}
                 </div>
