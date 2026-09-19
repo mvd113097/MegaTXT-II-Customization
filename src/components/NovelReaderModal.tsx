@@ -1068,7 +1068,30 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
       }
 
       const rawText = paragraphs[index] || "";
-      const text = rawText.trim();
+      let text = rawText.trim();
+
+      // OPTIMIZATION: Read directly from what is visually rendered on screen.
+      // This allows instant TTS support for browser-translated pages (Chrome, Edge, Safari, Soul Browser, etc.)
+      const renderedEl = document.getElementById(`reader-paragraph-${index}`);
+      if (renderedEl) {
+        let domText = "";
+        if (prefs.bilingualMode === "dual") {
+          const pElements = renderedEl.getElementsByTagName("p");
+          if (pElements.length > 0) {
+            domText = pElements[0].innerText || pElements[0].textContent || "";
+          }
+        } else {
+          const clone = renderedEl.cloneNode(true) as HTMLElement;
+          const selectNoneEls = clone.querySelectorAll(".select-none");
+          selectNoneEls.forEach((el) => el.remove());
+          domText = clone.innerText || clone.textContent || "";
+        }
+        domText = domText.trim();
+        if (domText && domText.length > 0) {
+          text = domText;
+        }
+      }
+
       if (!text) {
         // Skip empty whitespace paragraphs
         speakParagraphAtIndex(index + 1);
@@ -2412,10 +2435,16 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                             isHighlighted ? themeClasses.activeParagraph : "bg-black/5 dark:bg-white/5"
                           } space-y-1.5 mb-2.5`}
                         >
-                          {engPara ? (
-                            <p className="font-sans font-medium" style={{ fontSize: `${prefs.fontSize}px` }}>{engPara}</p>
-                          ) : null}
-                          <p className="opacity-75 font-serif" style={{ fontSize: `${Math.max(8, prefs.fontSize - 1)}px` }}>{para}</p>
+                          {/* Always render paragraphs to prevent DOM structure mismatch crashes with Google Translate */}
+                          <p 
+                            className={`font-sans font-medium ${engPara ? "block" : "hidden"}`} 
+                            style={{ fontSize: `${prefs.fontSize}px` }}
+                          >
+                            <span>{engPara}</span>
+                          </p>
+                          <p className="opacity-75 font-serif" style={{ fontSize: `${Math.max(8, prefs.fontSize - 1)}px` }}>
+                            <span>{para}</span>
+                          </p>
                         </div>
                       );
                     })
@@ -2423,6 +2452,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                     // English or Chinese Paragraphs with QuickNovel Paragraph Highlighting!
                     displayParagraphs.map((para, pIdx) => {
                       const isHighlighted = pIdx === activeParagraphIndex;
+                      const showVolumeIcon = isHighlighted && isTtsPlaying;
                       return (
                         <p
                           key={pIdx}
@@ -2435,12 +2465,15 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                               : "hover:bg-black/5 dark:hover:bg-white/5 opacity-90"
                           }`}
                         >
-                          {isHighlighted && isTtsPlaying && (
-                            <span className="inline-flex items-center gap-1 text-[11px] font-bold text-purple-600 dark:text-purple-400 mr-2 select-none align-middle">
-                              <Volume2 className="h-3.5 w-3.5 inline animate-pulse" />
-                            </span>
-                          )}
-                          {para}
+                          {/* Stable, non-conditional DOM sibling structure to completely avoid insertBefore/removeChild crash under Google Translate */}
+                          <span 
+                            className={`select-none align-middle mr-2 ${
+                              showVolumeIcon ? "inline-flex items-center gap-1 text-[11px] font-bold text-purple-600 dark:text-purple-400" : "hidden"
+                            }`}
+                          >
+                            <Volume2 className="h-3.5 w-3.5 inline animate-pulse" />
+                          </span>
+                          <span className="select-text">{para}</span>
                         </p>
                       );
                     })

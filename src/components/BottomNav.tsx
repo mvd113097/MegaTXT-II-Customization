@@ -17,36 +17,6 @@ export const BottomNav: React.FC<BottomNavProps> = ({
       aria-label="Mobile Navigation"
     >
       <div className="mx-auto flex h-14 max-w-lg items-center justify-around px-1.5 sm:px-2">
-        {/* Library Tab (Leftmost - Personal Bookshelf & Progress) */}
-        <button
-          id="nav-tab-library"
-          type="button"
-          onClick={() => onChangeTab("library")}
-          className={`flex flex-col items-center justify-center gap-1 py-1 px-2 rounded-xl transition cursor-pointer ${
-            activeTab === "library"
-              ? "text-purple-600 dark:text-purple-400 font-bold"
-              : "text-slate-400 dark:text-slate-500 hover:text-purple-500"
-          }`}
-        >
-          <Library className="h-5 w-5 stroke-[2.2]" />
-          <span className="text-[10.5px] leading-none">Library</span>
-        </button>
-
-        {/* History Tab (Next to Library) */}
-        <button
-          id="nav-tab-history"
-          type="button"
-          onClick={() => onChangeTab("history")}
-          className={`flex flex-col items-center justify-center gap-1 py-1 px-2 rounded-xl transition cursor-pointer ${
-            activeTab === "history"
-              ? "text-purple-600 dark:text-purple-400 font-bold"
-              : "text-slate-400 dark:text-slate-500 hover:text-purple-500"
-          }`}
-        >
-          <Clock className="h-5 w-5 stroke-[2.2]" />
-          <span className="text-[10.5px] leading-none">History</span>
-        </button>
-
         {/* Home Tab */}
         <button
           id="nav-tab-home"
@@ -62,7 +32,7 @@ export const BottomNav: React.FC<BottomNavProps> = ({
           <span className="text-[10.5px] leading-none">Home</span>
         </button>
 
-        {/* Store Tab (Quick Search) */}
+        {/* Store Tab */}
         <button
           id="nav-tab-store"
           type="button"
@@ -77,7 +47,7 @@ export const BottomNav: React.FC<BottomNavProps> = ({
           <span className="text-[10.5px] leading-none">Store</span>
         </button>
 
-        {/* Explore Tab (Rankings, Years, Tropes, Summaries) */}
+        {/* Explore Tab */}
         <button
           id="nav-tab-explore"
           type="button"
@@ -90,6 +60,36 @@ export const BottomNav: React.FC<BottomNavProps> = ({
         >
           <Compass className="h-5 w-5 stroke-[2.2]" />
           <span className="text-[10.5px] leading-none">Explore</span>
+        </button>
+
+        {/* History Tab */}
+        <button
+          id="nav-tab-history"
+          type="button"
+          onClick={() => onChangeTab("history")}
+          className={`flex flex-col items-center justify-center gap-1 py-1 px-2 rounded-xl transition cursor-pointer ${
+            activeTab === "history"
+              ? "text-purple-600 dark:text-purple-400 font-bold"
+              : "text-slate-400 dark:text-slate-500 hover:text-purple-500"
+          }`}
+        >
+          <Clock className="h-5 w-5 stroke-[2.2]" />
+          <span className="text-[10.5px] leading-none">History</span>
+        </button>
+
+        {/* Library Tab */}
+        <button
+          id="nav-tab-library"
+          type="button"
+          onClick={() => onChangeTab("library")}
+          className={`flex flex-col items-center justify-center gap-1 py-1 px-2 rounded-xl transition cursor-pointer ${
+            activeTab === "library"
+              ? "text-purple-600 dark:text-purple-400 font-bold"
+              : "text-slate-400 dark:text-slate-500 hover:text-purple-500"
+          }`}
+        >
+          <Library className="h-5 w-5 stroke-[2.2]" />
+          <span className="text-[10.5px] leading-none">Library</span>
         </button>
       </div>
 
