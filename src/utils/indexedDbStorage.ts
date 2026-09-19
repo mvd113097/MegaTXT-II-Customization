@@ -201,3 +201,59 @@ export async function saveReaderPreferences(prefs: Partial<ReaderPreferences>): 
   const current = await getReaderPreferences();
   await idbSet(STORES.READER_SETTINGS, "preferences", { ...current, ...prefs });
 }
+
+// ----------------------------------------------------
+// User Library Persistence (with instant localStorage sync)
+// ----------------------------------------------------
+
+const LIBRARY_STORAGE_KEY = "megatext_user_library_v1";
+
+export function getLocalLibraryBooks(): any[] {
+  try {
+    const raw = localStorage.getItem(LIBRARY_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveLocalLibraryBooks(books: any[]): void {
+  try {
+    localStorage.setItem(LIBRARY_STORAGE_KEY, JSON.stringify(books));
+  } catch (err) {
+    console.warn("Failed to persist library books to localStorage:", err);
+  }
+}
+
+export function addOrUpdateBookInLibrary(book: any): any[] {
+  const list = getLocalLibraryBooks();
+  const novelId = book.id || `${book.siteId || "src"}_${book.title}`;
+  const existingIdx = list.findIndex((b) => b.id === novelId || (b.title === book.title && b.author === book.author));
+  
+  const updatedBook = {
+    ...book,
+    id: novelId,
+    lastReadAt: Date.now(),
+    addedAt: existingIdx >= 0 ? list[existingIdx].addedAt : Date.now(),
+    currentChapterIndex: book.currentChapterIndex || (existingIdx >= 0 ? list[existingIdx].currentChapterIndex : 1),
+    totalChapters: book.totalChapters || (existingIdx >= 0 ? list[existingIdx].totalChapters : 1),
+  };
+
+  let nextList: any[];
+  if (existingIdx >= 0) {
+    nextList = [...list];
+    nextList[existingIdx] = { ...list[existingIdx], ...updatedBook };
+  } else {
+    nextList = [updatedBook, ...list];
+  }
+
+  saveLocalLibraryBooks(nextList);
+  return nextList;
+}
+
+export function removeBookFromLibrary(bookId: string): any[] {
+  const list = getLocalLibraryBooks();
+  const nextList = list.filter((b) => b.id !== bookId);
+  saveLocalLibraryBooks(nextList);
+  return nextList;
+}

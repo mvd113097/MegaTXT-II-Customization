@@ -78,3 +78,25 @@ export interface AuthStatus {
   authorizedEmail?: string;
   hasPasscodeConfigured: boolean;
 }
+
+export interface LibraryBook {
+  id: string;
+  title: string;
+  author?: string;
+  coverUrl?: string;
+  novelUrl?: string;
+  siteId?: string;
+  siteName?: string;
+  summary?: string;
+  currentChapterIndex: number;
+  totalChapters: number;
+  lastReadChapterTitle?: string;
+  lastReadAt: number;
+  addedAt: number;
+  allChapters?: Array<{ title: string; url: string; index?: number }>;
+  tags?: string[];
+  status?: string;
+  rating?: number;
+  points?: number;
+  likes?: number;
+}

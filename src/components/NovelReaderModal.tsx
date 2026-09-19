@@ -30,6 +30,8 @@ import {
   Square,
   Settings,
   HelpCircle,
+  Bookmark,
+  BookmarkCheck,
 } from "lucide-react";
 import {
   getCachedChapter,
@@ -37,6 +39,9 @@ import {
   getReaderPreferences,
   saveReaderPreferences,
   ReaderPreferences,
+  getLocalLibraryBooks,
+  addOrUpdateBookInLibrary,
+  removeBookFromLibrary,
 } from "../utils/indexedDbStorage";
 import { TextChunk } from "../types";
 
@@ -58,6 +63,11 @@ export interface NovelReaderModalProps {
   getAuthHeaders: () => Record<string, string>;
   sessionChunks?: TextChunk[];
   onImportNovel?: () => void;
+  onUpdateChapterIndex?: (
+    chapterIndex: number,
+    chapterTitle: string,
+    allChapters?: Array<{ title: string; url: string; index?: number }>
+  ) => void;
 }
 
 export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
@@ -78,6 +88,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
   getAuthHeaders,
   sessionChunks,
   onImportNovel,
+  onUpdateChapterIndex,
 }) => {
   // Current Chapter State
   const [currentChapterIndex, setCurrentChapterIndex] = useState<number>(initialChapterIndex);
@@ -118,19 +129,71 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
   const [sleepTimerMinutes, setSleepTimerMinutes] = useState<number | "end-of-chapter" | null>(null);
   const [sleepTimerRemainingSec, setSleepTimerRemainingSec] = useState<number | null>(null);
 
+  // Library / Bookmark State
+  const [isInLibrary, setIsInLibrary] = useState<boolean>(() => {
+    const books = getLocalLibraryBooks();
+    return books.some((b) => b.id === novelId || (b.title === novelTitle && (b.author === author || !author)));
+  });
+
+  const handleToggleLibrary = () => {
+    if (isInLibrary) {
+      removeBookFromLibrary(novelId);
+      setIsInLibrary(false);
+    } else {
+      addOrUpdateBookInLibrary({
+        id: novelId,
+        title: novelTitle,
+        author,
+        coverUrl,
+        novelUrl,
+        siteId,
+        currentChapterIndex,
+        totalChapters: chapterList.length > 0 ? chapterList.length : totalChapters,
+        lastReadChapterTitle: chapterTitle,
+        allChapters: chapterList,
+      });
+      setIsInLibrary(true);
+    }
+  };
+
   // QuickNovel TTS State (Paragraph-level highlighting & zero-delay playback)
   const [isTtsPlaying, setIsTtsPlaying] = useState(false);
   const [isTtsPaused, setIsTtsPaused] = useState(false);
   const [activeParagraphIndex, setActiveParagraphIndex] = useState<number>(-1);
   const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [selectedVoice, setSelectedVoice] = useState<SpeechSynthesisVoice | null>(null);
+  const [ttsFeedbackMessage, setTtsFeedbackMessage] = useState<string | null>(null);
 
-  // Refs for zero-delay instant execution
+  // Refs for zero-delay instant execution & state synchronization
   const activeParagraphIndexRef = useRef<number>(-1);
   const ttsParagraphsRef = useRef<string[]>([]);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const readerBodyRef = useRef<HTMLDivElement | null>(null);
   const sleepTimerIdRef = useRef<any>(null);
+  const pendingTtsStartRef = useRef(false);
+
+  // Draggable Floating Button Position State
+  // Default: bottom: 92px (comfortably above bottom navigation bar's 64px), right: 16px
+  const [bubblePos, setBubblePos] = useState<{ bottom: number; right?: number; left?: number; side: "right" | "left" }>(() => {
+    try {
+      const saved = localStorage.getItem("megatext_reader_bubble_pos");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (typeof parsed?.bottom === "number") {
+          return {
+            bottom: Math.max(84, parsed.bottom),
+            side: parsed.side || "right",
+            ...(parsed.side === "left" ? { left: 16 } : { right: 16 }),
+          };
+        }
+      }
+    } catch {}
+    return { bottom: 92, right: 16, side: "right" };
+  });
+
+  const isDraggingBubbleRef = useRef(false);
+  const bubbleDragStartRef = useRef<{ clientX: number; clientY: number; startBottom: number }>({ clientX: 0, clientY: 0, startBottom: 92 });
+  const bubbleHasMovedRef = useRef(false);
 
   // Load preferences from IndexedDB on mount
   useEffect(() => {
@@ -158,18 +221,20 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
     }
   }, [initialChapterIndex, allChapters]);
 
-  // Voice Initialization: Prioritize Standard Google US Female Voice
+  // Voice Initialization: Prioritize Standard Google US Female Voice (English Only)
   useEffect(() => {
     if (typeof window === "undefined" || !window.speechSynthesis) return;
 
     const findGoogleUsFemaleVoice = (voices: SpeechSynthesisVoice[]) => {
       if (!voices || voices.length === 0) return null;
 
-      // 1. Strict Google US English (Standard US Female in Chrome/Android)
+      // 1. Strict Google US English Female (Standard Google TTS voice in Chrome/Android)
       const googleUs = voices.find(
         (v) =>
           v.name.toLowerCase().includes("google") &&
-          (v.lang.toLowerCase() === "en-us" || v.lang.toLowerCase() === "en_us")
+          (v.lang.toLowerCase().replace("_", "-") === "en-us" ||
+            v.name.toLowerCase().includes("us english") ||
+            v.name.toLowerCase().includes("us female"))
       );
       if (googleUs) return googleUs;
 
@@ -179,21 +244,23 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
       );
       if (googleAnyEn) return googleAnyEn;
 
-      // 3. Known natural US female voices (Samantha, Zira, Victoria, Female)
+      // 3. Known natural high-quality US female voices (Jenny, Aria, Samantha, Victoria, Zira)
       const usFemale = voices.find(
         (v) =>
-          (v.lang.toLowerCase() === "en-us" || v.lang.toLowerCase() === "en_us") &&
-          (v.name.toLowerCase().includes("female") ||
+          (v.lang.toLowerCase().replace("_", "-") === "en-us") &&
+          (v.name.toLowerCase().includes("jenny") ||
+            v.name.toLowerCase().includes("aria") ||
             v.name.toLowerCase().includes("samantha") ||
-            v.name.toLowerCase().includes("zira") ||
+            v.name.toLowerCase().includes("victoria") ||
             v.name.toLowerCase().includes("natural") ||
-            v.name.toLowerCase().includes("jenny"))
+            v.name.toLowerCase().includes("female") ||
+            v.name.toLowerCase().includes("zira"))
       );
       if (usFemale) return usFemale;
 
       // 4. Any en-US voice
       const anyUs = voices.find(
-        (v) => v.lang.toLowerCase() === "en-us" || v.lang.toLowerCase() === "en_us"
+        (v) => v.lang.toLowerCase().replace("_", "-") === "en-us"
       );
       if (anyUs) return anyUs;
 
@@ -203,11 +270,55 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
     };
 
     const loadVoices = () => {
-      const voices = window.speechSynthesis.getVoices();
-      if (!voices || voices.length === 0) return;
-      setAvailableVoices(voices);
-      const matched = findGoogleUsFemaleVoice(voices);
-      if (matched) setSelectedVoice(matched);
+      const allVoices = window.speechSynthesis.getVoices();
+      if (!allVoices || allVoices.length === 0) return;
+
+      // Filter to English-only voices as requested by user ("i dont need other language voices")
+      const englishVoices = allVoices.filter(
+        (v) => v.lang && v.lang.toLowerCase().startsWith("en")
+      );
+      const filteredVoices = englishVoices.length > 0 ? englishVoices : allVoices;
+
+      // Sort with Google US English / Google English at top, followed by natural US female
+      filteredVoices.sort((a, b) => {
+        const aIsGoogleUs =
+          a.name.toLowerCase().includes("google") &&
+          (a.lang.toLowerCase().includes("us") || a.name.toLowerCase().includes("us english"));
+        const bIsGoogleUs =
+          b.name.toLowerCase().includes("google") &&
+          (b.lang.toLowerCase().includes("us") || b.name.toLowerCase().includes("us english"));
+        if (aIsGoogleUs && !bIsGoogleUs) return -1;
+        if (!aIsGoogleUs && bIsGoogleUs) return 1;
+
+        const aIsGoogle = a.name.toLowerCase().includes("google");
+        const bIsGoogle = b.name.toLowerCase().includes("google");
+        if (aIsGoogle && !bIsGoogle) return -1;
+        if (!aIsGoogle && bIsGoogle) return 1;
+
+        const aIsUs =
+          a.lang.toLowerCase().includes("us") || a.lang.toLowerCase().replace("_", "-") === "en-us";
+        const bIsUs =
+          b.lang.toLowerCase().includes("us") || b.lang.toLowerCase().replace("_", "-") === "en-us";
+        if (aIsUs && !bIsUs) return -1;
+        if (!aIsUs && bIsUs) return 1;
+
+        return a.name.localeCompare(b.name);
+      });
+
+      setAvailableVoices(filteredVoices);
+
+      // Restore saved preference if exists and valid, otherwise auto-select standard Google US Female
+      getReaderPreferences().then((saved) => {
+        if (saved?.ttsVoiceName) {
+          const matchedSaved = filteredVoices.find((v) => v.name === saved.ttsVoiceName);
+          if (matchedSaved) {
+            setSelectedVoice(matchedSaved);
+            return;
+          }
+        }
+        const matched = findGoogleUsFemaleVoice(filteredVoices);
+        if (matched) setSelectedVoice(matched);
+      });
     };
 
     loadVoices();
@@ -316,6 +427,11 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           setEnglishContent(sessionChunk.englishText || "");
           setIsLoadingChapter(false);
           setIsDataSavedFromCache(true);
+          onUpdateChapterIndex?.(targetIndex, sessionChunk.chapterTitle || `Chapter ${targetIndex}`);
+          if (pendingTtsStartRef.current) {
+            pendingTtsStartRef.current = false;
+            setTimeout(() => speakParagraphAtIndex(0), 250);
+          }
           return;
         }
       }
@@ -330,6 +446,11 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           setEnglishContent(cached.englishContent || "");
           setIsLoadingChapter(false);
           setIsDataSavedFromCache(true);
+          onUpdateChapterIndex?.(targetIndex, cached.chapterTitle || `Chapter ${targetIndex}`);
+          if (pendingTtsStartRef.current) {
+            pendingTtsStartRef.current = false;
+            setTimeout(() => speakParagraphAtIndex(0), 250);
+          }
           return;
         }
       } catch (e) {
@@ -388,6 +509,8 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           setChapterList(data.allChapters);
         }
 
+        onUpdateChapterIndex?.(targetIndex, fetchedTitle, data.allChapters);
+
         // Save to IndexedDB cache
         await setCachedChapter(novelId, targetIndex, {
           chapterIndex: targetIndex,
@@ -396,6 +519,31 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           englishContent: data.englishContent || "",
           totalChapters: data.totalChapters || totalChapters,
         });
+
+        // If in user library, auto-update last read chapter
+        try {
+          const libraryBooks = getLocalLibraryBooks();
+          const exists = libraryBooks.some((b) => b.id === novelId || (b.title === novelTitle && (b.author === author || !author)));
+          if (exists) {
+            addOrUpdateBookInLibrary({
+              id: novelId,
+              title: novelTitle,
+              author,
+              coverUrl,
+              novelUrl,
+              siteId,
+              currentChapterIndex: targetIndex,
+              totalChapters: data.totalChapters || totalChapters || chapterList.length || 1,
+              lastReadChapterTitle: fetchedTitle,
+              allChapters: data.allChapters || chapterList,
+            });
+          }
+        } catch {}
+
+        if (pendingTtsStartRef.current) {
+          pendingTtsStartRef.current = false;
+          setTimeout(() => speakParagraphAtIndex(0), 250);
+        }
       } catch (err: any) {
         setChapterError(err.message || "Failed to load chapter text.");
       } finally {
@@ -405,8 +553,39 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
         }
       }
     },
-    [novelId, chapterList, novelUrl, siteId, novelTitle, author, getAuthHeaders, sessionChunks, totalChapters]
+    [novelId, chapterList, novelUrl, siteId, novelTitle, author, getAuthHeaders, sessionChunks, totalChapters, onUpdateChapterIndex]
   );
+
+  // Novel Identity Synchronization: When switching from Novel 1 to Novel 2, cleanly reset and load novel 2
+  const prevNovelKeyRef = useRef<string>(`${siteId}_${novelTitle}_${novelUrl || ""}`);
+  useEffect(() => {
+    const currentKey = `${siteId}_${novelTitle}_${novelUrl || ""}`;
+    if (prevNovelKeyRef.current !== currentKey) {
+      prevNovelKeyRef.current = currentKey;
+
+      if (typeof window !== "undefined" && window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+      }
+      setIsTtsPlaying(false);
+      setIsTtsPaused(false);
+      setActiveParagraphIndex(-1);
+      activeParagraphIndexRef.current = -1;
+      pendingTtsStartRef.current = false;
+
+      const targetIndex = initialChapterIndex || 1;
+      setCurrentChapterIndex(targetIndex);
+      setChapterTitle(`Chapter ${targetIndex}`);
+      setChineseContent(initialContent || "");
+      setEnglishContent(initialEnglishContent || "");
+      setChapterList(allChapters && allChapters.length > 0 ? allChapters : []);
+      setChapterError(null);
+      setIsDataSavedFromCache(false);
+
+      if (!initialContent) {
+        loadChapter(targetIndex);
+      }
+    }
+  }, [siteId, novelTitle, novelUrl, initialChapterIndex, initialContent, initialEnglishContent, allChapters, loadChapter]);
 
   // Load initial chapter if needed
   useEffect(() => {
@@ -476,14 +655,32 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
     setIsTtsPaused(false);
     setActiveParagraphIndex(-1);
     activeParagraphIndexRef.current = -1;
+    pendingTtsStartRef.current = false;
   }, []);
 
   const speakParagraphAtIndex = useCallback(
     (index: number) => {
-      if (typeof window === "undefined" || !window.speechSynthesis) return;
+      if (typeof window === "undefined" || !window.speechSynthesis) {
+        setTtsFeedbackMessage("Text-to-speech is not supported in this browser.");
+        setTimeout(() => setTtsFeedbackMessage(null), 3000);
+        return;
+      }
 
       const paragraphs = ttsParagraphsRef.current;
-      if (!paragraphs || index < 0 || index >= paragraphs.length) {
+      if (!paragraphs || paragraphs.length === 0) {
+        if (isLoadingChapter) {
+          pendingTtsStartRef.current = true;
+          setTtsFeedbackMessage("Chapter is loading... TTS will begin in a moment.");
+          setTimeout(() => setTtsFeedbackMessage(null), 3000);
+          return;
+        }
+        setTtsFeedbackMessage("No text found in chapter to speak.");
+        setTimeout(() => setTtsFeedbackMessage(null), 3000);
+        stopTts();
+        return;
+      }
+
+      if (index < 0 || index >= paragraphs.length) {
         // Reached end of current chapter
         if (sleepTimerMinutes === "end-of-chapter") {
           stopTts();
@@ -495,16 +692,20 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           const nextIndex = currentChapterIndex + 1;
           const maxChapters = chapterList.length || totalChapters;
           if (nextIndex <= maxChapters) {
-            loadChapter(nextIndex).then(() => {
-              // Auto-start next chapter with slight natural pause
-              setTimeout(() => {
-                speakParagraphAtIndex(0);
-              }, 500);
-            });
+            pendingTtsStartRef.current = true;
+            loadChapter(nextIndex);
             return;
           }
         }
         stopTts();
+        return;
+      }
+
+      const rawText = paragraphs[index] || "";
+      const text = rawText.trim();
+      if (!text) {
+        // Skip empty whitespace paragraphs instantly
+        speakParagraphAtIndex(index + 1);
         return;
       }
 
@@ -522,21 +723,52 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
         }
       });
 
-      // 3. Immediately cancel previous speech & create utterance
-      window.speechSynthesis.cancel();
+      // 3. Language & Voice Matching
+      const isChinese = /[\u4e00-\u9fa5]/.test(text);
 
-      const text = paragraphs[index];
-      const utterance = new SpeechSynthesisUtterance(text);
-      utteranceRef.current = utterance;
-
-      if (selectedVoice) {
-        utterance.voice = selectedVoice;
+      let currentVoices = availableVoices;
+      if (!currentVoices || currentVoices.length === 0) {
+        try {
+          const fresh = window.speechSynthesis.getVoices();
+          if (fresh && fresh.length > 0) {
+            currentVoices = fresh;
+            setAvailableVoices(fresh);
+          }
+        } catch {}
       }
-      utterance.rate = prefs.ttsRate;
-      utterance.pitch = prefs.ttsPitch;
+
+      let voiceToUse: SpeechSynthesisVoice | null = null;
+      if (isChinese) {
+        if (selectedVoice && selectedVoice.lang && selectedVoice.lang.toLowerCase().startsWith("zh")) {
+          voiceToUse = selectedVoice;
+        } else if (currentVoices && currentVoices.length > 0) {
+          voiceToUse =
+            currentVoices.find((v) => v.lang && (v.lang.toLowerCase() === "zh-cn" || v.lang.toLowerCase() === "zh_cn")) ||
+            currentVoices.find((v) => v.lang && v.lang.toLowerCase().startsWith("zh")) ||
+            currentVoices.find((v) => v.name.toLowerCase().includes("chinese") || v.name.includes("普通话") || v.name.includes("中文")) ||
+            null;
+        }
+      } else {
+        if (selectedVoice && selectedVoice.lang && selectedVoice.lang.toLowerCase().startsWith("en")) {
+          voiceToUse = selectedVoice;
+        } else if (currentVoices && currentVoices.length > 0) {
+          voiceToUse =
+            currentVoices.find((v) => v.lang && (v.lang.toLowerCase() === "en-us" || v.lang.toLowerCase() === "en_us")) ||
+            currentVoices.find((v) => v.lang && v.lang.toLowerCase().startsWith("en")) ||
+            null;
+        }
+      }
+
+      // 4. Create Utterance with explicit language
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = isChinese ? "zh-CN" : "en-US";
+      if (voiceToUse) {
+        utterance.voice = voiceToUse;
+      }
+      utterance.rate = prefs.ttsRate || 1.0;
+      utterance.pitch = prefs.ttsPitch || 1.0;
 
       utterance.onend = () => {
-        // Automatically speak next paragraph with zero gap
         const nextIdx = index + 1;
         speakParagraphAtIndex(nextIdx);
       };
@@ -544,13 +776,43 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
       utterance.onerror = (e) => {
         if (e.error !== "interrupted" && e.error !== "canceled") {
           console.warn("TTS Error:", e);
+          if (utterance.voice && e.error !== "not-allowed") {
+            setTimeout(() => {
+              const fallback = new SpeechSynthesisUtterance(text);
+              fallback.lang = isChinese ? "zh-CN" : "en-US";
+              fallback.rate = prefs.ttsRate || 1.0;
+              fallback.pitch = prefs.ttsPitch || 1.0;
+              fallback.onend = () => speakParagraphAtIndex(index + 1);
+              utteranceRef.current = fallback;
+              (window as any).__megatextActiveUtterance = fallback;
+              window.speechSynthesis.speak(fallback);
+            }, 30);
+          }
         }
       };
 
-      window.speechSynthesis.speak(utterance);
+      // 5. Safely cancel preceding audio and prevent Android Chrome race condition
+      if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+        window.speechSynthesis.cancel();
+      }
+      if (window.speechSynthesis.paused) {
+        window.speechSynthesis.resume();
+      }
+
+      utteranceRef.current = utterance;
+      (window as any).__megatextActiveUtterance = utterance;
+
+      setTimeout(() => {
+        try {
+          window.speechSynthesis.speak(utterance);
+        } catch (err) {
+          console.warn("Speech synthesis speak error:", err);
+        }
+      }, 20);
     },
     [
       selectedVoice,
+      availableVoices,
       prefs.ttsRate,
       prefs.ttsPitch,
       prefs.autoAdvanceTts,
@@ -560,6 +822,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
       sleepTimerMinutes,
       loadChapter,
       stopTts,
+      isLoadingChapter,
     ]
   );
 
@@ -715,50 +978,122 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
   if (!isOpen) return null;
 
   // -------------------------------------------------------------
-  // Floating Open Book Icon Bubble (When Minimized)
-  // Replaces wide player with a floating book bubble at the bottom right
+  // Floating Reader Pill (When Minimized)
+  // Draggable, sits safely above bottom navigation (default bottom: 92px)
   // -------------------------------------------------------------
   if (isMinimized) {
+    const isDockedLeft = bubblePos.side === "left";
     return (
-      <div className="fixed bottom-6 right-6 z-[100] flex items-center justify-center select-none animate-in zoom-in-75 duration-200">
+      <div
+        style={{
+          bottom: `${bubblePos.bottom}px`,
+          ...(isDockedLeft ? { left: "16px" } : { right: "16px" }),
+        }}
+        className="fixed z-40 select-none animate-in zoom-in-75 duration-200"
+      >
         {/* Subtle pulsing wave when audio is actively speaking */}
         {isTtsPlaying && !isTtsPaused && (
-          <span className="absolute -inset-2 rounded-full bg-purple-500/30 animate-ping pointer-events-none" />
+          <span className="absolute -inset-1.5 rounded-full bg-purple-500/25 animate-ping pointer-events-none" />
         )}
 
-        {/* Floating Open Book Icon Bubble */}
-        <button
-          type="button"
-          onClick={onToggleMinimize}
-          title={`Reader Minimized (${novelTitle} · Ch ${currentChapterIndex}) - Click to restore`}
-          className="group relative w-14 h-14 sm:w-16 sm:h-16 rounded-full bg-gradient-to-tr from-purple-700 via-purple-600 to-indigo-600 text-white shadow-2xl flex items-center justify-center cursor-pointer transition-all duration-200 hover:scale-110 active:scale-95 border-2 border-white/25 hover:shadow-purple-500/50"
-        >
-          <BookOpen className="h-7 w-7 text-white transition-transform group-hover:scale-105" />
+        <div className="relative flex items-center bg-slate-900/95 backdrop-blur-md text-white rounded-full p-1.5 shadow-2xl border border-purple-500/30 ring-1 ring-white/10 hover:border-purple-400/60 transition-colors">
+          {/* Main draggable button to restore reader */}
+          <button
+            type="button"
+            onPointerDown={(e) => {
+              isDraggingBubbleRef.current = true;
+              bubbleHasMovedRef.current = false;
+              bubbleDragStartRef.current = {
+                clientX: e.clientX,
+                clientY: e.clientY,
+                startBottom: bubblePos.bottom,
+              };
+              try {
+                (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+              } catch {}
+            }}
+            onPointerMove={(e) => {
+              if (!isDraggingBubbleRef.current) return;
+              const dy = bubbleDragStartRef.current.clientY - e.clientY;
+              const dx = Math.abs(e.clientX - bubbleDragStartRef.current.clientX);
+              if (Math.abs(dy) > 5 || dx > 5) {
+                bubbleHasMovedRef.current = true;
+              }
+              const newBottom = Math.max(84, Math.min(window.innerHeight - 80, bubbleDragStartRef.current.startBottom + dy));
+              const newSide: "right" | "left" = e.clientX < window.innerWidth / 2 ? "left" : "right";
+              setBubblePos({
+                bottom: newBottom,
+                side: newSide,
+                ...(newSide === "left" ? { left: 16 } : { right: 16 }),
+              });
+            }}
+            onPointerUp={(e) => {
+              if (!isDraggingBubbleRef.current) return;
+              isDraggingBubbleRef.current = false;
+              try {
+                (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+              } catch {}
+              if (bubbleHasMovedRef.current) {
+                try {
+                  localStorage.setItem("megatext_reader_bubble_pos", JSON.stringify(bubblePos));
+                } catch {}
+              } else {
+                onToggleMinimize();
+              }
+            }}
+            title={`Reader Minimized (${novelTitle} · Ch ${currentChapterIndex}) - Tap to open or drag to move`}
+            className="flex items-center gap-2 pl-2 pr-3 py-1 cursor-grab active:cursor-grabbing group touch-none"
+          >
+            <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-purple-600 via-indigo-600 to-purple-500 text-white flex items-center justify-center shrink-0 shadow-inner group-hover:scale-105 transition-transform">
+              {isTtsPlaying && !isTtsPaused ? (
+                <Volume2 className="h-5 w-5 text-white animate-pulse" />
+              ) : (
+                <BookOpen className="h-5 w-5 text-white" />
+              )}
+            </div>
 
-          {/* Active TTS playback soundwave badge */}
-          {isTtsPlaying && !isTtsPaused && (
-            <span className="absolute -top-1 -right-1 flex h-4 w-4">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-4 w-4 bg-emerald-500 border-2 border-slate-900 items-center justify-center">
-                <Volume2 className="h-2 w-2 text-white" />
+            <div className="flex flex-col text-left max-w-[140px] sm:max-w-[180px]">
+              <span className="text-[11px] font-bold text-zinc-100 truncate leading-tight">
+                {novelTitle}
               </span>
-            </span>
-          )}
-        </button>
+              <span className="text-[10px] font-medium text-purple-300 leading-tight">
+                Ch {currentChapterIndex}
+                {isTtsPlaying && !isTtsPaused ? " · Speaking..." : isTtsPaused ? " · Paused" : ""}
+              </span>
+            </div>
+          </button>
 
-        {/* Small Close dismiss button */}
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            stopTts();
-            onClose();
-          }}
-          title="Close Reader"
-          className="absolute -top-1.5 -left-1.5 w-6 h-6 rounded-full bg-slate-900/90 text-slate-300 hover:text-white hover:bg-rose-600 border border-white/20 flex items-center justify-center cursor-pointer shadow-md transition-all active:scale-90"
-        >
-          <X className="h-3.5 w-3.5" />
-        </button>
+          {/* Quick Play / Pause Toggle right on the floating widget */}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              togglePlayPauseTts();
+            }}
+            title={isTtsPlaying && !isTtsPaused ? "Pause TTS" : "Play TTS"}
+            className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center cursor-pointer transition-colors active:scale-95 shrink-0 ml-1"
+          >
+            {isTtsPlaying && !isTtsPaused ? (
+              <Pause className="h-4 w-4 fill-current" />
+            ) : (
+              <Play className="h-4 w-4 fill-current ml-0.5" />
+            )}
+          </button>
+
+          {/* Close Reader Dismiss Button */}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              stopTts();
+              onClose();
+            }}
+            title="Close Reader"
+            className="w-7 h-7 rounded-full bg-slate-800 text-slate-400 hover:text-white hover:bg-rose-600 flex items-center justify-center cursor-pointer transition-colors active:scale-90 shrink-0 ml-1"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
       </div>
     );
   }
@@ -812,6 +1147,20 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
 
           {/* Right Action Controls (Clean, uncluttered, with all settings under the gear icon) */}
           <div className="flex items-center gap-1 sm:gap-2 shrink-0">
+            {/* Library / Bookmark Toggle */}
+            <button
+              type="button"
+              onClick={handleToggleLibrary}
+              title={isInLibrary ? "Saved in Library (Click to remove)" : "Bookmark & Save to Library"}
+              className={`p-2 sm:p-2.5 rounded-xl transition cursor-pointer flex items-center justify-center active:scale-95 ${
+                isInLibrary
+                  ? "bg-purple-600 text-white shadow-xs"
+                  : `${themeClasses.buttonBg} hover:text-purple-600`
+              }`}
+            >
+              <Bookmark className={`h-5 w-5 ${isInLibrary ? "fill-current" : ""}`} />
+            </button>
+
             {/* Chapters Table of Contents */}
             <button
               type="button"
@@ -992,89 +1341,158 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                 </div>
               )}
 
-              {/* Tab 2: Voice Settings (Includes explicit 1.3x Speed option and Sleep Timer) */}
+              {/* Tab 2: Voice Settings (Standard Google US Voice Priority & Fine-grained Speed Options) */}
               {settingsTab === "voice" && (
                 <div className="space-y-4">
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div className="space-y-1.5">
-                      <span className="font-bold block opacity-75">Voice Actor</span>
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold block opacity-75">Voice Actor (English)</span>
+                        <span className="text-[10px] text-purple-600 dark:text-purple-400 font-semibold">
+                          Google US Standard
+                        </span>
+                      </div>
                       <select
                         value={selectedVoice?.name || ""}
                         onChange={(e) => {
                           const v = availableVoices.find((x) => x.name === e.target.value);
-                          if (v) setSelectedVoice(v);
+                          if (v) {
+                            setSelectedVoice(v);
+                            updatePrefs({ ttsVoiceName: v.name });
+                            if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
+                              speakParagraphAtIndex(activeParagraphIndexRef.current);
+                            }
+                          }
                         }}
-                        className={`w-full rounded-lg ${themeClasses.buttonBg} px-2 py-1.5 font-semibold focus:outline-none truncate`}
+                        className={`w-full rounded-lg ${themeClasses.buttonBg} px-2.5 py-2 font-semibold text-xs focus:outline-none truncate`}
                       >
-                        {availableVoices.map((v, i) => (
-                          <option key={i} value={v.name}>
-                            {v.name} ({v.lang})
-                          </option>
-                        ))}
+                        {availableVoices.map((v, i) => {
+                          const nameLower = v.name.toLowerCase();
+                          const isGoogle = nameLower.includes("google");
+                          const isUs = v.lang.toLowerCase().includes("us") || nameLower.includes("us");
+                          let tag = "";
+                          if (isGoogle && isUs) tag = " ★ (Google US Standard)";
+                          else if (isGoogle) tag = " (Google)";
+                          else if (nameLower.includes("natural") || nameLower.includes("jenny") || nameLower.includes("aria") || nameLower.includes("samantha")) tag = " (Natural)";
+                          
+                          return (
+                            <option key={i} value={v.name}>
+                              {v.name} [{v.lang}]{tag}
+                            </option>
+                          );
+                        })}
                       </select>
+                      <p className="text-[10.5px] opacity-60">
+                        Defaulted to the clean Google Text-to-Speech US English voice. Other foreign language voices have been filtered out.
+                      </p>
                     </div>
 
                     <div className="space-y-1.5">
                       <span className="font-bold block opacity-75">Auto-advance Next Chapter</span>
-                      <label className="flex items-center gap-2 cursor-pointer mt-2">
+                      <label className="flex items-center gap-2 cursor-pointer mt-2 p-2 rounded-lg bg-black/5 dark:bg-white/5">
                         <input
                           type="checkbox"
                           checked={prefs.autoAdvanceTts}
                           onChange={(e) => updatePrefs({ autoAdvanceTts: e.target.checked })}
                           className="rounded text-purple-600 focus:ring-0 cursor-pointer h-4 w-4"
                         />
-                        <span className="font-semibold text-xs">Seamlessly read next chapter when finished</span>
+                        <span className="font-semibold text-xs leading-tight">
+                          Seamlessly read next chapter when finished
+                        </span>
                       </label>
                     </div>
                   </div>
 
-                  {/* TTS Speech Rate (with explicit 1.3x option) */}
-                  <div className="space-y-2 pt-1 border-t border-black/5 dark:border-white/5">
+                  {/* TTS Speech Rate (Granular Speed Options: 1.3x, 1.35x, 1.4x, 1.45x, 1.5x, etc.) */}
+                  <div className="space-y-2.5 pt-2 border-t border-black/5 dark:border-white/5">
                     <div className="flex items-center justify-between">
-                      <span className="font-bold block opacity-75">TTS Speed</span>
-                      <span className="text-purple-600 dark:text-purple-400 font-bold text-xs">
-                        Active Rate: {prefs.ttsRate}x
-                      </span>
-                    </div>
-
-                    {/* Speed preset pills including 1.3x */}
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      {[0.75, 1.0, 1.25, 1.3, 1.5, 1.75, 2.0].map((rate) => (
+                      <span className="font-bold block opacity-75">TTS Speed / Rate</span>
+                      <div className="flex items-center gap-1.5">
                         <button
-                          key={rate}
                           type="button"
                           onClick={() => {
-                            updatePrefs({ ttsRate: rate });
+                            const newRate = Math.max(0.5, Math.round((prefs.ttsRate - 0.05) * 100) / 100);
+                            updatePrefs({ ttsRate: newRate });
                             if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
                               speakParagraphAtIndex(activeParagraphIndexRef.current);
                             }
                           }}
-                          className={`px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer ${
-                            prefs.ttsRate === rate
-                              ? "bg-purple-600 text-white shadow-xs ring-2 ring-purple-400/30"
-                              : `${themeClasses.buttonBg} opacity-80 hover:opacity-100 hover:text-purple-600`
-                          }`}
+                          className={`px-2 py-0.5 rounded ${themeClasses.buttonBg} hover:bg-purple-500/20 active:scale-95 font-mono font-bold text-[11px] cursor-pointer`}
+                          title="Decrease speed by 0.05x"
                         >
-                          {rate}x
+                          -0.05
                         </button>
-                      ))}
+                        <span className="text-purple-600 dark:text-purple-400 font-mono font-bold text-xs px-2 py-0.5 rounded bg-purple-500/10 border border-purple-500/20">
+                          {Number(prefs.ttsRate).toFixed(2).replace(/\.00$/, ".0").replace(/0$/, "")}x
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const newRate = Math.min(2.5, Math.round((prefs.ttsRate + 0.05) * 100) / 100);
+                            updatePrefs({ ttsRate: newRate });
+                            if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
+                              speakParagraphAtIndex(activeParagraphIndexRef.current);
+                            }
+                          }}
+                          className={`px-2 py-0.5 rounded ${themeClasses.buttonBg} hover:bg-purple-500/20 active:scale-95 font-mono font-bold text-[11px] cursor-pointer`}
+                          title="Increase speed by 0.05x"
+                        >
+                          +0.05
+                        </button>
+                      </div>
                     </div>
 
-                    <input
-                      type="range"
-                      min="0.5"
-                      max="2.5"
-                      step="0.1"
-                      value={prefs.ttsRate}
-                      onChange={(e) => {
-                        const newRate = parseFloat(e.target.value);
-                        updatePrefs({ ttsRate: newRate });
-                        if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
-                          speakParagraphAtIndex(activeParagraphIndexRef.current);
-                        }
-                      }}
-                      className="w-full accent-purple-600 cursor-pointer mt-1"
-                    />
+                    {/* Speed preset pills with dedicated 1.30x, 1.35x, 1.40x, 1.45x, 1.50x */}
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {[0.75, 1.0, 1.1, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45, 1.5, 1.6, 1.75, 2.0].map((rate) => {
+                        const isSelected = Math.abs(prefs.ttsRate - rate) < 0.02;
+                        return (
+                          <button
+                            key={rate}
+                            type="button"
+                            onClick={() => {
+                              updatePrefs({ ttsRate: rate });
+                              if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
+                                speakParagraphAtIndex(activeParagraphIndexRef.current);
+                              }
+                            }}
+                            className={`px-2.5 py-1 rounded-lg text-xs font-bold font-mono transition cursor-pointer active:scale-95 ${
+                              isSelected
+                                ? "bg-purple-600 text-white shadow-xs ring-2 ring-purple-400/40 font-black"
+                                : `${themeClasses.buttonBg} opacity-80 hover:opacity-100 hover:text-purple-600`
+                            }`}
+                          >
+                            {rate}x
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {/* Smooth 0.05-step Slider */}
+                    <div className="space-y-1 pt-1">
+                      <input
+                        type="range"
+                        min="0.5"
+                        max="2.5"
+                        step="0.05"
+                        value={prefs.ttsRate}
+                        onChange={(e) => {
+                          const newRate = parseFloat(e.target.value);
+                          updatePrefs({ ttsRate: newRate });
+                          if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
+                            speakParagraphAtIndex(activeParagraphIndexRef.current);
+                          }
+                        }}
+                        className="w-full accent-purple-600 cursor-pointer"
+                      />
+                      <div className="flex justify-between text-[10px] opacity-50 font-mono px-0.5">
+                        <span>0.5x</span>
+                        <span>1.0x</span>
+                        <span className="font-bold text-purple-600 dark:text-purple-400">1.35x-1.45x</span>
+                        <span>2.0x</span>
+                        <span>2.5x</span>
+                      </div>
+                    </div>
                   </div>
 
                   {/* Sleep Timer inside Voice Settings */}
@@ -1543,6 +1961,13 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
             </div>
           )}
         </footer>
+
+        {/* Floating TTS Feedback Toast */}
+        {ttsFeedbackMessage && (
+          <div className="absolute bottom-20 left-1/2 -translate-x-1/2 z-50 px-4 py-2 bg-slate-950/90 text-white text-xs font-semibold rounded-full shadow-2xl border border-white/20 backdrop-blur-md animate-in fade-in zoom-in-95 pointer-events-none">
+            {ttsFeedbackMessage}
+          </div>
+        )}
 
         {/* ========================================================= */}
         {/* QuickNovel Translation Scope Modal */}

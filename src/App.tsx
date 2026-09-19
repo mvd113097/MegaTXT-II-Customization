@@ -18,6 +18,7 @@ import { ActiveTranslationView } from "./components/ActiveTranslationView";
 import { TranslationCompleteView } from "./components/TranslationCompleteView";
 import { StoreView } from "./components/StoreView";
 import { ExploreView } from "./components/ExploreView";
+import { LibraryView } from "./components/LibraryView";
 import { NovelReaderModal } from "./components/NovelReaderModal";
 import {
   getSessionFromIdb,
@@ -207,14 +208,14 @@ export default function App() {
   );
 
   // Modals & Navigation
-  const [activeNavTab, setActiveNavTab] = useState<"home" | "store" | "explore" | "history" | "settings">("home");
+  const [activeNavTab, setActiveNavTab] = useState<"home" | "library" | "store" | "explore" | "history" | "settings">("home");
   const [storeSearchTrigger, setStoreSearchTrigger] = useState<{ query: string; timestamp: number } | null>(null);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [isGlossaryOpen, setIsGlossaryOpen] = useState(false);
   const [isExportOpen, setIsExportOpen] = useState(false);
   const [isTelegramSettingsOpen, setIsTelegramSettingsOpen] = useState(false);
 
-  // Reader & TTS State
+  // Reader & TTS State with Persistent Session across page reload
   interface ActiveReaderNovel {
     novelTitle: string;
     author?: string;
@@ -228,14 +229,93 @@ export default function App() {
     englishContent?: string;
   }
 
-  const [readerNovel, setReaderNovel] = useState<ActiveReaderNovel | null>(null);
-  const [isReaderOpen, setIsReaderOpen] = useState(false);
-  const [isReaderMinimized, setIsReaderMinimized] = useState(false);
+  const READER_SESSION_KEY = "megatext_reader_session_v1";
+
+  const [readerNovel, setReaderNovel] = useState<ActiveReaderNovel | null>(() => {
+    try {
+      const saved = localStorage.getItem(READER_SESSION_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && parsed.readerNovel && parsed.readerNovel.novelTitle) {
+          return parsed.readerNovel;
+        }
+      }
+    } catch (e) {
+      console.warn("Could not restore reader novel from localStorage:", e);
+    }
+    return null;
+  });
+
+  const [isReaderOpen, setIsReaderOpen] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem(READER_SESSION_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (typeof parsed?.isReaderOpen === "boolean") {
+          return parsed.isReaderOpen;
+        }
+      }
+    } catch {}
+    return false;
+  });
+
+  const [isReaderMinimized, setIsReaderMinimized] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem(READER_SESSION_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (typeof parsed?.isReaderMinimized === "boolean") {
+          return parsed.isReaderMinimized;
+        }
+      }
+    } catch {}
+    return false;
+  });
+
+  // Sync reader state to localStorage
+  useEffect(() => {
+    try {
+      if (readerNovel) {
+        localStorage.setItem(
+          READER_SESSION_KEY,
+          JSON.stringify({
+            readerNovel,
+            isReaderOpen,
+            isReaderMinimized,
+            timestamp: Date.now(),
+          })
+        );
+      } else {
+        localStorage.removeItem(READER_SESSION_KEY);
+      }
+    } catch (e) {
+      console.warn("Could not save reader session to localStorage:", e);
+    }
+  }, [readerNovel, isReaderOpen, isReaderMinimized]);
 
   const handleOpenReader = (novel: ActiveReaderNovel) => {
     setReaderNovel(novel);
     setIsReaderOpen(true);
     setIsReaderMinimized(false);
+  };
+
+  const handleCloseReader = () => {
+    setIsReaderOpen(false);
+    setIsReaderMinimized(false);
+    // When explicitly closed by user, update session so it won't auto-reopen on next reload
+    try {
+      if (readerNovel) {
+        localStorage.setItem(
+          READER_SESSION_KEY,
+          JSON.stringify({
+            readerNovel,
+            isReaderOpen: false,
+            isReaderMinimized: false,
+            timestamp: Date.now(),
+          })
+        );
+      }
+    } catch {}
   };
 
   const handleOpenCurrentSessionReader = () => {
@@ -255,7 +335,7 @@ export default function App() {
     });
   };
 
-  const handleBottomNavChange = (tab: "home" | "store" | "explore" | "history" | "settings") => {
+  const handleBottomNavChange = (tab: "home" | "library" | "store" | "explore" | "history" | "settings") => {
     setActiveNavTab(tab);
     if (tab === "history") {
       setIsHistoryOpen(true);
@@ -1401,8 +1481,24 @@ Export Timestamp: ${new Date().toLocaleString()}
 
       {/* Main Screen Canvas */}
       <main className={`flex-1 w-full mx-auto px-3 sm:px-4 pt-3 pb-24 relative ${
-        activeNavTab === "store" || activeNavTab === "explore" ? "max-w-4xl" : "max-w-md"
+        activeNavTab === "store" || activeNavTab === "explore" || activeNavTab === "library" ? "max-w-4xl" : "max-w-md"
       }`}>
+        {/* Library Tab View (Personal Bookshelf & Reading Progress) */}
+        <div className={activeNavTab === "library" ? "block" : "hidden"}>
+          <LibraryView
+            onOpenReader={handleOpenReader}
+            onSearchStore={(keyword) => {
+              setStoreSearchTrigger({ query: keyword, timestamp: Date.now() });
+              setActiveNavTab("store");
+            }}
+            onTranslateWholeBook={(book) => {
+              // Redirect to store to download full chapters or start translation
+              setStoreSearchTrigger({ query: book.title, timestamp: Date.now() });
+              setActiveNavTab("store");
+            }}
+          />
+        </div>
+
         {/* Store Tab View */}
         <div className={activeNavTab === "store" ? "block" : "hidden"}>
           <StoreView
@@ -1613,13 +1709,21 @@ Export Timestamp: ${new Date().toLocaleString()}
       {/* Novel Reader Modal & Minimized Background Player */}
       {readerNovel && (
         <NovelReaderModal
+          key={`${readerNovel.novelTitle}__${readerNovel.novelUrl || readerNovel.siteId || ""}`}
           isOpen={isReaderOpen}
           isMinimized={isReaderMinimized}
-          onClose={() => {
-            setIsReaderOpen(false);
-            setIsReaderMinimized(false);
-          }}
+          onClose={handleCloseReader}
           onToggleMinimize={() => setIsReaderMinimized((prev) => !prev)}
+          onUpdateChapterIndex={(chapterIndex, chapterTitle, allChapters) => {
+            setReaderNovel((prev) => {
+              if (!prev) return null;
+              return {
+                ...prev,
+                chapterIndex,
+                ...(allChapters && allChapters.length > 0 ? { allChapters } : {}),
+              };
+            });
+          }}
           novelTitle={readerNovel.novelTitle}
           author={readerNovel.author}
           coverUrl={readerNovel.coverUrl}
