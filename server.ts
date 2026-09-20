@@ -2688,15 +2688,16 @@ app.get("/api/store/explore", requireAuthMiddleware, async (req, res) => {
     const tags = rawTagParam === "all" ? [] : rawTagParam.split(",").map((t) => t.trim()).filter(Boolean);
     const tag = tags[0] || "all";
     const query = (req.query.q as string) || "";
-    const sort = (req.query.sort as "points" | "likes" | "recent" | "chapters") || "points";
+    const sort = (req.query.sort as "points" | "likes" | "aiquLikes" | "recent" | "chapters") || "points";
     const page = parseInt((req.query.page as string) || "1", 10);
+    const forceRefresh = req.query.refresh === "true" || req.query.fresh === "true";
 
-    const collectionKey = `explore_col:${site}:${year}:${orientation}:${tags.slice().sort().join(",")}:${tag}:${query.toLowerCase().trim()}:${sort}`;
+    const collectionKey = `explore_col_v3:${site}:${year}:${orientation}:${tags.slice().sort().join(",")}:${tag}:${query.toLowerCase().trim()}:${sort}`;
     const cached = exploreCache.get(collectionKey);
     const now = Date.now();
     let allItems: any[];
 
-    if (cached && (now - cached.timestamp) < EXPLORE_CACHE_TTL_MS) {
+    if (!forceRefresh && cached && (now - cached.timestamp) < EXPLORE_CACHE_TTL_MS) {
       allItems = cached.data;
     } else {
       allItems = await scrapeExploreNovels({
@@ -2706,9 +2707,16 @@ app.get("/api/store/explore", requireAuthMiddleware, async (req, res) => {
         tag,
         tags,
         query,
-        sort,
+        sort: sort as any,
         page,
       });
+
+      // Strictly sanitize any legacy aberrant aiquLikes (> 10000)
+      for (const it of allItems) {
+        if (it.aiquLikes !== undefined && (it.aiquLikes <= 0 || it.aiquLikes > 10000)) {
+          delete it.aiquLikes;
+        }
+      }
 
       exploreCache.set(collectionKey, { data: allItems, timestamp: now });
       if (exploreCache.size > 150) {
@@ -3174,6 +3182,7 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
+    console.log(`[Server] Serving static files from ${distPath}, CWD: ${process.cwd()}`);
     // Cache static immutable assets (JS, CSS, images, fonts) for 1 year to save cellular data on return visits
     app.use(
       express.static(distPath, {

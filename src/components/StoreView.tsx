@@ -117,7 +117,7 @@ const POPULAR_SEARCHES = [
   "道诡异仙",
 ];
 
-const STORE_STATE_KEY = "megatext_store_state_v2";
+const STORE_STATE_KEY = "megatext_store_state_v3";
 
 interface SavedStoreState {
   query: string;
@@ -132,9 +132,23 @@ interface SavedStoreState {
 
 const getSavedStoreState = (): Partial<SavedStoreState> => {
   try {
+    sessionStorage.removeItem("megatext_store_state_v1");
+    sessionStorage.removeItem("megatext_store_state_v2");
+    localStorage.removeItem("megatext_store_state_v1");
+    localStorage.removeItem("megatext_store_state_v2");
+
     const raw = sessionStorage.getItem(STORE_STATE_KEY) || localStorage.getItem(STORE_STATE_KEY);
     if (raw) {
-      return JSON.parse(raw);
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.results)) {
+        parsed.results = parsed.results.map((r: any) => {
+          if (r.aiquLikes !== undefined && (r.aiquLikes <= 0 || r.aiquLikes > 10000)) {
+            delete r.aiquLikes;
+          }
+          return r;
+        });
+      }
+      return parsed;
     }
   } catch (e) {
     console.error("Failed to read saved store state:", e);
@@ -146,6 +160,12 @@ const getSavedStoreState = (): Partial<SavedStoreState> => {
 function formatPoints(pts?: number): string {
   if (!pts || pts <= 0) return "";
   return `${pts.toLocaleString()} pts`;
+}
+
+// Format authentic Aiqu community votes
+function formatAiquVotes(votes?: number): string {
+  if (!votes || votes <= 0 || votes > 10000) return "";
+  return `${votes.toLocaleString()} likes`;
 }
 
 // Format likes display accurately
@@ -429,7 +449,9 @@ export const StoreView: React.FC<StoreViewProps> = ({
       });
     } else if (sortBy === "aiquLikes") {
       items.sort((a, b) => {
-        const diff = (b.aiquLikes || 0) - (a.aiquLikes || 0);
+        const aVal = (a.aiquLikes && a.aiquLikes <= 10000) ? a.aiquLikes : 0;
+        const bVal = (b.aiquLikes && b.aiquLikes <= 10000) ? b.aiquLikes : 0;
+        const diff = bVal - aVal;
         if (diff !== 0) return diff;
         const lDiff = (b.likes || 0) - (a.likes || 0);
         if (lDiff !== 0) return lDiff;
@@ -850,13 +872,13 @@ export const StoreView: React.FC<StoreViewProps> = ({
                       </span>
                     )}
 
-                    {novel.aiquLikes !== undefined && novel.aiquLikes > 0 && (
+                    {novel.aiquLikes !== undefined && novel.aiquLikes > 0 && novel.aiquLikes <= 10000 && (
                       <span
-                        title={`Aiqu Site Votes: ${novel.aiquLikes.toLocaleString()} 赞`}
+                        title={`Aiqu Site Votes: ${novel.aiquLikes.toLocaleString()}`}
                         className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold border border-emerald-200/70 dark:border-emerald-900/40"
                       >
                         <ThumbsUp className="h-3 w-3 fill-emerald-400/30 text-emerald-600" />
-                        <span>{novel.aiquLikes.toLocaleString()} 赞</span>
+                        <span>{formatAiquVotes(novel.aiquLikes)}</span>
                       </span>
                     )}
 

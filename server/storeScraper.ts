@@ -533,16 +533,27 @@ async function searchAiqu226(query: string): Promise<StoreSearchResult[]> {
               }
             }
 
-            // Extract Aiqu on-site votes (e.g. "👍 26赞" or "26赞" or "点赞: 26" or "获赞: 26")
+            // Extract authentic Aiqu forum upvotes (赞/点赞)
             let aiquLikes: number | undefined;
-            const fullCardText = card.text();
-            const aiquVoteMatch =
-              fullCardText.match(/(?:👍|点赞|获赞|赞数|好评|推荐)?\s*(\d+)\s*赞/i) ||
-              fullCardText.match(/(?:👍|点赞|获赞)\s*(\d+)/i) ||
-              card.find(".praise, .zan, .likes, .vote, .search-card-date, .search-card-ext").text().match(/(\d+)/);
-            if (aiquVoteMatch) {
-              const v = parseInt(aiquVoteMatch[1], 10);
-              if (v > 0) aiquLikes = v;
+            const normTitle = title.toLowerCase().replace(/[《》\s]/g, "");
+            const normKey = `${normTitle}_${author.toLowerCase().replace(/\s/g, "")}`;
+            if (cachedAiquForumData && cachedAiquForumData.voteMap) {
+              aiquLikes = cachedAiquForumData.voteMap.get(normKey) ?? cachedAiquForumData.voteMap.get(normTitle);
+            }
+            if (aiquLikes === undefined) {
+              const fullCardText = card.text();
+              const forumZanMatch =
+                fullCardText.match(/(?:👍|点赞|获赞|赞数)?\s*(\d{1,4})\s*(?:赞|点赞|获赞|票)\b/) ||
+                card.find(".zan-num, .praise, .zan, .vote").text().match(/(\d{1,4})/);
+              if (forumZanMatch) {
+                const parsedZan = parseInt(forumZanMatch[1], 10);
+                if (parsedZan > 0 && parsedZan <= 10000) {
+                  aiquLikes = parsedZan;
+                }
+              }
+            }
+            if (aiquLikes !== undefined && (aiquLikes <= 0 || aiquLikes > 10000)) {
+              aiquLikes = undefined;
             }
 
             // Extract status
@@ -3771,6 +3782,91 @@ async function scrapeFuxsbExplore(options: ExploreFilterOptions): Promise<Explor
 // Cache for full detail metadata from aiqu226 detail pages
 export const aiquDetailCache = new Map<string, { fileSize?: string; points?: number; likes?: number; aiquLikes?: number; summary?: string }>();
 
+// Cache for Aiqu Forum Native Rankings (lt.aqxsw66.com)
+let cachedAiquForumData: { voteMap: Map<string, number>; items: ExploreNovelItem[]; timestamp: number } | null = null;
+
+export async function getAiquForumData(): Promise<{ voteMap: Map<string, number>; items: ExploreNovelItem[] }> {
+  if (cachedAiquForumData && Date.now() - cachedAiquForumData.timestamp < 10 * 60 * 1000) {
+    return cachedAiquForumData;
+  }
+  const voteMap = new Map<string, number>();
+  const items: ExploreNovelItem[] = [];
+
+  const types = ["zannum", "looknum"];
+  for (const t of types) {
+    const pageLimit = t === "zannum" ? 8 : 4;
+    const promises = [];
+    for (let p = 1; p <= pageLimit; p++) {
+      promises.push(
+        axios.get(`http://lt.aqxsw66.com/home.html?show_type=${t}&page=${p}`, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
+          },
+          timeout: 4500,
+        }).then((res) => {
+          const $ = cheerio.load(res.data);
+          $(".rank-card-item").each((_, el) => {
+            const rank = parseInt($(el).find(".rank-number").text().trim(), 10) || 0;
+            const titleA = $(el).find(".rank-title a");
+            const fullRawTitle = titleA.text().trim();
+            const href = titleA.attr("href") || "";
+            const fullUrl = href.startsWith("http") ? href : `http://lt.aqxsw66.com/${href}`;
+            const zan = parseInt($(el).find(".zan-num").text().trim(), 10) || 0;
+            const cat = $(el).find(".rank-category a").text().trim().replace(/^\[|\]$/g, "");
+            const timeStr = $(el).find(".rank-time").text().trim();
+
+            let title = fullRawTitle;
+            let category = cat || "耽美专区";
+            const catMatch = fullRawTitle.match(/^\[([^\]]+)\]/);
+            if (catMatch) {
+              category = catMatch[1];
+              title = title.replace(/^\[[^\]]+\]\s*/, "");
+            }
+            let author = "Unknown";
+            const authMatch = title.match(/作者[：:]\s*([^【\[(《\s]+)/);
+            if (authMatch) {
+              author = authMatch[1].trim();
+            }
+            const titleMatch = title.match(/《([^》]+)》/);
+            const cleanTitle = titleMatch ? titleMatch[1].trim() : title.replace(/作者.*$/g, "").replace(/【.*$/g, "").trim();
+
+            const normTitle = cleanTitle.toLowerCase().replace(/[《》\s]/g, "");
+            voteMap.set(normTitle, zan);
+            if (author && author !== "Unknown") {
+              voteMap.set(`${normTitle}_${author.toLowerCase().replace(/\s/g, "")}`, zan);
+            }
+
+            const detected = detect52ShukuOrientation(cleanTitle, fullRawTitle, category, fullUrl);
+
+            items.push({
+              id: `aiqu_forum_rank_${t}_${p}_${rank}_${cleanTitle}`,
+              title: cleanTitle,
+              author,
+              siteId: "aiqu226",
+              siteName: "aiqu",
+              novelUrl: fullUrl,
+              year: 2026,
+              dateStr: timeStr,
+              orientation: detected.orientation,
+              orientationLabel: detected.orientationLabel,
+              tags: [category, "耽美", t === "zannum" ? "近期点赞排行" : "近期阅读排行"],
+              summary: fullRawTitle,
+              points: zan * 100000 + 1000000,
+              likes: zan,
+              aiquLikes: zan,
+              status: "完结",
+            });
+          });
+        }).catch(() => {})
+      );
+    }
+    await Promise.allSettled(promises);
+  }
+
+  cachedAiquForumData = { voteMap, items, timestamp: Date.now() };
+  return cachedAiquForumData;
+}
+
 export async function enrichAiquNovelItems(items: ExploreNovelItem[]): Promise<void> {
   const toFetch = items.filter(
     (it) => it.siteId === "aiqu226" && it.novelUrl && !aiquDetailCache.has(it.novelUrl)
@@ -3818,9 +3914,12 @@ export async function enrichAiquNovelItems(items: ExploreNovelItem[]): Promise<v
 
           // Extract on-site forum votes if available
           let forumVotes = 0;
-          const voteMatch = fullText.match(/(?:👍|点赞|获赞|赞数|好评|推荐)?\s*(\d+)\s*赞/i) || fullText.match(/(?:👍|点赞|获赞)\s*(\d+)/i);
+          const voteMatch = fullText.match(/(?:👍|点赞|获赞|赞数|好评|推荐)?\s*(\d{1,4})\s*赞/i) || fullText.match(/(?:👍|点赞|获赞)\s*(\d{1,4})/i);
           if (voteMatch) {
-            forumVotes = parseInt(voteMatch[1], 10);
+            const v = parseInt(voteMatch[1], 10);
+            if (v > 0 && v <= 10000) {
+              forumVotes = v;
+            }
           }
 
           let intro = "";
@@ -3848,7 +3947,7 @@ export async function enrichAiquNovelItems(items: ExploreNovelItem[]): Promise<v
             data.likes = totalLikes;
             it.likes = totalLikes;
           }
-          if (forumVotes > 0) {
+          if (forumVotes > 0 && forumVotes <= 10000) {
             data.aiquLikes = forumVotes;
             it.aiquLikes = forumVotes;
           }
@@ -3874,6 +3973,19 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
     : (options.tag && options.tag !== "all" ? [options.tag.trim()] : []);
 
   const fetchTasks: { url: string; page: number; categoryHint?: string }[] = [];
+
+  // 0. Include Authentic Aiqu Forum Rankings (lt.aqxsw66.com)
+  const forumData = await getAiquForumData().catch(() => ({ voteMap: new Map<string, number>(), items: [] }));
+  for (const fItem of forumData.items) {
+    if (oriFilter === "bl" && fItem.orientation !== "bl") continue;
+    if (oriFilter === "het" && fItem.orientation !== "het") continue;
+    if (oriFilter === "no_cp" && fItem.orientation !== "no_cp") continue;
+    if (userQuery) {
+      const ql = userQuery.toLowerCase();
+      if (!fItem.title.toLowerCase().includes(ql) && !fItem.author.toLowerCase().includes(ql)) continue;
+    }
+    items.push(fItem);
+  }
 
   // 1. Direct Search-Driven Pages
   const searchKeywords: string[] = [];
@@ -4070,23 +4182,25 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
           const likes = parseNovelLikes(rawContent);
           const points = parseNovelPoints(rawContent, likes);
 
-          // Extract native Aiqu on-site forum votes if present on card (e.g. "👍 26 赞", "26赞", "总推荐: 1200")
-          let aiquLikes: number | undefined;
-          const cardText = card.text();
-          const aiquVoteMatch =
-            rawContent.match(/(?:总推荐|总投票|本月推荐|网站投票|投票数|推荐票|好评数|点赞数|网站赞数|站内投票)[：:\s]*([\d,]+(?:\.\d+)?(?:[万wWkK])?)/i) ||
-            cardText.match(/(?:👍|点赞|获赞|赞数|好评|推荐|投票)?\s*([\d,]+)\s*(?:赞|票)/i) ||
-            cardText.match(/(?:👍|点赞|获赞)\s*([\d,]+)/i) ||
-            card.find(".praise, .zan, .likes, .vote, .search-card-ext").text().match(/(\d+)/);
-          if (aiquVoteMatch) {
-            const s = aiquVoteMatch[1].replace(/,/g, "").trim();
-            if (s.includes("万") || s.toLowerCase().includes("w")) {
-              aiquLikes = Math.round(parseFloat(s) * 10000);
-            } else if (s.toLowerCase().includes("k")) {
-              aiquLikes = Math.round(parseFloat(s) * 1000);
-            } else {
-              aiquLikes = parseInt(s, 10) || undefined;
+          // Extract authentic Aiqu forum upvotes (赞/点赞)
+          const normTitle = title.toLowerCase().replace(/[《》\s]/g, "");
+          const normKey = `${normTitle}_${author.toLowerCase().replace(/\s/g, "")}`;
+          let aiquLikes: number | undefined = forumData.voteMap.get(normKey) ?? forumData.voteMap.get(normTitle);
+
+          if (aiquLikes === undefined) {
+            const cardText = card.text();
+            const forumZanMatch =
+              cardText.match(/(?:👍|点赞|获赞|赞数)?\s*(\d{1,4})\s*(?:赞|点赞|获赞|票)\b/) ||
+              card.find(".zan-num, .praise, .zan, .vote, .search-card-ext").text().match(/(\d{1,4})/);
+            if (forumZanMatch) {
+              const val = parseInt(forumZanMatch[1], 10);
+              if (val > 0 && val <= 10000) {
+                aiquLikes = val;
+              }
             }
+          }
+          if (aiquLikes !== undefined && (aiquLikes <= 0 || aiquLikes > 10000)) {
+            aiquLikes = undefined;
           }
 
           // Size extraction
@@ -4233,23 +4347,25 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
           const likes = parseNovelLikes(rawContent);
           const points = parseNovelPoints(rawContent, likes);
 
-          // Extract native Aiqu on-site forum votes if present on card (e.g. "👍 26 赞", "26赞", "总推荐: 1200")
-          let aiquLikes: number | undefined;
-          const cardText = card.text();
-          const aiquVoteMatch =
-            rawContent.match(/(?:总推荐|总投票|本月推荐|网站投票|投票数|推荐票|好评数|点赞数|网站赞数|站内投票)[：:\s]*([\d,]+(?:\.\d+)?(?:[万wWkK])?)/i) ||
-            cardText.match(/(?:👍|点赞|获赞|赞数|好评|推荐|投票)?\s*([\d,]+)\s*(?:赞|票)/i) ||
-            cardText.match(/(?:👍|点赞|获赞)\s*([\d,]+)/i) ||
-            card.find(".praise, .zan, .likes, .vote, .search-card-ext").text().match(/(\d+)/);
-          if (aiquVoteMatch) {
-            const s = aiquVoteMatch[1].replace(/,/g, "").trim();
-            if (s.includes("万") || s.toLowerCase().includes("w")) {
-              aiquLikes = Math.round(parseFloat(s) * 10000);
-            } else if (s.toLowerCase().includes("k")) {
-              aiquLikes = Math.round(parseFloat(s) * 1000);
-            } else {
-              aiquLikes = parseInt(s, 10) || undefined;
+          // Extract authentic Aiqu forum upvotes (赞/点赞)
+          const normTitle2 = title.toLowerCase().replace(/[《》\s]/g, "");
+          const normKey2 = `${normTitle2}_${author.toLowerCase().replace(/\s/g, "")}`;
+          let aiquLikes: number | undefined = forumData.voteMap.get(normKey2) ?? forumData.voteMap.get(normTitle2);
+
+          if (aiquLikes === undefined) {
+            const cardText = card.text();
+            const forumZanMatch =
+              cardText.match(/(?:👍|点赞|获赞|赞数)?\s*(\d{1,4})\s*(?:赞|点赞|获赞|票)\b/) ||
+              card.find(".zan-num, .praise, .zan, .vote, .search-card-ext").text().match(/(\d{1,4})/);
+            if (forumZanMatch) {
+              const val = parseInt(forumZanMatch[1], 10);
+              if (val > 0 && val <= 10000) {
+                aiquLikes = val;
+              }
             }
+          }
+          if (aiquLikes !== undefined && (aiquLikes <= 0 || aiquLikes > 10000)) {
+            aiquLikes = undefined;
           }
 
           const sizeMatch = rawContent.match(/小说大小[：:]\s*([\d.]+\s*(?:MB|KB|GB|M|K|G)?i?B?)/i);
@@ -5029,7 +5145,7 @@ export async function scrapeExploreNovels(options: ExploreFilterOptions): Promis
   }
 
   // aiqu226 (爱去小说)
-  if (targetSite === "all" || targetSite === "aiqu226") {
+  if (targetSite === "all" || targetSite === "aiqu226" || targetSite === "aiqu") {
     promises.push(safeScrapeWithTimeout(scrapeAiqu226Explore(options), 15000));
   }
 
@@ -5252,8 +5368,8 @@ export async function scrapeExploreNovels(options: ExploreFilterOptions): Promis
     });
   } else if (sortMode === "aiquLikes") {
     allItems.sort((a, b) => {
-      const bVotes = b.aiquLikes || 0;
-      const aVotes = a.aiquLikes || 0;
+      const bVotes = (b.aiquLikes && b.aiquLikes <= 10000) ? b.aiquLikes : 0;
+      const aVotes = (a.aiquLikes && a.aiquLikes <= 10000) ? a.aiquLikes : 0;
       if (bVotes !== aVotes) return bVotes - aVotes;
 
       // Extract native Aiqu on-site book ID as secondary tie-breaker

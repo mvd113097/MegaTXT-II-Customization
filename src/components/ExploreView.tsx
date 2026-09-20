@@ -14,6 +14,7 @@ import {
   ChevronDown,
   ChevronUp,
   RotateCcw,
+  RotateCw,
   Sparkles,
   Flame,
   CheckCircle,
@@ -240,8 +241,8 @@ function sortNovelItems(
   const sorted = [...list];
   if (sort === "aiquLikes") {
     sorted.sort((a, b) => {
-      const aVal = a.aiquLikes || 0;
-      const bVal = b.aiquLikes || 0;
+      const aVal = (a.aiquLikes && a.aiquLikes <= 10000) ? a.aiquLikes : 0;
+      const bVal = (b.aiquLikes && b.aiquLikes <= 10000) ? b.aiquLikes : 0;
       if (bVal !== aVal) return bVal - aVal;
       const aAiquId = parseInt((a.novelUrl || "").match(/txt-(\d+)/)?.[1] || "0", 10);
       const bAiquId = parseInt((b.novelUrl || "").match(/txt-(\d+)/)?.[1] || "0", 10);
@@ -301,7 +302,7 @@ function sortNovelItems(
 }
 
 // Module-level and localStorage persistence to preserve feed, pagination and filters across reloads
-const EXPLORE_PERSISTENCE_KEY = "megatext_explore_persisted_state_v2";
+const EXPLORE_PERSISTENCE_KEY = "megatext_explore_persisted_state_v5";
 
 interface PersistedFeedState {
   items: ExploreNovelItem[];
@@ -320,10 +321,29 @@ interface PersistedFeedState {
 
 function loadPersistedFeedState(): PersistedFeedState | null {
   try {
+    // Purge older legacy cache formats that might hold misparsed JJWXC nutrient bottle counts
+    localStorage.removeItem("megatext_explore_persisted_state_v1");
+    localStorage.removeItem("megatext_explore_persisted_state_v2");
+    localStorage.removeItem("megatext_explore_persisted_state_v3");
+    localStorage.removeItem("megatext_explore_persisted_state_v4");
+
     const raw = localStorage.getItem(EXPLORE_PERSISTENCE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed.page === "number" && parsed.filters) {
+        if (Array.isArray(parsed.items)) {
+          // If any items have legacy nutrient bottle counts as aiquLikes (> 10,000), reject and fetch fresh!
+          const hasBogusVotes = parsed.items.some((it: any) => it.aiquLikes && it.aiquLikes > 10000);
+          if (hasBogusVotes) {
+            localStorage.removeItem(EXPLORE_PERSISTENCE_KEY);
+            return null;
+          }
+          parsed.items.forEach((it: any) => {
+            if (it.aiquLikes && it.aiquLikes > 10000) {
+              delete it.aiquLikes;
+            }
+          });
+        }
         return parsed;
       }
     }
@@ -732,7 +752,8 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
       tags?: string[];
       query?: string;
       sort?: "points" | "likes" | "aiquLikes" | "recent" | "chapters";
-    }
+    },
+    forceRefresh = false
   ) => {
     setHasSearched(true);
     const site = overrideFilters?.site ?? selectedSite;
@@ -746,11 +767,15 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     syncExploreUrlAndStorage(pageIdx, site, year, orientation, tags, sort, query);
 
     const cacheKey = `c:${site}:${year}:${orientation}:${tags.slice().sort().join(",")}:${query.trim().toLowerCase()}:${sort}:${pageIdx}`;
+    if (forceRefresh) {
+      clientExploreCache.delete(cacheKey);
+    }
     const cached = clientExploreCache.get(cacheKey);
     const now = Date.now();
 
-    // 1. Instant cache hit
-    if (cached && now - cached.timestamp < CLIENT_CACHE_TTL_MS) {
+    // 1. Instant cache hit (reject if stale or contains legacy corrupted nutrient votes > 10000)
+    const hasCorruptedVotes = cached?.items?.some((it) => it.aiquLikes && it.aiquLikes > 10000);
+    if (!forceRefresh && !hasCorruptedVotes && cached && now - cached.timestamp < CLIENT_CACHE_TTL_MS) {
       setItems(sortNovelItems(cached.items, sort));
       setTotalAvailable(cached.total);
       setHasMore(cached.hasMore);
@@ -795,6 +820,9 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
         page: String(pageIdx),
         pageSize: "20",
       });
+      if (forceRefresh) {
+        params.set("refresh", "true");
+      }
 
       const res = await fetch(`/api/store/explore?${params.toString()}`, {
         headers: getAuthHeaders(),
@@ -824,7 +852,16 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
       }
 
       const data = await res.json();
-      const newItems: ExploreNovelItem[] = data.items || [];
+      const rawItems: ExploreNovelItem[] = data.items || [];
+      // Cleanse any legacy/misparsed aiquLikes (> 10000)
+      const newItems: ExploreNovelItem[] = rawItems.map((it) => {
+        if (it.aiquLikes !== undefined && (it.aiquLikes <= 0 || it.aiquLikes > 10000)) {
+          const clone = { ...it };
+          delete clone.aiquLikes;
+          return clone;
+        }
+        return it;
+      });
       const totalCount = data.total ?? (newItems.length > 0 ? 500 : 0);
       const moreAvailable = data.hasMore ?? (newItems.length === 20);
 
@@ -897,10 +934,9 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   };
 
   const handleSelectSort = (sortId: "points" | "likes" | "aiquLikes" | "recent" | "chapters") => {
-    if (sortId === sortBy && items.length > 0) return;
     setSortBy(sortId);
     setPage(1);
-    fetchExploreFeed(1, { sort: sortId });
+    fetchExploreFeed(1, { sort: sortId }, true);
   };
 
   const handlePageChange = (newPage: number) => {
@@ -917,7 +953,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     }
   };
 
-  // Auto-load explore feed on initial mount only if active query/filters are specified in URL
+  // Auto-load explore feed on initial mount only if active query/filters are specified in URL or corrupted
   useEffect(() => {
     const hasActiveFilters =
       selectedSite !== "all" ||
@@ -927,7 +963,9 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
       searchQuery.trim().length > 0 ||
       page > 1;
 
-    if (items.length === 0 && !hasSearched && hasActiveFilters) {
+    const hasCorruptedVotes = items.some((it) => it.aiquLikes && it.aiquLikes > 10000);
+
+    if (hasCorruptedVotes || (items.length === 0 && !hasSearched && hasActiveFilters)) {
       fetchExploreFeed(page, {
         site: selectedSite,
         year: selectedYear,
@@ -935,7 +973,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
         tags: selectedTags,
         query: searchQuery,
         sort: sortBy,
-      });
+      }, true);
     }
   }, []);
 
@@ -1273,6 +1311,12 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     if (likes >= 1000000) return `${(likes / 1000000).toFixed(2)}M likes`;
     if (likes >= 1000) return `${(likes / 1000).toFixed(1)}k likes`;
     return `${likes.toLocaleString()} likes`;
+  };
+
+  // Helper to format Aiqu on-site votes/likes (strictly authentic community forum upvotes)
+  const formatDisplayAiquVotes = (votes?: number) => {
+    if (!votes || votes <= 0 || votes > 10000) return "";
+    return `${votes.toLocaleString()} likes`;
   };
 
   // Helper to format word count
@@ -1675,11 +1719,22 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
           {/* Results Count Banner */}
           {!isLoading && displayItems.length > 0 && (
             <div className="flex items-center justify-between px-1 mb-3 text-xs text-slate-500 dark:text-slate-400 font-medium">
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-2">
                 <Sparkles className="h-3.5 w-3.5 text-purple-500" />
                 <span>
                   Found <strong className="text-purple-600 dark:text-purple-400 font-bold">{currentDisplayCount.toLocaleString()}</strong> novels
                 </span>
+                {!showWishlistOnly && (
+                  <button
+                    type="button"
+                    onClick={() => fetchExploreFeed(currentActivePage, undefined, true)}
+                    title="Refresh feed from source"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] text-purple-600 dark:text-purple-400 bg-purple-50 dark:bg-purple-950/40 hover:bg-purple-100 dark:hover:bg-purple-900/50 border border-purple-200 dark:border-purple-800 transition cursor-pointer font-medium"
+                  >
+                    <RotateCw className="w-3 h-3" />
+                    <span>Refresh</span>
+                  </button>
+                )}
               </div>
               <span className="text-[11px] text-slate-400">
                 Page {currentActivePage} of {totalPages}
@@ -1776,13 +1831,13 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                             <span>{formatDisplayPoints(item.points)}</span>
                           </span>
                         )}
-                        {item.aiquLikes !== undefined && item.aiquLikes > 0 && (
+                        {item.aiquLikes !== undefined && item.aiquLikes > 0 && item.aiquLikes <= 10000 && (
                           <span
-                            title={`Aiqu Site Votes: ${item.aiquLikes.toLocaleString()} 赞`}
+                            title={`Aiqu Site Votes: ${item.aiquLikes.toLocaleString()}`}
                             className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 text-[11px] font-bold border border-emerald-200/60 dark:border-emerald-900/40"
                           >
                             <ThumbsUp className="h-3 w-3 fill-emerald-400/40 text-emerald-600" />
-                            <span>{item.aiquLikes.toLocaleString()} 赞</span>
+                            <span>{formatDisplayAiquVotes(item.aiquLikes)}</span>
                           </span>
                         )}
                         {item.likes !== undefined && item.likes > 0 && (
@@ -1954,13 +2009,13 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                       </span>
                     )}
 
-                    {item.aiquLikes !== undefined && item.aiquLikes > 0 && (
+                    {item.aiquLikes !== undefined && item.aiquLikes > 0 && item.aiquLikes <= 10000 && (
                       <span
-                        title={`Aiqu Site Votes: ${item.aiquLikes.toLocaleString()} 赞`}
+                        title={`Aiqu Site Votes: ${item.aiquLikes.toLocaleString()}`}
                         className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold border border-emerald-200/70 dark:border-emerald-900/40"
                       >
                         <ThumbsUp className="h-3 w-3 fill-emerald-400/40 text-emerald-600" />
-                        <span>{item.aiquLikes.toLocaleString()} 赞</span>
+                        <span>{formatDisplayAiquVotes(item.aiquLikes)}</span>
                       </span>
                     )}
 
