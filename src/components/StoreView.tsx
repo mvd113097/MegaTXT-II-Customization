@@ -679,7 +679,7 @@ export const StoreView: React.FC<StoreViewProps> = ({
           </div>
 
           {/* Sorting Buttons */}
-          <div className="flex items-center gap-1.5 overflow-x-auto py-1 max-w-full">
+          <div className="flex items-center gap-1.5 overflow-x-auto py-1 max-w-full no-scrollbar">
             <span className="text-slate-400 text-[11px] mr-1 hidden sm:inline shrink-0">Sort by:</span>
             <button
               type="button"

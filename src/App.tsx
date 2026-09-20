@@ -1470,7 +1470,7 @@ Export Timestamp: ${new Date().toLocaleString()}
   }
 
   return (
-    <div className="min-h-screen w-full overflow-x-hidden bg-[#FAF8FE] dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col font-sans transition-colors duration-200 relative selection:bg-purple-200 selection:text-purple-900">
+    <div className="min-h-screen w-full overflow-x-clip bg-[#FAF8FE] dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col font-sans transition-colors duration-200 relative selection:bg-purple-200 selection:text-purple-900">
       {/* Pagoda Landscape Header Backdrop (Illustrated Storybook Spec) */}
       <PagodaHeaderIllustration />
 

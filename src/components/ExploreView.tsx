@@ -1400,7 +1400,6 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   return (
     <div
       className="w-full max-w-5xl mx-auto px-3 sm:px-4 py-4 pb-24 text-slate-800 dark:text-slate-100 transition-colors"
-      style={{ overscrollBehaviorY: "contain" }}
     >
       {/* Streamlined Header Bar */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">

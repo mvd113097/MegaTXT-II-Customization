@@ -1,6 +1,8 @@
 import { initializeApp, getApps, getApp } from "firebase/app";
 import {
+  initializeFirestore,
   getFirestore,
+  setLogLevel,
   doc,
   setDoc,
   getDoc,
@@ -12,6 +14,13 @@ import {
 } from "firebase/firestore";
 import fs from "fs";
 import path from "path";
+
+// Silence internal Firestore SDK debug/idle stream logs to prevent benign gRPC stream recycling warnings
+try {
+  setLogLevel("silent");
+} catch {
+  // ignore if not supported
+}
 
 export interface ServerTextChunk {
   id: string;
@@ -100,7 +109,19 @@ export function initFirestore(): Firestore | null {
 
     const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
     const app = getApps().length === 0 ? initializeApp(config) : getApp();
-    const db = config.firestoreDatabaseId ? getFirestore(app, config.firestoreDatabaseId) : getFirestore(app);
+    let db: Firestore;
+    try {
+      db = initializeFirestore(
+        app,
+        {
+          experimentalForceLongPolling: true,
+          ignoreUndefinedProperties: true,
+        },
+        config.firestoreDatabaseId || undefined
+      );
+    } catch {
+      db = config.firestoreDatabaseId ? getFirestore(app, config.firestoreDatabaseId) : getFirestore(app);
+    }
 
     dbInstance = db;
     isFirestoreAvailable = true;
