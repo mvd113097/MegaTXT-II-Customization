@@ -578,7 +578,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
   // Load Chapter (Instant Cache First -> Network Fallback)
   // -------------------------------------------------------------
   const loadChapter = useCallback(
-    async (targetIndex: number) => {
+    async (targetIndex: number, forceNetwork = false) => {
       if (targetIndex < 1) return;
       setIsLoadingChapter(true);
       setChapterError(null);
@@ -595,7 +595,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
       activeParagraphIndexRef.current = -1;
 
       // 1. Check current session chunks (e.g., active translation session)
-      if (sessionChunks && sessionChunks.length > 0) {
+      if (!forceNetwork && sessionChunks && sessionChunks.length > 0) {
         const sessionChunk = sessionChunks[targetIndex - 1];
         if (sessionChunk) {
           setCurrentChapterIndex(targetIndex);
@@ -614,24 +614,32 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
       }
 
       // 2. Check IndexedDB Offline Cache (0 bytes network!)
-      try {
-        const cached = await getCachedChapter(novelId, targetIndex);
-        if (cached && cached.chineseContent) {
-          setCurrentChapterIndex(targetIndex);
-          setChapterTitle(cached.chapterTitle || `Chapter ${targetIndex}`);
-          setChineseContent(cached.chineseContent);
-          setEnglishContent(cached.englishContent || "");
-          setIsLoadingChapter(false);
-          setIsDataSavedFromCache(true);
-          onUpdateChapterIndex?.(targetIndex, cached.chapterTitle || `Chapter ${targetIndex}`);
-          if (pendingTtsStartRef.current) {
-            pendingTtsStartRef.current = false;
-            setTimeout(() => speakParagraphAtIndex(0), 250);
+      if (!forceNetwork) {
+        try {
+          const cached = await getCachedChapter(novelId, targetIndex);
+          // Safety guard: if cached text has an abnormal monolithic dump (> 600 paragraphs),
+          // it was caused by the previous bug where the entire novel file was dumped into Chapter 1.
+          // Bypass stale cache so the clean single chapter is fetched!
+          const cachedParaCount = cached?.chineseContent
+            ? cached.chineseContent.split(/\r?\n+/).filter(Boolean).length
+            : 0;
+          if (cached && cached.chineseContent && cachedParaCount < 600) {
+            setCurrentChapterIndex(targetIndex);
+            setChapterTitle(cached.chapterTitle || `Chapter ${targetIndex}`);
+            setChineseContent(cached.chineseContent);
+            setEnglishContent(cached.englishContent || "");
+            setIsLoadingChapter(false);
+            setIsDataSavedFromCache(true);
+            onUpdateChapterIndex?.(targetIndex, cached.chapterTitle || `Chapter ${targetIndex}`);
+            if (pendingTtsStartRef.current) {
+              pendingTtsStartRef.current = false;
+              setTimeout(() => speakParagraphAtIndex(0), 250);
+            }
+            return;
           }
-          return;
+        } catch (e) {
+          console.warn("IndexedDB cache check skipped:", e);
         }
-      } catch (e) {
-        console.warn("IndexedDB cache check skipped:", e);
       }
 
       // 3. Fetch from API if not in cache
@@ -1221,7 +1229,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           border: "border-zinc-800",
           navBg: "bg-[#09090b]/95",
           activeParagraph:
-            "bg-purple-950/40 text-purple-100 border-l-4 border-purple-500 pl-3.5 ring-1 ring-purple-500/20",
+            "bg-purple-900/40 text-purple-100 ring-1 ring-purple-500/30",
           playerBg: "bg-zinc-900/95 border-zinc-800 text-zinc-100",
           buttonBg: "bg-zinc-800 hover:bg-zinc-700 text-zinc-200",
         };
@@ -1233,7 +1241,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           border: "border-[#e6dbca]",
           navBg: "bg-[#fcf7ed]/95",
           activeParagraph:
-            "bg-[#f0e3cc] text-[#241a12] border-l-4 border-amber-600 pl-3.5 ring-1 ring-amber-500/20",
+            "bg-[#eedfc4] text-[#241a12] ring-1 ring-amber-600/30",
           playerBg: "bg-[#f5ecdc]/95 border-[#e2d5c0] text-[#2e261f]",
           buttonBg: "bg-[#eae0cd] hover:bg-[#dfd3bd] text-[#2e261f]",
         };
@@ -1245,7 +1253,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           border: "border-slate-800",
           navBg: "bg-[#0f172a]/95",
           activeParagraph:
-            "bg-sky-950/40 text-sky-100 border-l-4 border-sky-400 pl-3.5 ring-1 ring-sky-500/20",
+            "bg-sky-900/40 text-sky-100 ring-1 ring-sky-400/30",
           playerBg: "bg-slate-900/95 border-slate-800 text-slate-100",
           buttonBg: "bg-slate-800 hover:bg-slate-700 text-slate-200",
         };
@@ -1257,7 +1265,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           border: "border-slate-200",
           navBg: "bg-white/95",
           activeParagraph:
-            "bg-purple-50 text-slate-950 border-l-4 border-purple-600 pl-3.5 ring-1 ring-purple-300",
+            "bg-purple-100/90 text-purple-950 ring-1 ring-purple-300",
           playerBg: "bg-white/95 border-slate-200 text-slate-900 shadow-xl",
           buttonBg: "bg-slate-100 hover:bg-slate-200 text-slate-800",
         };
@@ -1270,7 +1278,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           border: "border-[#dfcca1]",
           navBg: "bg-[#fbf0d9]/95",
           activeParagraph:
-            "bg-[#ebd6a7] text-[#2c1d0f] border-l-4 border-amber-700 pl-3.5 ring-1 ring-amber-600/20",
+            "bg-[#ebd6a7] text-[#2c1d0f] ring-1 ring-amber-700/30",
           playerBg: "bg-[#f3e3be]/95 border-[#dec899] text-[#3f3123]",
           buttonBg: "bg-[#e8d5a8] hover:bg-[#ddc895] text-[#3f3123]",
         };
@@ -2414,7 +2422,29 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                     </div>
 
                     {singleChapterTranslateError && (
-                      <p className="text-rose-500 text-[11px] font-medium">{singleChapterTranslateError}</p>
+                      <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 flex flex-wrap items-center justify-between gap-2">
+                        <p className="text-rose-500 text-xs font-medium">{singleChapterTranslateError}</p>
+                        <button
+                          type="button"
+                          onClick={() => loadChapter(currentChapterIndex, true)}
+                          className="px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-600 dark:text-rose-400 text-xs font-semibold cursor-pointer transition"
+                        >
+                          Re-fetch Clean Chapter
+                        </button>
+                      </div>
+                    )}
+
+                    {displayParagraphs.length > 600 && (
+                      <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 flex flex-wrap items-center justify-between gap-2 text-amber-700 dark:text-amber-300 text-xs">
+                        <span>Notice: This chapter contains {displayParagraphs.length} paragraphs. Tap Re-fetch to reload with exact single chapter boundaries.</span>
+                        <button
+                          type="button"
+                          onClick={() => loadChapter(currentChapterIndex, true)}
+                          className="px-2.5 py-1 rounded-lg bg-amber-500/25 hover:bg-amber-500/35 font-bold cursor-pointer transition"
+                        >
+                          Re-fetch Boundaries
+                        </button>
+                      </div>
                     )}
                   </div>
                 )}

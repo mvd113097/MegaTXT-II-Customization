@@ -17,6 +17,7 @@ import {
   Heart,
   Flame,
   Calendar,
+  ThumbsUp,
 } from "lucide-react";
 
 export interface StoreSearchResult {
@@ -31,6 +32,7 @@ export interface StoreSearchResult {
   intro?: string;
   coverUrl?: string;
   likes?: number;
+  aiquLikes?: number;
   points?: number;
   year?: number;
   status?: string;
@@ -120,7 +122,7 @@ const STORE_STATE_KEY = "megatext_store_state_v2";
 interface SavedStoreState {
   query: string;
   selectedSite: string;
-  sortBy?: "likes" | "year" | "points" | "relevance";
+  sortBy?: "likes" | "aiquLikes" | "year" | "points" | "relevance";
   results: StoreSearchResult[];
   hasSearched: boolean;
   selectedNovel: StoreNovelDetail | null;
@@ -168,7 +170,7 @@ export const StoreView: React.FC<StoreViewProps> = ({
 
   const [query, setQuery] = useState<string>(savedState.query || "");
   const [selectedSite, setSelectedSite] = useState<string>(savedState.selectedSite || "all");
-  const [sortBy, setSortBy] = useState<"likes" | "year" | "points" | "relevance">(
+  const [sortBy, setSortBy] = useState<"likes" | "aiquLikes" | "year" | "points" | "relevance">(
     savedState.sortBy || "likes"
   );
   const [isSearching, setIsSearching] = useState(false);
@@ -425,6 +427,16 @@ export const StoreView: React.FC<StoreViewProps> = ({
         }
         return (b.year || 0) - (a.year || 0);
       });
+    } else if (sortBy === "aiquLikes") {
+      items.sort((a, b) => {
+        const diff = (b.aiquLikes || 0) - (a.aiquLikes || 0);
+        if (diff !== 0) return diff;
+        const lDiff = (b.likes || 0) - (a.likes || 0);
+        if (lDiff !== 0) return lDiff;
+        const pDiff = (b.points || 0) - (a.points || 0);
+        if (pDiff !== 0) return pDiff;
+        return (b.year || 0) - (a.year || 0);
+      });
     } else if (sortBy === "year") {
       items.sort((a, b) => (b.year || 0) - (a.year || 0));
     } else if (sortBy === "points") {
@@ -645,25 +657,38 @@ export const StoreView: React.FC<StoreViewProps> = ({
           </div>
 
           {/* Sorting Buttons */}
-          <div className="flex items-center gap-1.5">
-            <span className="text-slate-400 text-[11px] mr-1 hidden sm:inline">Sort by:</span>
+          <div className="flex items-center gap-1.5 overflow-x-auto py-1 max-w-full">
+            <span className="text-slate-400 text-[11px] mr-1 hidden sm:inline shrink-0">Sort by:</span>
             <button
               type="button"
               onClick={() => setSortBy("likes")}
-              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition cursor-pointer ${
+              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition shrink-0 cursor-pointer ${
                 sortBy === "likes"
                   ? "bg-rose-500 text-white shadow-xs font-bold"
                   : "bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 hover:border-rose-300"
               }`}
             >
               <Flame className="h-3 w-3" />
-              <span>Highest Likes</span>
+              <span>Summary Likes</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setSortBy("aiquLikes")}
+              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition shrink-0 cursor-pointer ${
+                sortBy === "aiquLikes"
+                  ? "bg-emerald-600 text-white shadow-xs font-bold"
+                  : "bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 hover:border-emerald-300"
+              }`}
+            >
+              <ThumbsUp className="h-3 w-3" />
+              <span>Aiqu Votes (赞)</span>
             </button>
 
             <button
               type="button"
               onClick={() => setSortBy("year")}
-              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition cursor-pointer ${
+              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition shrink-0 cursor-pointer ${
                 sortBy === "year"
                   ? "bg-indigo-600 text-white shadow-xs font-bold"
                   : "bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 hover:border-indigo-300"
@@ -676,7 +701,7 @@ export const StoreView: React.FC<StoreViewProps> = ({
             <button
               type="button"
               onClick={() => setSortBy("points")}
-              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition cursor-pointer ${
+              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition shrink-0 cursor-pointer ${
                 sortBy === "points"
                   ? "bg-amber-500 text-white shadow-xs font-bold"
                   : "bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 hover:border-amber-300"
@@ -689,7 +714,7 @@ export const StoreView: React.FC<StoreViewProps> = ({
             <button
               type="button"
               onClick={() => setSortBy("relevance")}
-              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition cursor-pointer ${
+              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition shrink-0 cursor-pointer ${
                 sortBy === "relevance"
                   ? "bg-purple-600 text-white shadow-xs font-bold"
                   : "bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 hover:border-purple-300"
@@ -825,8 +850,21 @@ export const StoreView: React.FC<StoreViewProps> = ({
                       </span>
                     )}
 
+                    {novel.aiquLikes !== undefined && novel.aiquLikes > 0 && (
+                      <span
+                        title={`Aiqu Site Votes: ${novel.aiquLikes.toLocaleString()} 赞`}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold border border-emerald-200/70 dark:border-emerald-900/40"
+                      >
+                        <ThumbsUp className="h-3 w-3 fill-emerald-400/30 text-emerald-600" />
+                        <span>{novel.aiquLikes.toLocaleString()} 赞</span>
+                      </span>
+                    )}
+
                     {novel.siteId !== "dmxs" && novel.likes !== undefined && novel.likes > 0 && (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-rose-50 dark:bg-rose-950/50 text-rose-700 dark:text-rose-300 text-[10px] font-bold border border-rose-200/70 dark:border-rose-900/40">
+                      <span
+                        title={`Summary Likes: ${formatLikes(novel.likes)}`}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-rose-50 dark:bg-rose-950/50 text-rose-700 dark:text-rose-300 text-[10px] font-bold border border-rose-200/70 dark:border-rose-900/40"
+                      >
                         <Heart className="h-3 w-3 fill-rose-400 text-rose-500" />
                         <span>{formatLikes(novel.likes)}</span>
                       </span>

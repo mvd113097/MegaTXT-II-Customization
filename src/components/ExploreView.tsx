@@ -33,6 +33,7 @@ import {
   Trash2,
   ChevronLeft,
   ChevronRight,
+  ThumbsUp,
 } from "lucide-react";
 import { ChapterItem, StoreNovelDetail } from "./StoreView";
 
@@ -51,6 +52,7 @@ export interface ExploreNovelItem {
   summary: string;
   points: number; // Authentic JJWXC work points or popularity score
   likes: number;
+  aiquLikes?: number; // Native Aiqu site forum upvotes (赞)
   wordCount?: number;
   status?: string;
   chapterCount?: number;
@@ -159,6 +161,7 @@ const POPULAR_TROPES = [
 
 const SORT_OPTIONS = [
   { id: "likes", label: "🔥 Most Popular / Likes", shortLabel: "Popular" },
+  { id: "aiquLikes", label: "👍 Aiqu Site Votes", shortLabel: "Aiqu Votes" },
   { id: "points", label: "⭐️ Highest Rating / Points", shortLabel: "Rating" },
   { id: "recent", label: "⏱️ Newest Release", shortLabel: "Recent" },
   { id: "chapters", label: "📚 Most Chapters / Words", shortLabel: "Chapters" },
@@ -232,10 +235,24 @@ export function getAugmentedCardTags(item: ExploreNovelItem): string[] {
 
 function sortNovelItems(
   list: ExploreNovelItem[],
-  sort: "points" | "likes" | "recent" | "chapters"
+  sort: "points" | "likes" | "aiquLikes" | "recent" | "chapters"
 ): ExploreNovelItem[] {
   const sorted = [...list];
-  if (sort === "likes") {
+  if (sort === "aiquLikes") {
+    sorted.sort((a, b) => {
+      const aVal = a.aiquLikes || 0;
+      const bVal = b.aiquLikes || 0;
+      if (bVal !== aVal) return bVal - aVal;
+      const aAiquId = parseInt((a.novelUrl || "").match(/txt-(\d+)/)?.[1] || "0", 10);
+      const bAiquId = parseInt((b.novelUrl || "").match(/txt-(\d+)/)?.[1] || "0", 10);
+      if (bAiquId !== aAiquId) return bAiquId - aAiquId;
+      const lDiff = (b.likes || 0) - (a.likes || 0);
+      if (lDiff !== 0) return lDiff;
+      const pDiff = (b.points || 0) - (a.points || 0);
+      if (pDiff !== 0) return pDiff;
+      return (b.year || 0) - (a.year || 0);
+    });
+  } else if (sort === "likes") {
     sorted.sort((a, b) => {
       const aVal = a.likes || 0;
       const bVal = b.likes || 0;
@@ -283,20 +300,231 @@ function sortNovelItems(
   return sorted;
 }
 
-// Module-level cache to preserve feed and scroll position when switching tabs or closing drawers
-let cachedFeedState: {
+// Module-level and localStorage persistence to preserve feed, pagination and filters across reloads
+const EXPLORE_PERSISTENCE_KEY = "megatext_explore_persisted_state_v2";
+
+interface PersistedFeedState {
   items: ExploreNovelItem[];
   page: number;
+  totalAvailable: number;
   filters: {
     site: string;
     year: string;
     orientation: string;
     tags: string[];
     query: string;
-    sort: "points" | "likes" | "recent" | "chapters";
+    sort: "points" | "likes" | "aiquLikes" | "recent" | "chapters";
   };
   scrollY: number;
-} | null = null;
+}
+
+function loadPersistedFeedState(): PersistedFeedState | null {
+  try {
+    const raw = localStorage.getItem(EXPLORE_PERSISTENCE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.page === "number" && parsed.filters) {
+        return parsed;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+let cachedFeedState: PersistedFeedState | null = loadPersistedFeedState();
+
+function savePersistedFeedState(state: PersistedFeedState | null) {
+  cachedFeedState = state;
+  try {
+    if (!state) {
+      localStorage.removeItem(EXPLORE_PERSISTENCE_KEY);
+    } else {
+      localStorage.setItem(EXPLORE_PERSISTENCE_KEY, JSON.stringify(state));
+    }
+  } catch (e) {
+    console.warn("Could not save explore state to localStorage:", e);
+  }
+}
+
+function syncExploreUrlAndStorage(
+  page: number,
+  site: string,
+  year: string,
+  orientation: string,
+  tags: string[],
+  sort: string,
+  query: string
+) {
+  if (typeof window !== "undefined") {
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set("tab", "explore");
+      url.searchParams.set("page", String(page));
+      if (site !== "all") url.searchParams.set("site", site); else url.searchParams.delete("site");
+      if (year !== "all") url.searchParams.set("year", year); else url.searchParams.delete("year");
+      if (orientation !== "all") url.searchParams.set("orientation", orientation); else url.searchParams.delete("orientation");
+      if (tags && tags.length > 0) url.searchParams.set("tags", tags.join(",")); else url.searchParams.delete("tags");
+      if (sort !== "likes") url.searchParams.set("sort", sort); else url.searchParams.delete("sort");
+      if (query && query.trim()) url.searchParams.set("q", query.trim()); else url.searchParams.delete("q");
+      window.history.replaceState(null, "", url.toString());
+    } catch {}
+  }
+}
+
+function getPageNumbers(current: number, total: number): (number | string)[] {
+  if (total <= 7) {
+    return Array.from({ length: total }, (_, i) => i + 1);
+  }
+  const pages: (number | string)[] = [];
+  if (current <= 3) {
+    for (let i = 1; i <= Math.min(4, total); i++) pages.push(i);
+    pages.push("...");
+    pages.push(total);
+  } else if (current >= total - 2) {
+    pages.push(1);
+    pages.push("...");
+    for (let i = total - 3; i <= total; i++) pages.push(i);
+  } else {
+    pages.push(1);
+    pages.push("...");
+    pages.push(current - 1);
+    pages.push(current);
+    pages.push(current + 1);
+    pages.push("...");
+    pages.push(total);
+  }
+  return pages;
+}
+
+interface PaginationControlsProps {
+  currentPage: number;
+  totalPages: number;
+  totalItems: number;
+  onPageChange: (newPage: number) => void;
+  isLoading: boolean;
+  position?: "top" | "bottom";
+}
+
+const PaginationControls: React.FC<PaginationControlsProps> = ({
+  currentPage,
+  totalPages,
+  totalItems,
+  onPageChange,
+  isLoading,
+  position = "bottom",
+}) => {
+  const [jumpInput, setJumpInput] = useState<string>("");
+
+  const pageNumbers = useMemo(() => {
+    return getPageNumbers(currentPage, totalPages);
+  }, [currentPage, totalPages]);
+
+  const handleJumpSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const val = parseInt(jumpInput, 10);
+    if (!isNaN(val) && val >= 1 && val <= totalPages) {
+      onPageChange(val);
+      setJumpInput("");
+    }
+  };
+
+  if (totalPages <= 1) return null;
+
+  return (
+    <div
+      className={`flex flex-wrap items-center justify-between gap-2.5 p-2.5 sm:p-3 rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white/95 dark:bg-slate-900/95 shadow-xs ${
+        position === "top" ? "mb-3" : "mt-4 mb-8"
+      }`}
+    >
+      {/* Summary info */}
+      <div className="flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
+        <Sparkles className="h-3.5 w-3.5 text-purple-500 shrink-0" />
+        <span>
+          Page <strong className="text-purple-600 dark:text-purple-400 font-bold">{currentPage}</strong> of{" "}
+          <strong className="text-slate-700 dark:text-slate-300 font-bold">{totalPages}</strong>{" "}
+          <span className="opacity-75">({totalItems.toLocaleString()} novels)</span>
+        </span>
+      </div>
+
+      {/* Prev / Numeric buttons / Next */}
+      <div className="flex items-center gap-1 overflow-x-auto no-scrollbar py-0.5">
+        <button
+          type="button"
+          onClick={() => onPageChange(currentPage - 1)}
+          disabled={currentPage <= 1 || isLoading}
+          title="Previous Page"
+          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-purple-50 dark:hover:bg-slate-700 disabled:opacity-40 disabled:pointer-events-none"
+        >
+          <ChevronLeft className="h-3.5 w-3.5" />
+          <span className="hidden sm:inline">Prev</span>
+        </button>
+
+        {pageNumbers.map((p, idx) => {
+          if (p === "...") {
+            return (
+              <span
+                key={`ellipsis-${position}-${idx}`}
+                className="px-1 text-xs text-slate-400 select-none font-bold"
+              >
+                •••
+              </span>
+            );
+          }
+          const num = Number(p);
+          const isActive = num === currentPage;
+          return (
+            <button
+              key={`page-${position}-${num}`}
+              type="button"
+              onClick={() => onPageChange(num)}
+              disabled={isLoading || isActive}
+              className={`min-w-[28px] h-7 px-2 rounded-lg text-xs font-bold transition cursor-pointer flex items-center justify-center ${
+                isActive
+                  ? "bg-purple-600 text-white shadow-xs pointer-events-none ring-2 ring-purple-400/40"
+                  : "bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-purple-100 dark:hover:bg-purple-950/50 hover:text-purple-700 dark:hover:text-purple-300"
+              }`}
+            >
+              {num}
+            </button>
+          );
+        })}
+
+        <button
+          type="button"
+          onClick={() => onPageChange(currentPage + 1)}
+          disabled={currentPage >= totalPages || isLoading}
+          title="Next Page"
+          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-purple-50 dark:hover:bg-slate-700 disabled:opacity-40 disabled:pointer-events-none"
+        >
+          <span className="hidden sm:inline">Next</span>
+          <ChevronRight className="h-3.5 w-3.5" />
+        </button>
+      </div>
+
+      {/* Quick Jumper */}
+      <form onSubmit={handleJumpSubmit} className="flex items-center gap-1 shrink-0">
+        <label className="text-[11px] font-medium text-slate-400 hidden md:inline">Go to:</label>
+        <input
+          type="number"
+          min={1}
+          max={totalPages}
+          value={jumpInput}
+          onChange={(e) => setJumpInput(e.target.value)}
+          placeholder={`1-${totalPages}`}
+          disabled={isLoading}
+          className="w-14 px-1.5 py-1 text-xs text-center rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:outline-hidden focus:ring-1 focus:ring-purple-500 disabled:opacity-50"
+        />
+        <button
+          type="submit"
+          disabled={isLoading || !jumpInput}
+          className="px-2.5 py-1 rounded-lg bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold transition cursor-pointer disabled:opacity-40 disabled:pointer-events-none"
+        >
+          Go
+        </button>
+      </form>
+    </div>
+  );
+};
 
 // Multi-query in-memory LRU client cache for instantaneous filter switching
 interface ClientExploreCacheEntry {
@@ -314,26 +542,43 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   onSearchStore,
   onOpenReader,
 }) => {
-  // Initialize state from module cache if available
-  const [selectedSite, setSelectedSite] = useState<string>(
-    cachedFeedState?.filters.site || "all"
+  // Read initial values from URL search params if present, else fallback to persisted feed state
+  const getInitialParam = (key: string, fallback: string) => {
+    if (typeof window !== "undefined") {
+      try {
+        const val = new URLSearchParams(window.location.search).get(key);
+        if (val) return val;
+      } catch {}
+    }
+    return fallback;
+  };
+
+  const [selectedSite, setSelectedSite] = useState<string>(() =>
+    getInitialParam("site", cachedFeedState?.filters.site || "all")
   );
-  const [selectedYear, setSelectedYear] = useState<string>(
-    cachedFeedState?.filters.year || "all"
+  const [selectedYear, setSelectedYear] = useState<string>(() =>
+    getInitialParam("year", cachedFeedState?.filters.year || "all")
   );
-  const [selectedOrientation, setSelectedOrientation] = useState<string>(
-    cachedFeedState?.filters.orientation || "all"
+  const [selectedOrientation, setSelectedOrientation] = useState<string>(() =>
+    getInitialParam("orientation", cachedFeedState?.filters.orientation || "all")
   );
-  const [selectedTags, setSelectedTags] = useState<string[]>(
-    cachedFeedState?.filters.tags || []
+  const [selectedTags, setSelectedTags] = useState<string[]>(() => {
+    const fromUrl = getInitialParam("tags", "");
+    if (fromUrl) return fromUrl.split(",").map((t) => t.trim()).filter(Boolean);
+    return cachedFeedState?.filters.tags || [];
+  });
+  const [searchQuery, setSearchQuery] = useState<string>(() =>
+    getInitialParam("q", cachedFeedState?.filters.query || "")
   );
-  const [searchQuery, setSearchQuery] = useState<string>(
-    cachedFeedState?.filters.query || ""
+  const [sortBy, setSortBy] = useState<"points" | "likes" | "aiquLikes" | "recent" | "chapters">(() =>
+    (getInitialParam("sort", cachedFeedState?.filters.sort || "likes") as any)
   );
-  const [sortBy, setSortBy] = useState<"points" | "likes" | "recent" | "chapters">(
-    cachedFeedState?.filters.sort || "likes"
-  );
-  const [page, setPage] = useState<number>(cachedFeedState?.page || 1);
+  const [page, setPage] = useState<number>(() => {
+    const pageStr = getInitialParam("page", "");
+    const parsed = parseInt(pageStr, 10);
+    if (!isNaN(parsed) && parsed >= 1) return parsed;
+    return cachedFeedState?.page || 1;
+  });
 
   // Data State
   const [items, setItems] = useState<ExploreNovelItem[]>(cachedFeedState?.items || []);
@@ -371,6 +616,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     }
   });
   const [showWishlistOnly, setShowWishlistOnly] = useState<boolean>(false);
+  const [wishlistPage, setWishlistPage] = useState<number>(1);
 
   const isWishlisted = (novel: ExploreNovelItem) => {
     return wishlist.some((w) => w.id === novel.id || (w.title === novel.title && w.author === novel.author));
@@ -401,7 +647,9 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   const [endChapter, setEndChapter] = useState<number>(100);
   const [isImporting, setIsImporting] = useState<boolean>(false);
   const [importProgress, setImportProgress] = useState<string>("");
-  const [totalAvailable, setTotalAvailable] = useState<number>(0);
+  const [totalAvailable, setTotalAvailable] = useState<number>(
+    cachedFeedState?.totalAvailable || 0
+  );
   const [hasMore, setHasMore] = useState<boolean>(true);
   const [activeImportItemId, setActiveImportItemId] = useState<string | null>(null);
   const [activeLoadingTocItemId, setActiveLoadingTocItemId] = useState<string | null>(null);
@@ -430,9 +678,10 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
 
   // Save feed cache on unmount or update
   useEffect(() => {
-    cachedFeedState = {
+    savePersistedFeedState({
       items,
       page,
+      totalAvailable,
       filters: {
         site: selectedSite,
         year: selectedYear,
@@ -441,9 +690,9 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
         query: searchQuery,
         sort: sortBy,
       },
-      scrollY: window.scrollY,
-    };
-  }, [items, page, selectedSite, selectedYear, selectedOrientation, selectedTags, searchQuery, sortBy]);
+      scrollY: typeof window !== "undefined" ? window.scrollY : 0,
+    });
+  }, [items, page, totalAvailable, selectedSite, selectedYear, selectedOrientation, selectedTags, searchQuery, sortBy]);
 
   // Restore scroll position when returning to explore tab
   useEffect(() => {
@@ -452,41 +701,37 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     }
   }, []);
 
-  // Filtered/Computed novel list (or wishlist)
+  // Filtered/Computed novel list (or wishlist with 20-per-page slicing)
   const displayItems = useMemo(() => {
-    const source = showWishlistOnly ? wishlist : items;
-    return sortNovelItems(source, sortBy);
-  }, [items, wishlist, showWishlistOnly, sortBy]);
-
-  // Toggle category in multi-select mode
-  const toggleTag = (tagId: string) => {
-    if (tagId === "all") {
-      setSelectedTags([]);
-      return;
+    if (showWishlistOnly) {
+      const sorted = sortNovelItems(wishlist, sortBy);
+      const start = (wishlistPage - 1) * 20;
+      return sorted.slice(start, start + 20);
     }
-    setSelectedTags((prev) => {
-      if (prev.includes(tagId)) {
-        return prev.filter((t) => t !== tagId);
-      } else {
-        return [...prev, tagId];
-      }
-    });
-  };
+    return sortNovelItems(items, sortBy);
+  }, [items, wishlist, showWishlistOnly, sortBy, wishlistPage]);
 
-  // Background prefetching ref to avoid duplicate prefetch calls
-  const prefetchedPages = useRef<Set<number>>(new Set());
+  // Total pages calculation (20 novels per page)
+  const totalPages = useMemo(() => {
+    if (showWishlistOnly) {
+      return Math.max(1, Math.ceil(wishlist.length / 20));
+    }
+    return Math.max(1, Math.ceil((totalAvailable || items.length || 20) / 20));
+  }, [showWishlistOnly, wishlist.length, totalAvailable, items.length]);
 
-  // Fetch explore collection with instant client cache & AbortController
+  const currentDisplayCount = showWishlistOnly ? wishlist.length : totalAvailable || items.length;
+  const currentActivePage = showWishlistOnly ? wishlistPage : page;
+
+  // Fetch explore collection with instant client cache & AbortController (20 books per discrete page)
   const fetchExploreFeed = async (
     pageIdx = 1,
-    append = false,
     overrideFilters?: {
       site?: string;
       year?: string;
       orientation?: string;
       tags?: string[];
       query?: string;
-      sort?: "points" | "likes" | "recent" | "chapters";
+      sort?: "points" | "likes" | "aiquLikes" | "recent" | "chapters";
     }
   ) => {
     setHasSearched(true);
@@ -497,12 +742,15 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     const query = overrideFilters?.query ?? searchQuery;
     const sort = overrideFilters?.sort ?? sortBy;
 
+    // Sync URL parameters and local storage immediately
+    syncExploreUrlAndStorage(pageIdx, site, year, orientation, tags, sort, query);
+
     const cacheKey = `c:${site}:${year}:${orientation}:${tags.slice().sort().join(",")}:${query.trim().toLowerCase()}:${sort}:${pageIdx}`;
     const cached = clientExploreCache.get(cacheKey);
     const now = Date.now();
 
     // 1. Instant cache hit
-    if (!append && cached && now - cached.timestamp < CLIENT_CACHE_TTL_MS) {
+    if (cached && now - cached.timestamp < CLIENT_CACHE_TTL_MS) {
       setItems(sortNovelItems(cached.items, sort));
       setTotalAvailable(cached.total);
       setHasMore(cached.hasMore);
@@ -510,6 +758,13 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
       setIsLoading(false);
       setIsLoadingMore(false);
       setErrorMessage(null);
+      savePersistedFeedState({
+        items: cached.items,
+        filters: { site, year, orientation, tags, query, sort },
+        page: pageIdx,
+        totalAvailable: cached.total,
+        scrollY: 0,
+      });
       return;
     }
 
@@ -520,16 +775,10 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     const controller = new AbortController();
     activeAbortControllerRef.current = controller;
 
-    if (append) {
-      setIsLoadingMore(true);
-    } else {
-      setIsLoading(true);
-      prefetchedPages.current.clear();
-      // Keep existing items if available so UI doesn't violently flicker, while setting isLoading indicator
-    }
+    setIsLoading(true);
     setErrorMessage(null);
 
-    // 22-second client safety timeout for deep multi-page crawling
+    // 22-second client safety timeout
     const timeoutId = setTimeout(() => {
       controller.abort();
     }, 22000);
@@ -544,6 +793,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
         q: query,
         sort,
         page: String(pageIdx),
+        pageSize: "20",
       });
 
       const res = await fetch(`/api/store/explore?${params.toString()}`, {
@@ -575,22 +825,12 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
 
       const data = await res.json();
       const newItems: ExploreNovelItem[] = data.items || [];
-      const totalCount = data.total ?? newItems.length;
-      const moreAvailable = data.hasMore ?? (newItems.length === 50);
+      const totalCount = data.total ?? (newItems.length > 0 ? 500 : 0);
+      const moreAvailable = data.hasMore ?? (newItems.length === 20);
 
       setTotalAvailable(totalCount);
       setHasMore(moreAvailable);
-
-      if (append) {
-        setItems((prev) => {
-          const seen = new Set(prev.map((i) => `${i.title}_${i.author}`));
-          const filtered = newItems.filter((i) => !seen.has(`${i.title}_${i.author}`));
-          const combined = [...prev, ...filtered];
-          return sortNovelItems(combined, sort);
-        });
-      } else {
-        setItems(sortNovelItems(newItems, sort));
-      }
+      setItems(sortNovelItems(newItems, sort));
       setPage(pageIdx);
 
       // Save to client cache
@@ -601,19 +841,17 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
         timestamp: now,
       });
 
-      // Save to module state
-      if (!append && newItems.length > 0) {
-        cachedFeedState = {
-          items: newItems,
-          filters: { site, year, orientation, tags, query, sort },
-          page: pageIdx,
-          scrollY: typeof window !== "undefined" ? window.scrollY : 0,
-        };
-      }
+      // Save to persistent storage
+      savePersistedFeedState({
+        items: newItems,
+        filters: { site, year, orientation, tags, query, sort },
+        page: pageIdx,
+        totalAvailable: totalCount,
+        scrollY: 0,
+      });
     } catch (err: any) {
       clearTimeout(timeoutId);
       if (err.name === "AbortError") {
-        // Request was aborted by user filter switch or timeout
         return;
       }
       console.error("Explore feed fetch error:", err);
@@ -628,30 +866,84 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     }
   };
 
-  // Auto-load 2026 explore feed on initial mount if empty
-  useEffect(() => {
-    if (!cachedFeedState && items.length === 0 && !hasSearched) {
-      fetchExploreFeed(1, false);
+  // Filter handlers - update selection state only; search executes on Search button click or page change
+  const handleSelectSite = (siteId: string) => {
+    setSelectedSite(siteId);
+    if ((siteId === "aiqu226" || siteId === "52shuku" || siteId === "fuxsb") && sortBy === "points") {
+      setSortBy("likes");
     }
-  }, []);
-
-  // Restore scroll position or state if returning to Explore tab
-  useEffect(() => {
-    if (cachedFeedState && cachedFeedState.items.length > 0) {
-      setHasSearched(true);
-    }
-  }, []);
-
-  // Load More Handler
-  const handleLoadMore = () => {
-    if (isLoadingMore || isLoading || !hasMore) return;
-    fetchExploreFeed(page + 1, true);
   };
 
+  const handleSelectYear = (yearId: string) => {
+    setSelectedYear(yearId);
+  };
+
+  const handleSelectOrientation = (oriId: string) => {
+    setSelectedOrientation(oriId);
+  };
+
+  const handleToggleTag = (tagId: string) => {
+    if (tagId === "all") {
+      setSelectedTags([]);
+      return;
+    }
+    setSelectedTags((prev) => {
+      if (prev.includes(tagId)) {
+        return prev.filter((t) => t !== tagId);
+      } else {
+        return [...prev, tagId];
+      }
+    });
+  };
+
+  const handleSelectSort = (sortId: "points" | "likes" | "aiquLikes" | "recent" | "chapters") => {
+    if (sortId === sortBy && items.length > 0) return;
+    setSortBy(sortId);
+    setPage(1);
+    fetchExploreFeed(1, { sort: sortId });
+  };
+
+  const handlePageChange = (newPage: number) => {
+    const maxP = totalPages;
+    const target = Math.max(1, Math.min(newPage, maxP));
+    if (showWishlistOnly) {
+      setWishlistPage(target);
+    } else {
+      if (target === page && items.length > 0) return;
+      fetchExploreFeed(target);
+    }
+    if (typeof window !== "undefined") {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  };
+
+  // Auto-load explore feed on initial mount only if active query/filters are specified in URL
+  useEffect(() => {
+    const hasActiveFilters =
+      selectedSite !== "all" ||
+      selectedYear !== "all" ||
+      selectedOrientation !== "all" ||
+      selectedTags.length > 0 ||
+      searchQuery.trim().length > 0 ||
+      page > 1;
+
+    if (items.length === 0 && !hasSearched && hasActiveFilters) {
+      fetchExploreFeed(page, {
+        site: selectedSite,
+        year: selectedYear,
+        orientation: selectedOrientation,
+        tags: selectedTags,
+        query: searchQuery,
+        sort: sortBy,
+      });
+    }
+  }, []);
+
   // Handle manual keyword search execution
-  const handleKeywordSearch = (e: React.FormEvent) => {
-    e.preventDefault();
-    fetchExploreFeed(1, false);
+  const handleKeywordSearch = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setPage(1);
+    fetchExploreFeed(1);
   };
 
   const toggleSummary = (id: string) => {
@@ -1024,8 +1316,12 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     );
   };
 
-  // Reset all filters
+  // Reset all filters and clear all results
   const handleResetFilters = () => {
+    if (activeAbortControllerRef.current) {
+      activeAbortControllerRef.current.abort();
+      activeAbortControllerRef.current = null;
+    }
     setSelectedSite("all");
     setSelectedYear("all");
     setSelectedOrientation("all");
@@ -1033,14 +1329,35 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     setSearchQuery("");
     setSortBy("likes");
     setShowWishlistOnly(false);
+    setWishlistPage(1);
+    setPage(1);
     setItems([]);
+    setTotalAvailable(0);
     setHasSearched(false);
     setIsLoading(false);
+    setIsLoadingMore(false);
+    setErrorMessage(null);
     cachedFeedState = null;
+    try {
+      localStorage.removeItem(EXPLORE_PERSISTENCE_KEY);
+      const url = new URL(window.location.href);
+      url.searchParams.set("tab", "explore");
+      url.searchParams.delete("page");
+      url.searchParams.delete("site");
+      url.searchParams.delete("year");
+      url.searchParams.delete("orientation");
+      url.searchParams.delete("tags");
+      url.searchParams.delete("sort");
+      url.searchParams.delete("q");
+      window.history.replaceState(null, "", url.toString());
+    } catch {}
   };
 
   return (
-    <div className="w-full max-w-5xl mx-auto px-3 sm:px-4 py-4 pb-24 text-slate-800 dark:text-slate-100 transition-colors">
+    <div
+      className="w-full max-w-5xl mx-auto px-3 sm:px-4 py-4 pb-24 text-slate-800 dark:text-slate-100 transition-colors"
+      style={{ overscrollBehaviorY: "contain" }}
+    >
       {/* Streamlined Header Bar */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
         <div className="flex items-center gap-2.5">
@@ -1065,7 +1382,10 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
           {/* Wishlist / Reading List Filter Button */}
           <button
             type="button"
-            onClick={() => setShowWishlistOnly(!showWishlistOnly)}
+            onClick={() => {
+              setShowWishlistOnly(!showWishlistOnly);
+              setWishlistPage(1);
+            }}
             className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition cursor-pointer border ${
               showWishlistOnly
                 ? "bg-rose-500 text-white border-rose-600 shadow-sm"
@@ -1139,9 +1459,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
           {searchQuery && (
             <button
               type="button"
-              onClick={() => {
-                setSearchQuery("");
-              }}
+              onClick={() => setSearchQuery("")}
               className="absolute right-16 p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer"
             >
               <X className="h-4 w-4" />
@@ -1167,14 +1485,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                 <button
                   key={st.id}
                   type="button"
-                  onClick={() => {
-                    setSelectedSite(st.id);
-                    if (st.id === "aiqu226" || st.id === "52shuku" || st.id === "fuxsb") {
-                      if (sortBy === "points") {
-                        setSortBy("likes");
-                      }
-                    }
-                  }}
+                  onClick={() => handleSelectSite(st.id)}
                   className={`px-2.5 py-1 rounded-lg text-xs font-medium whitespace-nowrap transition cursor-pointer ${
                     active
                       ? "bg-purple-600 text-white font-bold shadow-xs"
@@ -1195,9 +1506,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                 <button
                   key={yr.id}
                   type="button"
-                  onClick={() => {
-                    setSelectedYear(yr.id);
-                  }}
+                  onClick={() => handleSelectYear(yr.id)}
                   className={`px-2 py-1 rounded-lg text-xs font-medium whitespace-nowrap transition cursor-pointer ${
                     active
                       ? "bg-purple-600 text-white font-bold shadow-xs"
@@ -1211,71 +1520,63 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
           </div>
         </div>
 
-        {/* Row 3: Pairing Filter, Expandable Tropes Toggle, Sort Selector, and Search Action */}
-        <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
-          <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar py-0.5">
-            <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mr-1">Pairing:</span>
-            {ORIENTATION_OPTIONS.map((ori) => {
-              const active = selectedOrientation === ori.id;
-              return (
-                <button
-                  key={ori.id}
-                  type="button"
-                  onClick={() => {
-                    setSelectedOrientation(ori.id);
-                  }}
-                  className={`px-3 py-1 rounded-full text-xs font-medium whitespace-nowrap transition cursor-pointer ${
-                    active
-                      ? "bg-purple-600 text-white font-bold shadow-xs"
-                      : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-purple-50 dark:hover:bg-slate-700"
-                  }`}
-                >
-                  {ori.label}
-                </button>
-              );
-            })}
+        {/* Row 3: Pairing Filter & Expandable Tropes Toggle */}
+        <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar py-0.5 pt-1.5 border-t border-slate-100 dark:border-slate-800">
+          <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mr-1">Pairing:</span>
+          {ORIENTATION_OPTIONS.map((ori) => {
+            const active = selectedOrientation === ori.id;
+            return (
+              <button
+                key={ori.id}
+                type="button"
+                onClick={() => handleSelectOrientation(ori.id)}
+                className={`px-2.5 py-1 rounded-lg text-xs font-medium whitespace-nowrap transition cursor-pointer ${
+                  active
+                    ? "bg-purple-600 text-white font-bold shadow-xs"
+                    : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-purple-50 dark:hover:bg-slate-700"
+                }`}
+              >
+                {ori.label}
+              </button>
+            );
+          })}
 
-            {/* Expandable Tropes Button */}
-            <button
-              type="button"
-              onClick={() => setShowTropesDrawer(!showTropesDrawer)}
-              className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-bold whitespace-nowrap transition cursor-pointer border ${
-                showTropesDrawer || selectedTags.length > 0
-                  ? "bg-amber-500 text-white border-amber-600 shadow-xs"
-                  : "bg-purple-50 dark:bg-purple-950/50 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-800 hover:bg-purple-100"
-              }`}
-            >
-              <Tag className="h-3 w-3" />
-              <span>Tropes {selectedTags.length > 0 ? `(${selectedTags.length})` : ""}</span>
-              {showTropesDrawer ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-            </button>
-          </div>
+          {/* Expandable Tropes Button */}
+          <button
+            type="button"
+            onClick={() => setShowTropesDrawer(!showTropesDrawer)}
+            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold whitespace-nowrap transition cursor-pointer border ${
+              showTropesDrawer || selectedTags.length > 0
+                ? "bg-amber-500 text-white border-amber-600 shadow-xs"
+                : "bg-purple-50 dark:bg-purple-950/50 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-800 hover:bg-purple-100"
+            }`}
+          >
+            <Tag className="h-3 w-3" />
+            <span>Tropes {selectedTags.length > 0 ? `(${selectedTags.length})` : ""}</span>
+            {showTropesDrawer ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+          </button>
+        </div>
 
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Sort:</span>
-            <div className="flex items-center gap-1">
-              {SORT_OPTIONS.map((opt) => {
-                const active = sortBy === opt.id;
-                return (
-                  <button
-                    key={opt.id}
-                    type="button"
-                    onClick={() => {
-                      setSortBy(opt.id as any);
-                      setItems((prev) => sortNovelItems(prev, opt.id as any));
-                    }}
-                    className={`px-2 py-0.8 rounded-md text-xs font-semibold transition cursor-pointer ${
-                      active
-                        ? "bg-purple-600 text-white font-bold"
-                        : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-200"
-                    }`}
-                  >
-                    {opt.shortLabel}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
+        {/* Row 4: Sort Selector */}
+        <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar py-0.5 pt-1.5 border-t border-slate-100 dark:border-slate-800">
+          <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mr-1">Sort:</span>
+          {SORT_OPTIONS.map((opt) => {
+            const active = sortBy === opt.id;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => handleSelectSort(opt.id as any)}
+                className={`px-2.5 py-1 rounded-lg text-xs font-medium whitespace-nowrap transition cursor-pointer ${
+                  active
+                    ? "bg-purple-600 text-white font-bold shadow-xs"
+                    : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-purple-50 dark:hover:bg-slate-700"
+                }`}
+              >
+                {opt.shortLabel}
+              </button>
+            );
+          })}
         </div>
 
         {/* Collapsible Tropes Panel */}
@@ -1288,9 +1589,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
               {selectedTags.length > 0 && (
                 <button
                   type="button"
-                  onClick={() => {
-                    setSelectedTags([]);
-                  }}
+                  onClick={() => setSelectedTags([])}
                   className="text-xs text-purple-600 dark:text-purple-400 font-semibold hover:underline cursor-pointer"
                 >
                   Clear All ({selectedTags.length})
@@ -1305,17 +1604,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                   <button
                     key={t.id}
                     type="button"
-                    onClick={() => {
-                      let nextTags: string[] = [];
-                      if (t.id === "all") {
-                        nextTags = [];
-                      } else if (selectedTags.includes(t.id)) {
-                        nextTags = selectedTags.filter((x) => x !== t.id);
-                      } else {
-                        nextTags = [...selectedTags, t.id];
-                      }
-                      setSelectedTags(nextTags);
-                    }}
+                    onClick={() => handleToggleTag(t.id)}
                     className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition cursor-pointer ${
                       active
                         ? isAll
@@ -1340,7 +1629,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
           <div className="flex items-center gap-2">
             <span>{errorMessage}</span>
             <button
-              onClick={() => fetchExploreFeed(1, false)}
+              onClick={() => fetchExploreFeed(1)}
               className="underline font-bold hover:text-rose-900 dark:hover:text-rose-100 cursor-pointer ml-1"
             >
               Retry Search
@@ -1385,17 +1674,21 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
 
           {/* Results Count Banner */}
           {!isLoading && displayItems.length > 0 && (
-            <div className="flex items-center justify-between mb-3 px-1 text-xs text-slate-500 dark:text-slate-400 font-medium">
+            <div className="flex items-center justify-between px-1 mb-3 text-xs text-slate-500 dark:text-slate-400 font-medium">
               <div className="flex items-center gap-1.5">
                 <Sparkles className="h-3.5 w-3.5 text-purple-500" />
-                <span>Found <strong className="text-purple-600 dark:text-purple-400 font-bold">{displayItems.length}</strong> books</span>
+                <span>
+                  Found <strong className="text-purple-600 dark:text-purple-400 font-bold">{currentDisplayCount.toLocaleString()}</strong> novels
+                </span>
               </div>
-              {page > 1 && <span className="text-[11px] opacity-75">Page {page}</span>}
+              <span className="text-[11px] text-slate-400">
+                Page {currentActivePage} of {totalPages}
+              </span>
             </div>
           )}
 
-          {/* Empty Feed State */}
-          {!isLoading && displayItems.length === 0 && (
+          {/* Empty Feed State - ONLY shown after user has searched or when viewing reading list */}
+          {!isLoading && displayItems.length === 0 && (hasSearched || showWishlistOnly) && (
             <div className="text-center py-16 bg-white dark:bg-slate-900 rounded-2xl border border-dashed border-slate-200 dark:border-slate-800 p-8">
               <BookOpen className="h-10 w-10 text-slate-300 dark:text-slate-600 mx-auto mb-3" />
               <h3 className="text-sm font-bold text-slate-700 dark:text-slate-300">
@@ -1426,6 +1719,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
               {displayItems.map((item, index) => {
                 const isJjwxc = item.siteId === "jjwxc";
                 const bookmarked = isWishlisted(item);
+                const rankNum = (currentActivePage - 1) * 20 + index + 1;
 
                 return (
                   <div
@@ -1433,8 +1727,8 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                     className="p-3 sm:px-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-purple-50/40 dark:hover:bg-slate-800/50 transition-colors"
                   >
                     <div className="flex items-start gap-2.5 min-w-0 flex-1">
-                      <span className="shrink-0 inline-flex h-5 w-6 items-center justify-center rounded-md bg-purple-100 dark:bg-purple-900/60 text-[10px] font-bold text-purple-700 dark:text-purple-300 mt-0.5">
-                        #{index + 1}
+                      <span className="shrink-0 inline-flex h-5 min-w-[24px] px-1 items-center justify-center rounded-md bg-purple-100 dark:bg-purple-900/60 text-[10px] font-bold text-purple-700 dark:text-purple-300 mt-0.5">
+                        #{rankNum}
                       </span>
 
                       <div className="min-w-0 flex-1">
@@ -1480,6 +1774,15 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300 text-[11px] font-bold border border-amber-200/60 dark:border-amber-900/40">
                             <Star className="h-3 w-3 fill-amber-400 text-amber-500" />
                             <span>{formatDisplayPoints(item.points)}</span>
+                          </span>
+                        )}
+                        {item.aiquLikes !== undefined && item.aiquLikes > 0 && (
+                          <span
+                            title={`Aiqu Site Votes: ${item.aiquLikes.toLocaleString()} 赞`}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 text-[11px] font-bold border border-emerald-200/60 dark:border-emerald-900/40"
+                          >
+                            <ThumbsUp className="h-3 w-3 fill-emerald-400/40 text-emerald-600" />
+                            <span>{item.aiquLikes.toLocaleString()} 赞</span>
                           </span>
                         )}
                         {item.likes !== undefined && item.likes > 0 && (
@@ -1558,111 +1861,118 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
               const isJjwxc = item.siteId === "jjwxc";
               const bookmarked = isWishlisted(item);
               const cardTags = getAugmentedCardTags(item);
+              const rankNum = (currentActivePage - 1) * 20 + index + 1;
 
               return (
                 <div
                   key={item.id || index}
                   className="group relative bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-3.5 sm:p-4 shadow-xs hover:shadow-md hover:border-purple-300 dark:hover:border-purple-600/60 transition-all duration-200"
                 >
-                  {/* Top Row: Rank, Badges, Metrics & Bookmark Ribbon */}
-                  <div className="flex flex-wrap items-center justify-between gap-1.5 mb-2.5">
-                    <div className="flex flex-wrap items-center gap-1.5 min-w-0">
-                      <span className="inline-flex h-5 min-w-[20px] px-1.5 items-center justify-center rounded-md bg-purple-100 dark:bg-purple-900/60 text-[10px] font-bold text-purple-700 dark:text-purple-300">
-                        #{index + 1}
-                      </span>
+                  {/* Bookmark Button - Pinned cleanly inside the card's top-right corner */}
+                  <button
+                    type="button"
+                    onClick={() => toggleWishlist(item)}
+                    title={bookmarked ? "Remove from Reading List" : "Save to Reading List"}
+                    className={`absolute top-3 right-3 sm:top-3.5 sm:right-3.5 p-1.5 rounded-lg border transition-all z-10 cursor-pointer ${
+                      bookmarked
+                        ? "text-rose-600 bg-rose-50 border-rose-200 dark:bg-rose-950/60 dark:border-rose-800"
+                        : "text-slate-400 bg-slate-50/80 border-slate-200/80 hover:text-rose-500 hover:bg-slate-100 dark:bg-slate-800/80 dark:border-slate-700 dark:hover:bg-slate-700"
+                    }`}
+                  >
+                    <Bookmark className={`h-4 w-4 ${bookmarked ? "fill-rose-500 text-rose-500" : ""}`} />
+                  </button>
 
+                  {/* Top Row: Rank, Badges, & Metrics (with right padding so it never overlaps bookmark) */}
+                  <div className="flex flex-wrap items-center gap-1.5 mb-2.5 pr-9">
+                    <span className="inline-flex h-5 min-w-[24px] px-1.5 items-center justify-center rounded-md bg-purple-100 dark:bg-purple-900/60 text-[10px] font-bold text-purple-700 dark:text-purple-300">
+                      #{rankNum}
+                    </span>
+
+                    <span
+                      className={`inline-flex items-center px-1.5 py-0.5 rounded-md text-[10px] font-semibold ${
+                        isJjwxc
+                          ? "bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800"
+                          : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200/60 dark:border-slate-700"
+                      }`}
+                    >
+                      {formatCleanSiteName(item.siteId, item.siteName)}
+                    </span>
+
+                    <span
+                      className={`inline-flex items-center px-1.5 py-0.5 rounded-md text-[10px] font-semibold border ${
+                        item.orientation === "bl"
+                          ? "bg-pink-50 dark:bg-pink-950/60 text-pink-700 dark:text-pink-300 border-pink-200 dark:border-pink-900/40"
+                          : item.orientation === "het"
+                          ? "bg-purple-50 dark:bg-purple-950/60 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-900/40"
+                          : "bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-900/40"
+                      }`}
+                    >
+                      {item.orientationLabel}
+                    </span>
+
+                    {item.status && (
                       <span
-                        className={`inline-flex items-center px-1.5 py-0.5 rounded-md text-[10px] font-semibold ${
-                          isJjwxc
-                            ? "bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800"
-                            : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200/60 dark:border-slate-700"
+                        className={`inline-flex items-center px-1.5 py-0.5 rounded-md text-[10px] font-bold border ${
+                          item.status.includes("完结")
+                            ? "bg-emerald-50 dark:bg-emerald-950/70 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800"
+                            : "bg-blue-50 dark:bg-blue-950/70 text-blue-700 dark:text-blue-300 border-blue-200 dark:border-blue-800"
                         }`}
                       >
-                        {formatCleanSiteName(item.siteId, item.siteName)}
+                        {item.status === "完结" ? "✅ 完结" : item.status}
                       </span>
+                    )}
 
+                    {formatDisplayWordCount(item) && (
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-[10px] font-medium text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
+                        📝 {formatDisplayWordCount(item)}
+                      </span>
+                    )}
+
+                    <span className="inline-flex items-center px-1.5 py-0.5 rounded-md bg-indigo-50 dark:bg-indigo-950/60 text-[10px] font-semibold text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-900/40">
+                      📅 {item.year}
+                    </span>
+
+                    {/* Metric Badges */}
+                    {item.rating !== undefined && item.rating > 0 && (
                       <span
-                        className={`inline-flex items-center px-1.5 py-0.5 rounded-md text-[10px] font-semibold border ${
-                          item.orientation === "bl"
-                            ? "bg-pink-50 dark:bg-pink-950/60 text-pink-700 dark:text-pink-300 border-pink-200 dark:border-pink-900/40"
-                            : item.orientation === "het"
-                            ? "bg-purple-50 dark:bg-purple-950/60 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-900/40"
-                            : "bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-900/40"
-                        }`}
+                        title={`Rating: ${item.rating.toFixed(1)} / 5.0 (${item.ratingCount || 1} votes)`}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300 text-[10px] font-bold border border-amber-200/70 dark:border-amber-900/40"
                       >
-                        {item.orientationLabel}
+                        <Star className="h-3 w-3 fill-amber-400 text-amber-500" />
+                        <span>{item.rating.toFixed(1)} ★</span>
+                        {item.ratingCount ? <span className="text-[9px] opacity-75">({item.ratingCount})</span> : null}
                       </span>
+                    )}
 
-                      {item.status && (
-                        <span
-                          className={`inline-flex items-center px-1.5 py-0.5 rounded-md text-[10px] font-bold border ${
-                            item.status.includes("完结")
-                              ? "bg-emerald-50 dark:bg-emerald-950/70 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800"
-                              : "bg-blue-50 dark:bg-blue-950/70 text-blue-700 dark:text-blue-300 border-blue-200 dark:border-blue-800"
-                          }`}
-                        >
-                          {item.status === "完结" ? "✅ 完结" : item.status}
-                        </span>
-                      )}
-
-                      {formatDisplayWordCount(item) && (
-                        <span className="inline-flex items-center px-1.5 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-[10px] font-medium text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
-                          📝 {formatDisplayWordCount(item)}
-                        </span>
-                      )}
-
-                      <span className="inline-flex items-center px-1.5 py-0.5 rounded-md bg-indigo-50 dark:bg-indigo-950/60 text-[10px] font-semibold text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-900/40">
-                        📅 {item.year}
-                      </span>
-                    </div>
-
-                    {/* Right side: Score & Bookmark */}
-                    <div className="flex items-center gap-2 shrink-0">
-                      {item.rating !== undefined && item.rating > 0 && (
-                        <span
-                          title={`Rating: ${item.rating.toFixed(1)} / 5.0 (${item.ratingCount || 1} votes)`}
-                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300 text-[10px] font-bold border border-amber-200/70 dark:border-amber-900/40"
-                        >
-                          <Star className="h-3 w-3 fill-amber-400 text-amber-500" />
-                          <span>{item.rating.toFixed(1)} ★</span>
-                          {item.ratingCount ? <span className="text-[9px] opacity-75">({item.ratingCount})</span> : null}
-                        </span>
-                      )}
-
-                      {item.points !== undefined && item.points > 0 && (
-                        <span
-                          title={`Official JJWXC Points: ${item.points.toLocaleString()}`}
-                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300 text-[10px] font-bold border border-amber-200/70 dark:border-amber-900/40"
-                        >
-                          <Star className="h-3 w-3 fill-amber-400 text-amber-500" />
-                          <span>{formatDisplayPoints(item.points)}</span>
-                        </span>
-                      )}
-
-                      {item.likes !== undefined && item.likes > 0 && (
-                        <span
-                          title={`Likes / Bookmarks: ${item.likes.toLocaleString()}`}
-                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-pink-50 dark:bg-pink-950/50 text-pink-700 dark:text-pink-300 text-[10px] font-bold border border-pink-200/70 dark:border-pink-900/40"
-                        >
-                          <Heart className="h-3 w-3 fill-pink-500 text-pink-500" />
-                          <span>{formatDisplayLikes(item.likes)}</span>
-                        </span>
-                      )}
-
-                      {/* Bookmark button */}
-                      <button
-                        type="button"
-                        onClick={() => toggleWishlist(item)}
-                        title={bookmarked ? "Remove from Reading List" : "Save to Reading List"}
-                        className={`p-1 rounded-md transition cursor-pointer ${
-                          bookmarked
-                            ? "text-rose-500 bg-rose-50 dark:bg-rose-950/50 hover:bg-rose-100"
-                            : "text-slate-400 hover:text-rose-500 hover:bg-slate-100 dark:hover:bg-slate-800"
-                        }`}
+                    {item.points !== undefined && item.points > 0 && (
+                      <span
+                        title={`Official JJWXC Points: ${item.points.toLocaleString()}`}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300 text-[10px] font-bold border border-amber-200/70 dark:border-amber-900/40"
                       >
-                        <Bookmark className={`h-4 w-4 ${bookmarked ? "fill-rose-500" : ""}`} />
-                      </button>
-                    </div>
+                        <Star className="h-3 w-3 fill-amber-400 text-amber-500" />
+                        <span>{formatDisplayPoints(item.points)}</span>
+                      </span>
+                    )}
+
+                    {item.aiquLikes !== undefined && item.aiquLikes > 0 && (
+                      <span
+                        title={`Aiqu Site Votes: ${item.aiquLikes.toLocaleString()} 赞`}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold border border-emerald-200/70 dark:border-emerald-900/40"
+                      >
+                        <ThumbsUp className="h-3 w-3 fill-emerald-400/40 text-emerald-600" />
+                        <span>{item.aiquLikes.toLocaleString()} 赞</span>
+                      </span>
+                    )}
+
+                    {item.likes !== undefined && item.likes > 0 && (
+                      <span
+                        title={`Likes / Bookmarks: ${item.likes.toLocaleString()}`}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-pink-50 dark:bg-pink-950/50 text-pink-700 dark:text-pink-300 text-[10px] font-bold border border-pink-200/70 dark:border-pink-900/40"
+                      >
+                        <Heart className="h-3 w-3 fill-pink-500 text-pink-500" />
+                        <span>{formatDisplayLikes(item.likes)}</span>
+                      </span>
+                    )}
                   </div>
 
                   {/* Title & Author */}
@@ -1827,33 +2137,21 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
             })
           )}
 
-          {/* Load More Button */}
-          {!showWishlistOnly && (
-            <div className="text-center pt-4 pb-8 flex flex-col items-center gap-2">
+          {/* Bottom Pagination & Page Summary */}
+          {totalPages > 1 && (
+            <div className="pt-4 pb-8 flex flex-col items-center gap-3">
+              <PaginationControls
+                currentPage={currentActivePage}
+                totalPages={totalPages}
+                totalItems={currentDisplayCount}
+                onPageChange={handlePageChange}
+                isLoading={isLoading}
+                position="bottom"
+              />
               <p className="text-xs text-slate-400">
-                Showing <strong className="text-purple-600 dark:text-purple-400">{displayItems.length}</strong> of{" "}
-                <strong className="text-purple-600 dark:text-purple-400">{totalAvailable || displayItems.length}</strong> novels
+                Showing page <strong className="text-purple-600 dark:text-purple-400 font-bold">{currentActivePage}</strong> of{" "}
+                <strong className="text-purple-600 dark:text-purple-400 font-bold">{totalPages}</strong> ({currentDisplayCount} total novels)
               </p>
-              {hasMore && (
-                <button
-                  type="button"
-                  onClick={handleLoadMore}
-                  disabled={isLoadingMore}
-                  className="inline-flex items-center gap-2 px-5 py-2 rounded-xl bg-purple-50 dark:bg-slate-800 border border-purple-200 dark:border-purple-800 hover:bg-purple-100 dark:hover:bg-slate-700 text-purple-700 dark:text-purple-300 text-xs font-semibold shadow-xs transition cursor-pointer"
-                >
-                  {isLoadingMore ? (
-                    <>
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>Loading Next 50 Novels...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Compass className="h-4 w-4" />
-                      <span>Load Next 50 Novels</span>
-                    </>
-                  )}
-                </button>
-              )}
             </div>
           )}
         </div>

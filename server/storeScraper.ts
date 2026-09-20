@@ -16,6 +16,7 @@ export interface StoreSearchResult {
   intro?: string;
   coverUrl?: string;
   likes?: number;
+  aiquLikes?: number;
   points?: number;
   year?: number;
   status?: string;
@@ -532,6 +533,18 @@ async function searchAiqu226(query: string): Promise<StoreSearchResult[]> {
               }
             }
 
+            // Extract Aiqu on-site votes (e.g. "👍 26赞" or "26赞" or "点赞: 26" or "获赞: 26")
+            let aiquLikes: number | undefined;
+            const fullCardText = card.text();
+            const aiquVoteMatch =
+              fullCardText.match(/(?:👍|点赞|获赞|赞数|好评|推荐)?\s*(\d+)\s*赞/i) ||
+              fullCardText.match(/(?:👍|点赞|获赞)\s*(\d+)/i) ||
+              card.find(".praise, .zan, .likes, .vote, .search-card-date, .search-card-ext").text().match(/(\d+)/);
+            if (aiquVoteMatch) {
+              const v = parseInt(aiquVoteMatch[1], 10);
+              if (v > 0) aiquLikes = v;
+            }
+
             // Extract status
             let status = "完结";
             if (rawContent.includes("连载") || dateStr.includes("连载")) {
@@ -557,6 +570,7 @@ async function searchAiqu226(query: string): Promise<StoreSearchResult[]> {
               novelUrl: href.startsWith("http") ? href : `http://www.aiqu226.com${href}`,
               intro: cleanSummary || rawContent,
               likes,
+              aiquLikes,
               points,
               year,
               status,
@@ -954,6 +968,84 @@ async function searchPtwxz(query: string): Promise<StoreSearchResult[]> {
 }
 
 /**
+ * Expands English and romanized queries into relevant Chinese web novel genre/trope keywords
+ */
+export function expandKeywordsForSearch(query: string): string[] {
+  const clean = query.trim().toLowerCase();
+  const queries = [query.trim()];
+
+  const termMap: Record<string, string[]> = {
+    prehistoric: ["洪荒", "史前", "远古", "原始"],
+    honghuang: ["洪荒"],
+    primitive: ["原始", "原始社会", "远古"],
+    ancient: ["古代", "穿越古代", "古穿今"],
+    apocalypse: ["末世", "末日"],
+    apocalyptic: ["末世", "末日"],
+    doomsday: ["末日", "末世"],
+    zombie: ["丧尸", "末世"],
+    zombies: ["丧尸", "末世"],
+    cultivation: ["修仙", "修真", "仙侠"],
+    cultivator: ["修仙", "修真"],
+    immortal: ["修仙", "仙侠"],
+    xianxia: ["仙侠", "修仙"],
+    wuxia: ["武侠"],
+    transmigration: ["穿书", "穿越", "快穿"],
+    transmigrate: ["穿书", "穿越"],
+    transmigrated: ["穿书", "穿越"],
+    "quick wear": ["快穿", "穿书"],
+    "quick transmigration": ["快穿", "穿书"],
+    qt: ["快穿"],
+    reborn: ["重生"],
+    rebirth: ["重生"],
+    interstellar: ["星际"],
+    farming: ["种田", "种田文"],
+    "infinite flow": ["无限流", "无限"],
+    infinite: ["无限流", "无限"],
+    entertainment: ["娱乐圈"],
+    showbiz: ["娱乐圈"],
+    "beast world": ["兽世", "兽人"],
+    beastman: ["兽世", "兽人"],
+    orc: ["兽世", "兽人"],
+    orcs: ["兽世", "兽人"],
+    abo: ["ABO", "Omega", "Alpha"],
+    omega: ["Omega", "ABO"],
+    alpha: ["Alpha", "ABO"],
+    esports: ["电竞", "网游"],
+    "e-sports": ["电竞", "网游"],
+    gaming: ["电竞", "网游"],
+    campus: ["校园", "青春"],
+    school: ["校园", "青春"],
+    mecha: ["机甲"],
+    magic: ["魔法", "西幻"],
+    wizard: ["魔法", "西幻"],
+    system: ["系统"],
+    danmei: ["耽美", "纯爱"],
+    bl: ["耽美", "纯爱"],
+    gl: ["百合"],
+    yuri: ["百合"],
+    villain: ["反派"],
+    villainess: ["反派"],
+    "cannon fodder": ["炮灰"],
+    sweet: ["甜文"],
+    fluff: ["甜文"],
+    "secret love": ["暗恋"],
+    "childhood sweethearts": ["青梅竹马"],
+    ceo: ["总裁", "豪门"],
+    tycoon: ["豪门", "总裁"],
+  };
+
+  for (const [englishTerm, chineseTerms] of Object.entries(termMap)) {
+    if (clean === englishTerm || clean.includes(englishTerm)) {
+      for (const t of chineseTerms) {
+        if (!queries.includes(t)) queries.push(t);
+      }
+    }
+  }
+
+  return queries;
+}
+
+/**
  * Universal Search Handler: Supports Title, Author, and Direct Webpage URLs
  */
 export async function searchStoreNovels(query: string, targetSiteId?: string): Promise<StoreSearchResult[]> {
@@ -1006,6 +1098,9 @@ export async function searchStoreNovels(query: string, targetSiteId?: string): P
     }
   }
 
+  // Expand English keywords (e.g. prehistoric -> 洪荒, 史前, 远古) to search Chinese indexes
+  const queryVariants = expandKeywordsForSearch(cleanQuery);
+
   const tasks: Promise<StoreSearchResult[]>[] = [];
 
   const withTimeout = (task: Promise<StoreSearchResult[]>, ms = 3800): Promise<StoreSearchResult[]> => {
@@ -1018,17 +1113,19 @@ export async function searchStoreNovels(query: string, targetSiteId?: string): P
     });
   };
 
-  if (!targetSiteId || targetSiteId === "all" || targetSiteId === "52shuku") tasks.push(withTimeout(search52Shuku(cleanQuery)));
-  if (!targetSiteId || targetSiteId === "all" || targetSiteId === "fuxsb") tasks.push(withTimeout(searchFuxsb(cleanQuery)));
-  if (!targetSiteId || targetSiteId === "all" || targetSiteId === "dmxs") tasks.push(withTimeout(searchDmxs(cleanQuery)));
-  if (!targetSiteId || targetSiteId === "all" || targetSiteId === "aiqu226") tasks.push(withTimeout(searchAiqu226(cleanQuery)));
-  if (!targetSiteId || targetSiteId === "all" || targetSiteId === "quanben") tasks.push(withTimeout(searchQuanben(cleanQuery)));
-  if (!targetSiteId || targetSiteId === "all" || targetSiteId === "biquge") tasks.push(withTimeout(searchBiquge(cleanQuery)));
-  if (!targetSiteId || targetSiteId === "all" || targetSiteId === "69shuba") tasks.push(withTimeout(search69Shuba(cleanQuery)));
-  if (!targetSiteId || targetSiteId === "all" || targetSiteId === "czbooks") tasks.push(withTimeout(searchCzbooks(cleanQuery)));
-  if (!targetSiteId || targetSiteId === "all" || targetSiteId === "uukanshu") tasks.push(withTimeout(searchUukanshu(cleanQuery)));
-  if (!targetSiteId || targetSiteId === "all" || targetSiteId === "sto") tasks.push(withTimeout(searchSto(cleanQuery)));
-  if (!targetSiteId || targetSiteId === "all" || targetSiteId === "ptwxz") tasks.push(withTimeout(searchPtwxz(cleanQuery)));
+  for (const q of queryVariants) {
+    if (!targetSiteId || targetSiteId === "all" || targetSiteId === "52shuku") tasks.push(withTimeout(search52Shuku(q)));
+    if (!targetSiteId || targetSiteId === "all" || targetSiteId === "fuxsb") tasks.push(withTimeout(searchFuxsb(q)));
+    if (!targetSiteId || targetSiteId === "all" || targetSiteId === "dmxs") tasks.push(withTimeout(searchDmxs(q)));
+    if (!targetSiteId || targetSiteId === "all" || targetSiteId === "aiqu226") tasks.push(withTimeout(searchAiqu226(q)));
+    if (!targetSiteId || targetSiteId === "all" || targetSiteId === "quanben") tasks.push(withTimeout(searchQuanben(q)));
+    if (!targetSiteId || targetSiteId === "all" || targetSiteId === "biquge") tasks.push(withTimeout(searchBiquge(q)));
+    if (!targetSiteId || targetSiteId === "all" || targetSiteId === "69shuba") tasks.push(withTimeout(search69Shuba(q)));
+    if (!targetSiteId || targetSiteId === "all" || targetSiteId === "czbooks") tasks.push(withTimeout(searchCzbooks(q)));
+    if (!targetSiteId || targetSiteId === "all" || targetSiteId === "uukanshu") tasks.push(withTimeout(searchUukanshu(q)));
+    if (!targetSiteId || targetSiteId === "all" || targetSiteId === "sto") tasks.push(withTimeout(searchSto(q)));
+    if (!targetSiteId || targetSiteId === "all" || targetSiteId === "ptwxz") tasks.push(withTimeout(searchPtwxz(q)));
+  }
 
   const resultsNested = await Promise.allSettled(tasks);
   const allResults: StoreSearchResult[] = [];
@@ -1469,51 +1566,83 @@ async function fetchTxtOrZipFileCached(url: string): Promise<string> {
   }
 }
 
+export function isAnyChapterHeader(line: string): boolean {
+  const t = line.trim();
+  if (t.length === 0 || t.length > 55) return false;
+  return (
+    /^第\s*[0-9一二三四五六七八九十百千万]+\s*[章回节卷集部篇折话](?:[\s:：、._\-【（\[]|$)/u.test(t) ||
+    /^[（【\[]\s*第\s*[0-9一二三四五六七八九十百千万]+\s*[章回节卷集部篇折话].*?[）】\]]/.test(t) ||
+    /^Chapter\s*[0-9IVXLCDM]+/i.test(t) ||
+    /^Section\s*\d+/i.test(t) ||
+    /^正文\s+第\s*[0-9一二三四五六七八九十百千万]+\s*[章回节](?:[\s:：、._\-【（\[]|$)/u.test(t) ||
+    /^(?:楔子|序章|尾声|番外|后记|终章|感言|完结感言)(?:\s|$|[:：])/i.test(t) ||
+    /^(\d{1,5}|[一二三四五六七八九十百]+)[\s、.．【]/.test(t)
+  );
+}
+
 function extractChaptersFromText(text: string, fileUrl: string): ChapterItem[] {
   const lines = text.split(/\r\n|\n|\r/);
   const chapters: ChapterItem[] = [];
+
+  interface HeaderMatch {
+    lineIndex: number;
+    title: string;
+  }
+  let matches: HeaderMatch[] = [];
 
   // Pass 1: standard chapter regex
   lines.forEach((l, idx) => {
     const t = l.trim();
     if (
-      /^第\s*\d+\s*[章回节]/.test(t) ||
-      /^第[一二三四五六七八九十百千0-9]+\s*[章回节]/.test(t) ||
-      /^Chapter\s*\d+/i.test(t)
+      t.length <= 55 &&
+      (/^第\s*[0-9一二三四五六七八九十百千万]+\s*[章回节卷集部篇折话](?:[\s:：、._\-【（\[]|$)/u.test(t) ||
+        /^[（【\[]\s*第\s*[0-9一二三四五六七八九十百千万]+\s*[章回节卷集部篇折话]/.test(t) ||
+        /^Chapter\s*[0-9IVXLCDM]+/i.test(t) ||
+        /^Section\s*\d+/i.test(t) ||
+        /^正文\s+第\s*[0-9一二三四五六七八九十百千万]+\s*[章回节](?:[\s:：、._\-【（\[]|$)/u.test(t) ||
+        /^(?:楔子|序章|尾声|番外|后记|终章|感言|完结感言)(?:\s|$|[:：])/i.test(t))
     ) {
-      // If the first chapter is at line > 0 (meaning there is book preamble/synopsis before it),
-      // make the first chapter's pointer start at line 0 so reading Chapter 1 includes the complete opening
-      const startLine = (chapters.length === 0 && idx > 0) ? 0 : idx;
-      chapters.push({
-        index: chapters.length + 1,
+      matches.push({
+        lineIndex: idx,
         title: t.substring(0, 60),
-        url: `txt:${encodeURI(fileUrl)}#line:${startLine}`,
       });
     }
   });
 
   // Pass 2: If no standard chapter markers, match numeric section headers (e.g. "1 ", "1.", "【1】")
-  if (chapters.length === 0) {
+  if (matches.length === 0) {
     lines.forEach((l, idx) => {
       const t = l.trim();
-      if (/^(\d+|[一二三四五六七八九十百]+)[\s、.【]/.test(t) && t.length < 50) {
-        const startLine = (chapters.length === 0 && idx > 0) ? 0 : idx;
-        chapters.push({
-          index: chapters.length + 1,
+      if (t.length <= 50 && /^(\d{1,5}|[一二三四五六七八九十百]+)[\s、.．【]/.test(t)) {
+        matches.push({
+          lineIndex: idx,
           title: t.substring(0, 60),
-          url: `txt:${encodeURI(fileUrl)}#line:${startLine}`,
         });
       }
     });
   }
 
-  // Pass 3: If still no chapters, chunk every 80 lines
-  if (chapters.length === 0 && lines.length > 25) {
+  // If matches were found, assign exact start and end line boundaries for each chapter!
+  if (matches.length > 0) {
+    matches.forEach((m, idx) => {
+      const nextMatch = matches[idx + 1];
+      // For Chapter 1 (idx === 0), start from line 0 so the reader retains the full preamble, title, author, and complete synopsis
+      const startLine = idx === 0 ? 0 : m.lineIndex;
+      const endLine = nextMatch ? nextMatch.lineIndex : lines.length;
+      chapters.push({
+        index: idx + 1,
+        title: m.title,
+        url: `txt:${encodeURI(fileUrl)}#start:${startLine}&end:${endLine}`,
+      });
+    });
+  } else if (lines.length > 25) {
+    // Pass 3: If still no chapters, chunk every 80 lines
     for (let i = 0; i < lines.length; i += 80) {
+      const endLine = Math.min(i + 80, lines.length);
       chapters.push({
         index: chapters.length + 1,
         title: `第 ${chapters.length + 1} 部分`,
-        url: `txt:${encodeURI(fileUrl)}#line:${i}`,
+        url: `txt:${encodeURI(fileUrl)}#start:${i}&end:${endLine}`,
       });
     }
   }
@@ -1528,54 +1657,31 @@ export async function fetchChapterText(chapterUrl: string): Promise<string> {
   try {
     // Handle direct TXT line pointers
     if (chapterUrl.startsWith("txt:")) {
-      const match = chapterUrl.match(/^txt:([^#]+)#line:(\d+)/);
+      const match = chapterUrl.match(/^txt:([^#]+)#(?:start:(\d+)&end:(\d+)|line:(\d+)(?:&end:(\d+))?)/);
       if (match) {
         const rawUrl = decodeURIComponent(match[1]);
-        const lineIdx = parseInt(match[2], 10);
+        const startLine = parseInt(match[2] || match[4] || "0", 10);
+        const endLine = match[3] || match[5] ? parseInt(match[3] || match[5], 10) : undefined;
         const txt = await fetchTxtOrZipFileCached(rawUrl);
         if (txt) {
           const lines = txt.split(/\r\n|\n|\r/);
-          if (lineIdx >= 0 && lineIdx < lines.length) {
-            const result: string[] = [];
-            if (lineIdx === 0) {
-              // Read from line 0 (including book preamble), through the first chapter heading & body,
-              // and stop at the second chapter heading
-              let seenFirstHeader = false;
-              for (let i = 0; i < lines.length; i++) {
-                const line = lines[i];
-                const trimmed = line.trim();
-                const isHeader =
-                  /^第\s*\d+\s*[章回节]/.test(trimmed) ||
-                  /^第[一二三四五六七八九十百千0-9]+\s*[章回节]/.test(trimmed) ||
-                  /^Chapter\s*\d+/i.test(trimmed);
-
-                if (isHeader) {
-                  if (!seenFirstHeader) {
-                    seenFirstHeader = true;
-                    result.push(line);
-                    continue;
-                  } else {
-                    break;
-                  }
-                }
-                result.push(line);
-              }
+          if (startLine >= 0 && startLine < lines.length) {
+            let chapterLines: string[] = [];
+            if (typeof endLine === "number" && endLine > startLine) {
+              // Exact slice bounded by next chapter start! Cap safely at max 800 lines for a chapter + preamble
+              chapterLines = lines.slice(startLine, Math.min(endLine, startLine + 800));
             } else {
-              result.push(lines[lineIdx]);
-              for (let i = lineIdx + 1; i < lines.length; i++) {
+              // Backward compatibility for legacy links with only startLine: scan up to next header or 350 lines
+              chapterLines.push(lines[startLine]);
+              for (let i = startLine + 1; i < Math.min(lines.length, startLine + 350); i++) {
                 const line = lines[i];
-                const trimmed = line.trim();
-                if (
-                  /^第\s*\d+\s*[章回节]/.test(trimmed) ||
-                  /^第[一二三四五六七八九十百千0-9]+\s*[章回节]/.test(trimmed) ||
-                  /^Chapter\s*\d+/i.test(trimmed)
-                ) {
-                  break;
-                }
-                result.push(line);
+                if (isAnyChapterHeader(line)) break;
+                chapterLines.push(line);
               }
             }
-            return result
+
+            // Return clean paragraph lines preserving full synopsis and preamble
+            return chapterLines
               .map((l) => l.trim())
               .filter(Boolean)
               .join("\n\n")
@@ -1654,6 +1760,7 @@ export interface ExploreNovelItem {
   summary: string;
   points: number; // Real JJWXC work points e.g. 23563821056
   likes: number; // e.g. bookmarks or popularity
+  aiquLikes?: number; // Native Aiqu site forum upvotes (赞)
   wordCount?: number;
   status?: string; // "完结" | "连载"
   chapterCount?: number;
@@ -1673,7 +1780,7 @@ export interface ExploreFilterOptions {
   tag?: string; // Backward compatibility for single tag
   tags?: string[]; // Multi-category selection e.g. ['末世', '种田'] or ['史前', '空间']
   query?: string; // Keyword to match in title OR summary
-  sort?: "points" | "likes" | "recent" | "chapters";
+  sort?: "points" | "likes" | "aiquLikes" | "recent" | "chapters";
   page?: number;
 }
 
@@ -1687,31 +1794,46 @@ export function isGlNovel(title: string, summary: string = "", category: string 
   const u = (url || "").toLowerCase();
   const s = (summary || "").toLowerCase();
   const tagStr = (tags || []).join(" ").toLowerCase();
+  const allText = `${t} ${c} ${s} ${tagStr}`.toLowerCase();
+  const allCompact = allText.replace(/\s+/g, "");
 
-  // Explicit title / category / URL GL patterns
-  if (/\bgl\b/i.test(t) || /gl《/i.test(t) || /《.*gl.*》/i.test(t) || /\(gl\)/i.test(t) || /\[gl\]/i.test(t) || /【gl】/i.test(t) || /（gl）/i.test(t)) return true;
-  if (/百合/.test(t) || /百合/.test(c) || /百合/.test(tagStr) || u.includes("/gl/") || u.includes("/glbh/")) return true;
-  if (/双女主/.test(t) || /双女主/.test(c) || /双女主/.test(tagStr)) return true;
-  if (/女双/.test(t) || /女双/.test(c)) return true;
-  if (/女女/.test(t) || /女女/.test(c)) return true;
-  if (/女攻/.test(t) || /女攻/.test(c)) return true;
-  if (/\bgl\b/i.test(c)) return true;
+  // 1. URL-based check
+  if (u.includes("/gl/") || u.includes("/glbh/")) return true;
 
-  // Explicit summary GL markers
+  // 2. Exact compact sub-string checks
   if (
-    /\[gl\]/i.test(s) ||
-    /【gl】/i.test(s) ||
-    /\(gl\)/i.test(s) ||
-    /（gl）/i.test(s) ||
-    /gl《/i.test(s) ||
-    /\[百合\]/.test(s) ||
-    /【百合】/.test(s) ||
-    /\(百合\)/.test(s) ||
-    /（百合）/.test(s) ||
-    /\[双女主\]/.test(s) ||
-    /【双女主】/.test(s) ||
-    /\[百合向\]/.test(s) ||
-    /【百合向】/.test(s)
+    allCompact.includes("百合") ||
+    allCompact.includes("双女主") ||
+    allCompact.includes("女女") ||
+    allCompact.includes("女攻") ||
+    allCompact.includes("女双") ||
+    allCompact.includes("[gl]") ||
+    allCompact.includes("【gl】") ||
+    allCompact.includes("(gl)") ||
+    allCompact.includes("（gl）") ||
+    allCompact.includes("[gl百合]") ||
+    allCompact.includes("【gl百合】") ||
+    allCompact.includes("gl百合") ||
+    allCompact.includes("gl向") ||
+    allCompact.includes("gl小说") ||
+    allCompact.includes("gl文") ||
+    allCompact.includes("百合向") ||
+    allCompact.includes("百合文") ||
+    allCompact.includes("百合小说")
+  ) {
+    return true;
+  }
+
+  // 3. Spaced GL regex patterns e.g. "[ G L 百合]", "【 G L 】", "GL《"
+  if (
+    /\bg\s*l\b/i.test(t) ||
+    /\bg\s*l\b/i.test(c) ||
+    /\[\s*g\s*l(?:\s*百合)?\s*\]/i.test(allText) ||
+    /【\s*g\s*l(?:\s*百合)?\s*】/i.test(allText) ||
+    /\(\s*g\s*l(?:\s*百合)?\s*\)/i.test(allText) ||
+    /（\s*g\s*l(?:\s*百合)?\s*）/i.test(allText) ||
+    /g\s*l\s*《/i.test(allText) ||
+    /《.*g\s*l.*》/i.test(allText)
   ) {
     return true;
   }
@@ -2344,17 +2466,21 @@ export function detect52ShukuOrientation(
   tags: string[] = []
 ): { orientation: "bl" | "het" | "no_cp" | "general"; orientationLabel: string } {
   const combined = `${title} ${summary} ${category} ${url} ${tags.join(" ")}`.toLowerCase();
+  const titleLower = (title || "").toLowerCase();
+  const summaryLower = (summary || "").toLowerCase();
+  const catLower = (category || "").toLowerCase();
+  const urlLower = (url || "").toLowerCase();
 
   // 1. Strict GL Check
   if (
     isGlNovel(title, summary, category, url, tags) ||
-    category.includes("百合") ||
-    category.includes("gl") ||
-    category.includes("GL") ||
-    url.includes("/gl/") ||
-    url.includes("/glbh/") ||
+    catLower.includes("百合") ||
+    catLower.includes("gl") ||
+    urlLower.includes("/gl/") ||
+    urlLower.includes("/glbh/") ||
     combined.includes("[gl百合]") ||
-    combined.includes("[gl]")
+    combined.includes("[gl]") ||
+    combined.includes("【gl】")
   ) {
     return { orientation: "het", orientationLabel: "GL (百合)" };
   }
@@ -2362,31 +2488,98 @@ export function detect52ShukuOrientation(
   // 2. Strict No-CP / Pure Plot Check
   if (
     isNoCpNovel(title, summary, category, url, tags) ||
-    category.includes("无cp") ||
-    category.includes("无CP") ||
-    combined.includes("无cp") ||
-    combined.includes("无CP") ||
-    combined.includes("无ｃｐ") ||
-    combined.includes("无ＣＰ") ||
-    combined.includes("[无cp向]") ||
-    combined.includes("[无ｃｐ向]")
+    catLower.includes("无cp") ||
+    catLower.includes("无CP") ||
+    catLower.includes("无ｃｐ") ||
+    catLower.includes("无ＣＰ") ||
+    summaryLower.includes("无cp") ||
+    summaryLower.includes("无CP") ||
+    summaryLower.includes("无ｃｐ") ||
+    summaryLower.includes("无ＣＰ") ||
+    summaryLower.includes("[无cp向]") ||
+    summaryLower.includes("【无cp】") ||
+    summaryLower.includes("【无cp向】") ||
+    titleLower.includes("无cp") ||
+    titleLower.includes("无CP") ||
+    titleLower.includes("怪物之母")
   ) {
     return { orientation: "no_cp", orientationLabel: "无CP (Plot)" };
   }
 
-  // 3. Strict Het / BG / 言情 Check (Authentic 所属栏目：言情小说, /yanqing/, 军婚, 养崽, etc.)
+  // 3. Strict BL / 耽美 / 纯爱 Check (Requires explicit BL signals, NEVER partial common words like 接受/攻击)
+  const isExplicitDanmei =
+    catLower.includes("耽美") ||
+    catLower.includes("纯爱") ||
+    catLower.includes("双男主") ||
+    catLower.includes("古耽") ||
+    catLower.includes("现耽") ||
+    catLower.includes("古代架空耽美") ||
+    catLower.includes("穿越重生耽美") ||
+    catLower.includes("现代都市耽美") ||
+    catLower.includes("科幻网游耽美") ||
+    catLower.includes("仙侠修真耽美") ||
+    catLower.includes("耽美专区") ||
+    urlLower.includes("/danmei/") ||
+    urlLower.includes("/gudan/") ||
+    urlLower.includes("/xiandan/") ||
+    urlLower.includes("/15/") || // Aiqu226 list15 = 耽美专区
+    urlLower.includes("/dmxs/") ||
+    urlLower.includes("/fuxsb/") ||
+    urlLower.includes("/jiakong/") ||
+    urlLower.includes("/chongsheng/") ||
+    urlLower.includes("/xiandaidushi/") ||
+    urlLower.includes("/kehuan/") ||
+    urlLower.includes("/xianxia/") ||
+    combined.includes("所属栏目：耽美") ||
+    combined.includes("所属栏目:耽美") ||
+    combined.includes("所属栏目：古代架空耽美") ||
+    combined.includes("所属栏目:古代架空耽美") ||
+    combined.includes("所属栏目：穿越重生耽美") ||
+    combined.includes("所属栏目:穿越重生耽美") ||
+    combined.includes("所属栏目：现代都市耽美") ||
+    combined.includes("所属栏目:现代都市耽美") ||
+    combined.includes("耽美小说") ||
+    combined.includes("【耽美】") ||
+    combined.includes("[耽美]") ||
+    combined.includes("【纯爱】") ||
+    combined.includes("[纯爱]") ||
+    combined.includes("【双男主】") ||
+    combined.includes("[双男主]") ||
+    summaryLower.includes("主受") ||
+    summaryLower.includes("主攻") ||
+    summaryLower.includes("双男主") ||
+    summaryLower.includes("强强bl") ||
+    summaryLower.includes("生子bl") ||
+    summaryLower.includes("男男") ||
+    summaryLower.includes("攻x受") ||
+    summaryLower.includes("受x攻") ||
+    summaryLower.includes("强攻弱受") ||
+    summaryLower.includes("年下攻") ||
+    summaryLower.includes("年上攻") ||
+    titleLower.includes("主受") ||
+    titleLower.includes("主攻") ||
+    titleLower.includes("双男主");
+
+  // 4. Strict Het / BG / 言情 Check (Authentic 所属栏目：言情小说, /yanqing/, 军婚, 养崽, 穿越重生, 女生小说, etc.)
   const isExplicitYanqing =
-    category.includes("言情") ||
-    category.includes("古言") ||
-    category.includes("现言") ||
-    category.includes("女频") ||
-    category.includes("男女") ||
-    category.includes("现代情感") ||
-    category.includes("bg同人") ||
-    category.includes("BG同人") ||
-    url.includes("/yanqing/") ||
-    url.includes("/guyan/") ||
-    url.includes("/xianyan/") ||
+    catLower.includes("言情") ||
+    catLower.includes("古言") ||
+    catLower.includes("现言") ||
+    catLower.includes("女频") ||
+    catLower.includes("女生小说") ||
+    catLower.includes("男女") ||
+    catLower.includes("现代情感") ||
+    catLower.includes("bg同人") ||
+    catLower.includes("cycs") || // Aiqu list112 穿越重生
+    catLower.includes("gdtr") || // Aiqu list117 古代言情
+    urlLower.includes("/yanqing/") ||
+    urlLower.includes("/guyan/") ||
+    urlLower.includes("/xianyan/") ||
+    urlLower.includes("/cycs/") ||
+    urlLower.includes("/gdtr/") ||
+    urlLower.includes("/112/") ||
+    urlLower.includes("/117/") ||
+    urlLower.includes("/nsxs/") ||
     combined.includes("所属栏目：言情") ||
     combined.includes("所属栏目:言情") ||
     combined.includes("所属栏目：\n言情") ||
@@ -2402,57 +2595,24 @@ export function detect52ShukuOrientation(
     combined.includes("[bg同人]");
 
   const hasHetTropes =
-    /军婚|军嫂|养崽|生崽|带球跑|大院|真千金|假千金|团宠小师妹|女配|穿成女配|炮灰女配|娇妻|娇软|小娇妻|后妈|继母|王妃|侧妃|皇后|福宝|锦鲤|八零|七零|六零|九零/i.test(
+    /军婚|军嫂|养崽|生崽|带球跑|大院|真千金|假千金|团宠|小师妹|女配|穿成女配|炮灰女配|娇妻|娇软|小娇妻|后妈|继母|王妃|侧妃|皇后|娘娘|嫡女|庶女|贵女|公主|妈妈|母神|女神|福宝|锦鲤|八零|七零|六零|九零|总裁|闪婚|前妻|怪物之母/i.test(
       combined
     ) && !/双男主|主受|主攻|攻x受|受x攻|纯爱|耽美|男男/i.test(combined);
 
-  if (isExplicitYanqing || hasHetTropes) {
+  if ((isExplicitYanqing || hasHetTropes) && !isExplicitDanmei) {
     return { orientation: "het", orientationLabel: "言情 (BG)" };
   }
-
-  // 4. Strict BL / 耽美 / 纯爱 Check (Includes 52shuku core category folders: /jiakong/, /chongsheng/, /xiandaidushi/, /kehuan/, /xianxia/)
-  const isExplicitDanmei =
-    category.includes("耽美") ||
-    category.includes("纯爱") ||
-    category.includes("双男主") ||
-    category.includes("古耽") ||
-    category.includes("现耽") ||
-    category.includes("古代架空") ||
-    category.includes("古代架空耽美") ||
-    category.includes("穿越重生耽美") ||
-    category.includes("现代都市耽美") ||
-    category.includes("科幻网游耽美") ||
-    category.includes("仙侠修真耽美") ||
-    url.includes("/danmei/") ||
-    url.includes("/gudan/") ||
-    url.includes("/xiandan/") ||
-    url.includes("/jiakong/") ||
-    url.includes("/chongsheng/") ||
-    url.includes("/xiandaidushi/") ||
-    url.includes("/kehuan/") ||
-    url.includes("/xianxia/") ||
-    combined.includes("所属栏目：耽美") ||
-    combined.includes("所属栏目:耽美") ||
-    combined.includes("所属栏目：古代架空耽美") ||
-    combined.includes("所属栏目:古代架空耽美") ||
-    combined.includes("所属栏目：穿越重生耽美") ||
-    combined.includes("所属栏目:穿越重生耽美") ||
-    combined.includes("所属栏目：现代都市耽美") ||
-    combined.includes("所属栏目:现代都市耽美") ||
-    combined.includes("耽美小说") ||
-    combined.includes("纯爱") ||
-    combined.includes("双男主") ||
-    combined.includes("主受") ||
-    combined.includes("主攻") ||
-    combined.includes("强强bl") ||
-    combined.includes("生子bl") ||
-    combined.includes("男男");
 
   if (isExplicitDanmei) {
     return { orientation: "bl", orientationLabel: "耽美 (BL)" };
   }
 
-  // 5. Default fallback based on category text or general
+  // 5. If category is female/rebirth without explicit BL tags, default to BG (言情)
+  if (catLower.includes("穿越重生") || catLower.includes("女生") || catLower.includes("都市言情")) {
+    return { orientation: "het", orientationLabel: "言情 (BG)" };
+  }
+
+  // 6. Default fallback based on category text or general
   if (category && category !== "小说" && category !== "Unknown") {
     return { orientation: "general", orientationLabel: category };
   }
@@ -3609,7 +3769,7 @@ async function scrapeFuxsbExplore(options: ExploreFilterOptions): Promise<Explor
 }
 
 // Cache for full detail metadata from aiqu226 detail pages
-export const aiquDetailCache = new Map<string, { fileSize?: string; points?: number; likes?: number; summary?: string }>();
+export const aiquDetailCache = new Map<string, { fileSize?: string; points?: number; likes?: number; aiquLikes?: number; summary?: string }>();
 
 export async function enrichAiquNovelItems(items: ExploreNovelItem[]): Promise<void> {
   const toFetch = items.filter(
@@ -3623,6 +3783,7 @@ export async function enrichAiquNovelItems(items: ExploreNovelItem[]): Promise<v
       if (cached.fileSize) it.fileSize = cached.fileSize;
       if (cached.points) it.points = cached.points;
       if (cached.likes) it.likes = cached.likes;
+      if (cached.aiquLikes) it.aiquLikes = cached.aiquLikes;
       if (cached.summary && cached.summary.length > (it.summary?.length || 0)) it.summary = cached.summary;
     }
   });
@@ -3655,6 +3816,13 @@ export async function enrichAiquNovelItems(items: ExploreNovelItem[]): Promise<v
           const totalLikes = parseNovelLikes(fullText);
           const ptsVal = parseNovelPoints(fullText, totalLikes);
 
+          // Extract on-site forum votes if available
+          let forumVotes = 0;
+          const voteMatch = fullText.match(/(?:👍|点赞|获赞|赞数|好评|推荐)?\s*(\d+)\s*赞/i) || fullText.match(/(?:👍|点赞|获赞)\s*(\d+)/i);
+          if (voteMatch) {
+            forumVotes = parseInt(voteMatch[1], 10);
+          }
+
           let intro = "";
           const introIdx = fullText.search(/(?:小说简介|简介|文案)[：:]/);
           if (introIdx !== -1) {
@@ -3665,7 +3833,7 @@ export async function enrichAiquNovelItems(items: ExploreNovelItem[]): Promise<v
               .trim();
           }
 
-          const data: { fileSize?: string; points?: number; likes?: number; summary?: string } = {};
+          const data: { fileSize?: string; points?: number; likes?: number; aiquLikes?: number; summary?: string } = {};
           if (sizeMatch) {
             let s = sizeMatch[1].toUpperCase().replace(/\s+/g, " ");
             if (!s.includes("B") && !s.includes("b")) s += "B";
@@ -3679,6 +3847,10 @@ export async function enrichAiquNovelItems(items: ExploreNovelItem[]): Promise<v
           if (totalLikes > 0) {
             data.likes = totalLikes;
             it.likes = totalLikes;
+          }
+          if (forumVotes > 0) {
+            data.aiquLikes = forumVotes;
+            it.aiquLikes = forumVotes;
           }
           if (intro && intro.length > (it.summary?.length || 0)) {
             data.summary = intro;
@@ -3898,6 +4070,25 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
           const likes = parseNovelLikes(rawContent);
           const points = parseNovelPoints(rawContent, likes);
 
+          // Extract native Aiqu on-site forum votes if present on card (e.g. "👍 26 赞", "26赞", "总推荐: 1200")
+          let aiquLikes: number | undefined;
+          const cardText = card.text();
+          const aiquVoteMatch =
+            rawContent.match(/(?:总推荐|总投票|本月推荐|网站投票|投票数|推荐票|好评数|点赞数|网站赞数|站内投票)[：:\s]*([\d,]+(?:\.\d+)?(?:[万wWkK])?)/i) ||
+            cardText.match(/(?:👍|点赞|获赞|赞数|好评|推荐|投票)?\s*([\d,]+)\s*(?:赞|票)/i) ||
+            cardText.match(/(?:👍|点赞|获赞)\s*([\d,]+)/i) ||
+            card.find(".praise, .zan, .likes, .vote, .search-card-ext").text().match(/(\d+)/);
+          if (aiquVoteMatch) {
+            const s = aiquVoteMatch[1].replace(/,/g, "").trim();
+            if (s.includes("万") || s.toLowerCase().includes("w")) {
+              aiquLikes = Math.round(parseFloat(s) * 10000);
+            } else if (s.toLowerCase().includes("k")) {
+              aiquLikes = Math.round(parseFloat(s) * 1000);
+            } else {
+              aiquLikes = parseInt(s, 10) || undefined;
+            }
+          }
+
           // Size extraction
           const sizeMatch = rawContent.match(/小说大小[：:]\s*([\d.]+\s*(?:MB|KB|GB|M|K|G)?i?B?)/i);
           let fileSize: string | undefined;
@@ -3921,46 +4112,11 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
             fileSize = `${((wordCount * 3.0) / (1024 * 1024)).toFixed(2)} MB`;
           }
 
-          const isGl = isGlNovel(title, rawContent, category, href);
-          let orientation: "bl" | "het" | "no_cp" | "general" = "bl";
-          let orientationLabel = "耽美 (BL)";
+          const detected = detect52ShukuOrientation(title, rawContent, category, href);
+          const orientation = detected.orientation;
+          const orientationLabel = detected.orientationLabel;
 
-          if (isGl) {
-            orientation = "het";
-            orientationLabel = "GL (百合)";
-          } else if (rawContent.includes("无CP") || rawContent.includes("无cp")) {
-            orientation = "no_cp";
-            orientationLabel = "无CP (Plot)";
-          } else if (
-            category.includes("耽美") ||
-            category.includes("纯爱") ||
-            href.includes("/15/") ||
-            rawContent.includes("耽美") ||
-            rawContent.includes("纯爱") ||
-            rawContent.includes("双男主") ||
-            rawContent.includes("主受") ||
-            rawContent.includes("主攻") ||
-            rawContent.includes("BL") ||
-            rawContent.includes("强强") ||
-            rawContent.includes("年下") ||
-            rawContent.includes("年上") ||
-            rawContent.includes("生子") ||
-            rawContent.includes("受") ||
-            rawContent.includes("攻") ||
-            rawContent.includes("主角：") ||
-            rawContent.includes("主角:")
-          ) {
-            orientation = "bl";
-            orientationLabel = "耽美 (BL)";
-          } else if (category.includes("言情") || rawContent.includes("言情") || rawContent.includes("BG") || rawContent.includes("女主")) {
-            orientation = "het";
-            orientationLabel = "言情 (BG)";
-          } else {
-            orientation = "bl";
-            orientationLabel = "耽美 (BL)";
-          }
-
-          if (oriFilter === "bl" && (isGl || orientation !== "bl")) return;
+          if (oriFilter === "bl" && orientation !== "bl") return;
           if (oriFilter === "het" && orientation !== "het") return;
           if (oriFilter === "no_cp" && orientation !== "no_cp") return;
 
@@ -4024,6 +4180,7 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
             summary: cleanSummary || rawContent,
             points,
             likes,
+            aiquLikes,
             wordCount,
             status: "完结",
             fileSize,
@@ -4076,6 +4233,25 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
           const likes = parseNovelLikes(rawContent);
           const points = parseNovelPoints(rawContent, likes);
 
+          // Extract native Aiqu on-site forum votes if present on card (e.g. "👍 26 赞", "26赞", "总推荐: 1200")
+          let aiquLikes: number | undefined;
+          const cardText = card.text();
+          const aiquVoteMatch =
+            rawContent.match(/(?:总推荐|总投票|本月推荐|网站投票|投票数|推荐票|好评数|点赞数|网站赞数|站内投票)[：:\s]*([\d,]+(?:\.\d+)?(?:[万wWkK])?)/i) ||
+            cardText.match(/(?:👍|点赞|获赞|赞数|好评|推荐|投票)?\s*([\d,]+)\s*(?:赞|票)/i) ||
+            cardText.match(/(?:👍|点赞|获赞)\s*([\d,]+)/i) ||
+            card.find(".praise, .zan, .likes, .vote, .search-card-ext").text().match(/(\d+)/);
+          if (aiquVoteMatch) {
+            const s = aiquVoteMatch[1].replace(/,/g, "").trim();
+            if (s.includes("万") || s.toLowerCase().includes("w")) {
+              aiquLikes = Math.round(parseFloat(s) * 10000);
+            } else if (s.toLowerCase().includes("k")) {
+              aiquLikes = Math.round(parseFloat(s) * 1000);
+            } else {
+              aiquLikes = parseInt(s, 10) || undefined;
+            }
+          }
+
           const sizeMatch = rawContent.match(/小说大小[：:]\s*([\d.]+\s*(?:MB|KB|GB|M|K|G)?i?B?)/i);
           let fileSize: string | undefined;
           if (sizeMatch) {
@@ -4098,50 +4274,12 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
             fileSize = `${((wordCount * 3.0) / (1024 * 1024)).toFixed(2)} MB`;
           }
 
-          const isGl = isGlNovel(title, rawContent, category, href);
-          let orientation: "bl" | "het" | "no_cp" | "general" = "bl";
-          let orientationLabel = category || "耽美 (BL)";
-
-          if (isGl) {
-            orientation = "het";
-            orientationLabel = "GL (百合)";
-          } else if (
-            category.includes("耽美") ||
-            category.includes("纯爱") ||
-            href.includes("/15/") ||
-            rawContent.includes("耽美") ||
-            rawContent.includes("纯爱") ||
-            rawContent.includes("双男主") ||
-            rawContent.includes("主受") ||
-            rawContent.includes("主攻") ||
-            rawContent.includes("BL") ||
-            rawContent.includes("强强") ||
-            rawContent.includes("年下") ||
-            rawContent.includes("年上") ||
-            rawContent.includes("生子") ||
-            rawContent.includes("受") ||
-            rawContent.includes("攻") ||
-            rawContent.includes("主角：") ||
-            rawContent.includes("主角:")
-          ) {
-            orientation = "bl";
-            orientationLabel = "耽美 (BL)";
-          } else if (category.includes("言情") || rawContent.includes("言情") || rawContent.includes("BG") || rawContent.includes("女主")) {
-            orientation = "het";
-            orientationLabel = "言情 (BG)";
-          } else if (rawContent.includes("无CP") || rawContent.includes("无cp")) {
-            orientation = "no_cp";
-            orientationLabel = "无CP (Plot)";
-          } else {
-            orientation = "bl";
-            orientationLabel = "耽美 (BL)";
-          }
+          const detected = detect52ShukuOrientation(title, rawContent, category, href);
+          const orientation = detected.orientation;
+          const orientationLabel = detected.orientationLabel;
 
           // Orientation filtering
-          if (oriFilter === "bl") {
-            if (isGl) return;
-            if (orientation !== "bl" && category.includes("言情")) return;
-          }
+          if (oriFilter === "bl" && orientation !== "bl") return;
           if (oriFilter === "het" && orientation !== "het") return;
           if (oriFilter === "no_cp" && orientation !== "no_cp") return;
 
@@ -4203,6 +4341,7 @@ async function scrapeAiqu226Explore(options: ExploreFilterOptions): Promise<Expl
             summary: cleanSummary || rawContent,
             points,
             likes,
+            aiquLikes,
             wordCount,
             status: "完结",
             fileSize,
@@ -5110,6 +5249,25 @@ export async function scrapeExploreNovels(options: ExploreFilterOptions): Promis
         return (b.ratingCount || 0) - (a.ratingCount || 0);
       }
       return (b.year || 0) - (a.year || 0);
+    });
+  } else if (sortMode === "aiquLikes") {
+    allItems.sort((a, b) => {
+      const bVotes = b.aiquLikes || 0;
+      const aVotes = a.aiquLikes || 0;
+      if (bVotes !== aVotes) return bVotes - aVotes;
+
+      // Extract native Aiqu on-site book ID as secondary tie-breaker
+      const aAiquId = parseInt((a.novelUrl || "").match(/txt-(\d+)/)?.[1] || "0", 10);
+      const bAiquId = parseInt((b.novelUrl || "").match(/txt-(\d+)/)?.[1] || "0", 10);
+      if (bAiquId !== aAiquId) return bAiquId - aAiquId;
+
+      const bLikes = b.likes || 0;
+      const aLikes = a.likes || 0;
+      if (bLikes !== aLikes) return bLikes - aLikes;
+      const bPts = b.points || 0;
+      const aPts = a.points || 0;
+      if (bPts !== aPts) return bPts - aPts;
+      return (b.dateStr || "").localeCompare(a.dateStr || "");
     });
   } else if (sortMode === "recent") {
     allItems.sort((a, b) => {

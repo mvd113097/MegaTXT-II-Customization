@@ -384,8 +384,15 @@ async function generateWithQuotaScheduler(
     const isTemporary =
       err.status === 503 ||
       err.status === 500 ||
+      err.status === 504 ||
       err.statusCode === 503 ||
       err.statusCode === 500 ||
+      err.statusCode === 504 ||
+      err.code === 504 ||
+      err.status === "DEADLINE_EXCEEDED" ||
+      errStr.includes("504") ||
+      errStr.includes("deadline") ||
+      errStr.includes("deadline_exceeded") ||
       errStr.includes("503") ||
       errStr.includes("500") ||
       errStr.includes("unavailable") ||
@@ -2710,7 +2717,8 @@ app.get("/api/store/explore", requireAuthMiddleware, async (req, res) => {
       }
     }
 
-    const PAGE_SIZE = 50;
+    const requestedPageSize = parseInt((req.query.pageSize as string) || "20", 10);
+    const PAGE_SIZE = isNaN(requestedPageSize) || requestedPageSize < 1 ? 20 : Math.min(100, requestedPageSize);
     const pageNum = Math.max(1, page);
     const startIndex = (pageNum - 1) * PAGE_SIZE;
     const pageItems = allItems.slice(startIndex, startIndex + PAGE_SIZE);
@@ -2813,25 +2821,63 @@ app.post("/api/store/translate-single-chapter", requireAuthMiddleware, async (re
       return;
     }
 
+    const cleanContent = content.trim();
     const systemPrompt =
       "You are an elite literary Chinese-to-English web novel translator. Translate faithfully into fluent, captivating English prose without conversational commentary. Preserve names, titles, and dialogue nuance naturally.";
-    const userPrompt = `Translate the following chapter into natural, immersive English:\n\nNovel: ${
-      novelTitle || "Web Novel"
-    }\nChapter: ${chapterTitle || "Chapter"}\n\nOriginal Text:\n"""\n${content.slice(
-      0,
-      15000
-    )}\n"""\n\nEnglish Translation:`;
 
-    const result = await generateWithQuotaScheduler(userPrompt, systemPrompt, 0, 5, 2000);
+    let translatedEnglish = "";
+    let modelUsed = "";
+
+    // If chapter text is <= 4000 characters, translate in a single high-speed pass
+    if (cleanContent.length <= 4000) {
+      const userPrompt = `Translate the following chapter into natural, immersive English:\n\nNovel: ${
+        novelTitle || "Web Novel"
+      }\nChapter: ${chapterTitle || "Chapter"}\n\nOriginal Text:\n"""\n${cleanContent}\n"""\n\nEnglish Translation:`;
+
+      const result = await generateWithQuotaScheduler(userPrompt, systemPrompt, 0, 5, 2000);
+      translatedEnglish = result.text.trim();
+      modelUsed = result.modelUsed;
+    } else {
+      // Long chapter (> 4000 chars): partition into safe ~3000 character chunks to prevent 504 Deadline Exceeded
+      const paragraphs = cleanContent.split(/\r?\n+/).map((p: string) => p.trim()).filter((p: string) => p.length > 0);
+      const chunks: string[] = [];
+      let currentChunk = "";
+
+      for (const p of paragraphs) {
+        if ((currentChunk + "\n\n" + p).length > 3000 && currentChunk.length > 0) {
+          chunks.push(currentChunk);
+          currentChunk = p;
+        } else {
+          currentChunk = currentChunk ? currentChunk + "\n\n" + p : p;
+        }
+      }
+      if (currentChunk) chunks.push(currentChunk);
+
+      // Bound chunks to a safe limit (max 5 chunks)
+      const targetChunks = chunks.slice(0, 5);
+      const translatedParts: string[] = [];
+
+      for (let i = 0; i < targetChunks.length; i++) {
+        const subPrompt = `Translate this part (${i + 1}/${targetChunks.length}) of the chapter into natural, immersive English:\n\nNovel: ${
+          novelTitle || "Web Novel"
+        }\nChapter: ${chapterTitle || "Chapter"}\n\nOriginal Text:\n"""\n${targetChunks[i]}\n"""\n\nEnglish Translation:`;
+
+        const resPart = await generateWithQuotaScheduler(subPrompt, systemPrompt, 0, 4, 1500);
+        translatedParts.push(resPart.text.trim());
+        modelUsed = resPart.modelUsed;
+      }
+      translatedEnglish = translatedParts.join("\n\n");
+    }
+
     res.json({
       success: true,
       chapterTitle: chapterTitle || "Chapter",
-      englishContent: result.text.trim(),
-      modelUsed: result.modelUsed,
+      englishContent: translatedEnglish,
+      modelUsed,
     });
   } catch (err: any) {
     console.error("Translate single chapter error:", err);
-    res.status(500).json({ error: err.message || "Failed to translate chapter." });
+    res.status(500).json({ error: formatCleanErrorMessage(err) || "Failed to translate chapter." });
   }
 });
 

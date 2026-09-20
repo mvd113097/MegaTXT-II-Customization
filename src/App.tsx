@@ -209,7 +209,22 @@ export default function App() {
   );
 
   // Modals & Navigation
-  const [activeNavTab, setActiveNavTab] = useState<"home" | "library" | "store" | "explore" | "history">("home");
+  const [activeNavTab, setActiveNavTab] = useState<"home" | "library" | "store" | "explore" | "history">(() => {
+    try {
+      if (typeof window !== "undefined") {
+        const urlParams = new URLSearchParams(window.location.search);
+        const tabParam = urlParams.get("tab");
+        if (tabParam && ["home", "library", "store", "explore", "history"].includes(tabParam)) {
+          return tabParam as any;
+        }
+      }
+      const saved = localStorage.getItem("megatext_active_nav_tab");
+      if (saved && ["home", "library", "store", "explore", "history"].includes(saved)) {
+        return saved as any;
+      }
+    } catch {}
+    return "home";
+  });
   const [storeSearchTrigger, setStoreSearchTrigger] = useState<{ query: string; timestamp: number } | null>(null);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [isGlossaryOpen, setIsGlossaryOpen] = useState(false);
@@ -328,6 +343,14 @@ export default function App() {
 
   const handleBottomNavChange = (tab: "home" | "library" | "store" | "explore" | "history") => {
     setActiveNavTab(tab);
+    try {
+      localStorage.setItem("megatext_active_nav_tab", tab);
+      if (typeof window !== "undefined") {
+        const url = new URL(window.location.href);
+        url.searchParams.set("tab", tab);
+        window.history.replaceState(null, "", url.toString());
+      }
+    } catch {}
     if (tab === "history") {
       setIsHistoryOpen(true);
     }
