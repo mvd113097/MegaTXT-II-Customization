@@ -3,6 +3,7 @@ import compression from "compression";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
+import zlib from "zlib";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
@@ -3030,28 +3031,33 @@ app.get("/api/cloud-job/sync-texts", async (req, res) => {
   });
 });
 
-// Direct server-side EPUB builder & downloader with 0 client memory bottleneck
 // Direct server-side EPUB builder & downloader with 0 client memory bottleneck & minimal network data usage
 app.get("/api/cloud-job/download-epub", async (req, res) => {
   try {
-    let targetJob = getJobForSession(req);
-    if (!targetJob) {
-      const rawNovelHeader = req.headers["x-novel-name"] || req.headers["x-novel-filename"];
-      const novelQuery = (req.query.fileName || req.query.novelName || "") as string;
-      let targetNovelName = "";
-      if (rawNovelHeader && typeof rawNovelHeader === "string") {
-        try { targetNovelName = decodeURIComponent(rawNovelHeader).trim(); } catch { targetNovelName = rawNovelHeader.trim(); }
-      } else if (novelQuery && typeof novelQuery === "string") {
-        try { targetNovelName = decodeURIComponent(novelQuery).trim(); } catch { targetNovelName = novelQuery.trim(); }
-      }
-      if (targetNovelName && targetNovelName !== "[object Object]" && targetNovelName !== "undefined") {
-        const fsJob = await findJobInFirestoreByNovel(targetNovelName);
-        if (fsJob) {
-          targetJob = fsJob;
-          const sessionId = getSessionId(req);
-          setJobForSession(sessionId, targetJob);
+    const rawNovelHeader = req.headers["x-novel-name"] || req.headers["x-novel-filename"];
+    const novelQuery = (req.query.fileName || req.query.novelName || "") as string;
+    let targetNovelName = "";
+    if (rawNovelHeader && typeof rawNovelHeader === "string") {
+      try { targetNovelName = decodeURIComponent(rawNovelHeader).trim(); } catch { targetNovelName = rawNovelHeader.trim(); }
+    } else if (novelQuery && typeof novelQuery === "string") {
+      try { targetNovelName = decodeURIComponent(novelQuery).trim(); } catch { targetNovelName = novelQuery.trim(); }
+    }
+
+    let targetJob: CloudJob | null = null;
+    if (targetNovelName && targetNovelName !== "[object Object]" && targetNovelName !== "undefined") {
+      for (const j of cloudJobs.values()) {
+        if (isSameNovel(j.fileName, targetNovelName) && !(j as any).isDeleted) {
+          targetJob = j;
+          break;
         }
       }
+      if (!targetJob) {
+        targetJob = await findJobInFirestoreByNovel(targetNovelName);
+      }
+    }
+
+    if (!targetJob) {
+      targetJob = getJobForSession(req);
     }
 
     if (!targetJob) {
@@ -3116,24 +3122,30 @@ app.get("/api/cloud-job/download-epub", async (req, res) => {
 // Direct server-side TXT downloader
 app.get("/api/cloud-job/download-txt", async (req, res) => {
   try {
-    let targetJob = getJobForSession(req);
-    if (!targetJob) {
-      const rawNovelHeader = req.headers["x-novel-name"] || req.headers["x-novel-filename"];
-      const novelQuery = (req.query.fileName || req.query.novelName || "") as string;
-      let targetNovelName = "";
-      if (rawNovelHeader && typeof rawNovelHeader === "string") {
-        try { targetNovelName = decodeURIComponent(rawNovelHeader).trim(); } catch { targetNovelName = rawNovelHeader.trim(); }
-      } else if (novelQuery && typeof novelQuery === "string") {
-        try { targetNovelName = decodeURIComponent(novelQuery).trim(); } catch { targetNovelName = novelQuery.trim(); }
-      }
-      if (targetNovelName && targetNovelName !== "[object Object]" && targetNovelName !== "undefined") {
-        const fsJob = await findJobInFirestoreByNovel(targetNovelName);
-        if (fsJob) {
-          targetJob = fsJob;
-          const sessionId = getSessionId(req);
-          setJobForSession(sessionId, targetJob);
+    const rawNovelHeader = req.headers["x-novel-name"] || req.headers["x-novel-filename"];
+    const novelQuery = (req.query.fileName || req.query.novelName || "") as string;
+    let targetNovelName = "";
+    if (rawNovelHeader && typeof rawNovelHeader === "string") {
+      try { targetNovelName = decodeURIComponent(rawNovelHeader).trim(); } catch { targetNovelName = rawNovelHeader.trim(); }
+    } else if (novelQuery && typeof novelQuery === "string") {
+      try { targetNovelName = decodeURIComponent(novelQuery).trim(); } catch { targetNovelName = novelQuery.trim(); }
+    }
+
+    let targetJob: CloudJob | null = null;
+    if (targetNovelName && targetNovelName !== "[object Object]" && targetNovelName !== "undefined") {
+      for (const j of cloudJobs.values()) {
+        if (isSameNovel(j.fileName, targetNovelName) && !(j as any).isDeleted) {
+          targetJob = j;
+          break;
         }
       }
+      if (!targetJob) {
+        targetJob = await findJobInFirestoreByNovel(targetNovelName);
+      }
+    }
+
+    if (!targetJob) {
+      targetJob = getJobForSession(req);
     }
 
     if (!targetJob) {
@@ -3237,7 +3249,6 @@ app.get("/api/cloud-job/chunk/:index", (req, res) => {
 app.post("/api/cloud-job/prepare", requireAuthMiddleware, async (req, res) => {
   try {
     const {
-      rawText = "",
       fileName = "novel.txt",
       fileSizeBytes = 0,
       style = "xianxia",
@@ -3248,6 +3259,16 @@ app.post("/api/cloud-job/prepare", requireAuthMiddleware, async (req, res) => {
       splitByChapters = true,
       autoStart = false,
     } = req.body;
+
+    let rawText = (req.body.rawText || "") as string;
+    if (!rawText && req.body.rawTextGzipBase64) {
+      try {
+        const compressedBuf = Buffer.from(req.body.rawTextGzipBase64, "base64");
+        rawText = zlib.gunzipSync(compressedBuf).toString("utf-8");
+      } catch (err: any) {
+        console.warn("Failed to gunzip rawTextGzipBase64 payload on server:", err);
+      }
+    }
 
     const sessionId = getSessionId(req);
     const charCount = typeof rawText === "string" ? countChineseCharacters(rawText) || rawText.length : 0;
@@ -3463,6 +3484,20 @@ app.post("/api/cloud-job/start", requireAuthMiddleware, async (req, res) => {
 
     if (!targetJob) {
       targetJob = getJobForSession(req);
+    }
+
+    if (!targetJob && fileName) {
+      for (const j of cloudJobs.values()) {
+        if (isSameNovel(j.fileName, fileName) && !(j as any).isDeleted) {
+          targetJob = j;
+          break;
+        }
+      }
+    }
+
+    // Ensure full chunks are loaded into memory if needed
+    if (targetJob && (!targetJob.chunks || targetJob.chunks.length === 0)) {
+      targetJob = await loadFullChunksForJob(targetJob);
     }
 
     // 3. If targetJob found from prepare step or memory/disk:

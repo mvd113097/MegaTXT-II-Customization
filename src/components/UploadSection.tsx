@@ -18,7 +18,7 @@ import { SAMPLE_CHINESE_NOVEL } from "../data/sampleNovel";
 import { ConfirmModal } from "./ConfirmModal";
 
 interface UploadSectionProps {
-  onLoadText: (text: string, fileName: string, targetChunkChars: number, splitByChapters: boolean) => void;
+  onLoadText: (text: string, fileName: string, targetChunkChars: number, splitByChapters: boolean, autoStart?: boolean) => void;
   serverJob?: any | null;
   onLoadServerJob?: () => void;
   onDeleteServerJob?: () => void;
@@ -130,12 +130,12 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
     });
   };
 
-  const handleConfirm = () => {
+  const handleConfirm = (autoStart: boolean = true) => {
     const textToLoad = activeTab === "file" ? fileContent : pastedText;
     const name = activeTab === "file" ? fileName || "chinese_document.txt" : "pasted_text.txt";
     if (!textToLoad.trim()) return;
 
-    onLoadText(textToLoad, name, targetChunkChars, splitByChapters);
+    onLoadText(textToLoad, name, targetChunkChars, splitByChapters, autoStart);
   };
 
   return (
@@ -496,15 +496,27 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
               </div>
             )}
 
-            <button
-              id="confirm-prepare-btn"
-              onClick={handleConfirm}
-              disabled={isReading || (activeTab === "file" ? !fileContent : !pastedText.trim())}
-              className="w-full inline-flex items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 py-3.5 px-6 text-sm font-bold text-white shadow-md shadow-purple-500/20 transition hover:opacity-95 active:scale-98 disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer"
-            >
-              <FileCode className="h-4.5 w-4.5" />
-              <span>Process & Prepare Text Chunks</span>
-            </button>
+            <div className="space-y-2.5">
+              <button
+                id="start-translate-direct-btn"
+                onClick={() => handleConfirm(true)}
+                disabled={isReading || (activeTab === "file" ? !fileContent : !pastedText.trim())}
+                className="w-full inline-flex items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 py-3.5 px-6 text-sm font-bold text-white shadow-md shadow-purple-500/20 transition hover:opacity-95 active:scale-98 disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer"
+              >
+                <Zap className="h-4.5 w-4.5 fill-current" />
+                <span>Start Cloud Translation (Ultra-Low Data Mode)</span>
+              </button>
+
+              <button
+                id="confirm-prepare-btn"
+                onClick={() => handleConfirm(false)}
+                disabled={isReading || (activeTab === "file" ? !fileContent : !pastedText.trim())}
+                className="w-full inline-flex items-center justify-center gap-2 rounded-2xl border border-purple-200 dark:border-purple-800/80 bg-white dark:bg-slate-900 py-2.5 px-6 text-xs font-bold text-purple-700 dark:text-purple-300 hover:bg-purple-50 dark:hover:bg-purple-950/40 transition active:scale-98 disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer"
+              >
+                <FileCode className="h-4 w-4" />
+                <span>Prepare & Preview Chunks First</span>
+              </button>
+            </div>
           </div>
         </div>
       </div>
