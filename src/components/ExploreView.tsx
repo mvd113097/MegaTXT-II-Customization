@@ -35,13 +35,19 @@ import {
   ChevronLeft,
   ChevronRight,
   ThumbsUp,
+  Languages,
 } from "lucide-react";
 import { ChapterItem, StoreNovelDetail } from "./StoreView";
+import { cleanAuthorName, cleanSummaryText } from "../utils/storeFormatters";
 
 export interface ExploreNovelItem {
   id: string;
   title: string;
   author: string;
+  titleZh?: string;
+  authorZh?: string;
+  titleEn?: string;
+  authorEn?: string;
   siteId: string;
   siteName: string;
   novelUrl: string;
@@ -51,6 +57,9 @@ export interface ExploreNovelItem {
   orientationLabel: string;
   tags: string[];
   summary: string;
+  summaryZh?: string;
+  summaryEn?: string;
+  hasFullSynopsis?: boolean;
   points: number; // Authentic JJWXC work points or popularity score
   likes: number;
   aiquLikes?: number; // Native Aiqu site forum upvotes (赞)
@@ -78,6 +87,7 @@ export interface ReadableMirror {
 
 export function formatCleanSiteName(siteId?: string, siteName?: string): string {
   const s = (siteId || siteName || "").toLowerCase();
+  if (s.includes("czbooks") || s.includes("狂人")) return "czbooks";
   if (s.includes("aiqu")) return "aiqu";
   if (s.includes("jjwxc") || s.includes("晋江")) return "jjwxc";
   if (s.includes("52shuku") || s.includes("52")) return "52shuku";
@@ -93,9 +103,9 @@ export function formatCleanSiteName(siteId?: string, siteName?: string): string 
 }
 
 interface ExploreViewProps {
-  onImportNovel: (title: string, rawText: string) => void;
+  onImportNovel: (title: string, rawText: string, autoStart?: boolean) => void;
   getAuthHeaders: () => Record<string, string>;
-  onSearchStore?: (keyword: string) => void;
+  onSearchStore?: (keyword: string, site?: string) => void;
   onOpenReader?: (novel: {
     novelTitle: string;
     author?: string;
@@ -109,8 +119,9 @@ interface ExploreViewProps {
 
 const SITE_OPTIONS = [
   { id: "all", label: "All Sites", shortLabel: "All Sites" },
-  { id: "aiqu226", label: "aiqu", shortLabel: "aiqu" },
+  { id: "czbooks", label: "czbooks", shortLabel: "czbooks" },
   { id: "jjwxc", label: "jjwxc", shortLabel: "jjwxc" },
+  { id: "aiqu226", label: "aiqu", shortLabel: "aiqu" },
   { id: "52shuku", label: "52shuku", shortLabel: "52shuku" },
   { id: "fuxsb", label: "fuxsb", shortLabel: "fuxsb" },
   { id: "dmxs", label: "dmxs", shortLabel: "dmxs" },
@@ -161,9 +172,9 @@ const POPULAR_TROPES = [
 ];
 
 const SORT_OPTIONS = [
+  { id: "points", label: "⭐️ Highest Article Points / Rating", shortLabel: "Article Points" },
   { id: "likes", label: "🔥 Most Popular / Likes", shortLabel: "Popular" },
   { id: "aiquLikes", label: "👍 Aiqu Site Votes", shortLabel: "Aiqu Votes" },
-  { id: "points", label: "⭐️ Highest Rating / Points", shortLabel: "Rating" },
   { id: "recent", label: "⏱️ Newest Release", shortLabel: "Recent" },
   { id: "chapters", label: "📚 Most Chapters / Words", shortLabel: "Chapters" },
 ];
@@ -236,9 +247,42 @@ export function getAugmentedCardTags(item: ExploreNovelItem): string[] {
 
 function sortNovelItems(
   list: ExploreNovelItem[],
-  sort: "points" | "likes" | "aiquLikes" | "recent" | "chapters"
+  sort: "points" | "likes" | "aiquLikes" | "recent" | "chapters",
+  siteId?: string,
+  searchQuery?: string
 ): ExploreNovelItem[] {
   const sorted = [...list];
+  const isJjwxc = siteId === "jjwxc" || (sorted.length > 0 && sorted.every((it) => it.siteId === "jjwxc"));
+  const isCzbooks = siteId === "czbooks" || (sorted.length > 0 && sorted.every((it) => it.siteId === "czbooks"));
+  const rawQLower = (searchQuery || "").trim().toLowerCase();
+
+  // For JJWXC, the official standard is Article Points (作品积分) from highest to lowest
+  if (isJjwxc && sort !== "recent" && sort !== "chapters") {
+    sorted.sort((a, b) => {
+      const pDiff = (b.points || 0) - (a.points || 0);
+      if (pDiff !== 0) return pDiff;
+      const lDiff = (b.likes || 0) - (a.likes || 0);
+      if (lDiff !== 0) return lDiff;
+      return (b.year || 0) - (a.year || 0);
+    });
+    return sorted;
+  }
+
+  // For CZBooks, standard is Bookmarks (收藏数) from highest to lowest - NOT views count
+  if (isCzbooks && sort !== "recent" && sort !== "chapters") {
+    sorted.sort((a, b) => {
+      if (rawQLower) {
+        const aMatch = a.title.toLowerCase().includes(rawQLower) ? 1 : 0;
+        const bMatch = b.title.toLowerCase().includes(rawQLower) ? 1 : 0;
+        if (bMatch !== aMatch) return bMatch - aMatch;
+      }
+      const lDiff = (b.likes || 0) - (a.likes || 0);
+      if (lDiff !== 0) return lDiff;
+      return (b.year || 0) - (a.year || 0);
+    });
+    return sorted;
+  }
+
   if (sort === "aiquLikes") {
     sorted.sort((a, b) => {
       const aVal = (a.aiquLikes && a.aiquLikes <= 10000) ? a.aiquLikes : 0;
@@ -255,6 +299,11 @@ function sortNovelItems(
     });
   } else if (sort === "likes") {
     sorted.sort((a, b) => {
+      // If comparing two JJWXC items, points is the primary metric
+      if (a.siteId === "jjwxc" && b.siteId === "jjwxc") {
+        const pDiff = (b.points || 0) - (a.points || 0);
+        if (pDiff !== 0) return pDiff;
+      }
       const aVal = a.likes || 0;
       const bVal = b.likes || 0;
       if (bVal !== aVal) return bVal - aVal;
@@ -270,12 +319,6 @@ function sortNovelItems(
     });
   } else if (sort === "points") {
     sorted.sort((a, b) => {
-      if ((a.points || 0) === 0 && (b.points || 0) === 0 && (a.rating !== undefined || b.rating !== undefined)) {
-        const aR = a.rating ?? 0;
-        const bR = b.rating ?? 0;
-        if (bR !== aR) return bR - aR;
-        return (b.ratingCount || 0) - (a.ratingCount || 0);
-      }
       const aPoints = a.points || 0;
       const bPoints = b.points || 0;
       const pDiff = bPoints - aPoints;
@@ -590,9 +633,13 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   const [searchQuery, setSearchQuery] = useState<string>(() =>
     getInitialParam("q", cachedFeedState?.filters.query || "")
   );
-  const [sortBy, setSortBy] = useState<"points" | "likes" | "aiquLikes" | "recent" | "chapters">(() =>
-    (getInitialParam("sort", cachedFeedState?.filters.sort || "likes") as any)
-  );
+  const [sortBy, setSortBy] = useState<"points" | "likes" | "aiquLikes" | "recent" | "chapters">(() => {
+    const fromUrl = getInitialParam("sort", cachedFeedState?.filters.sort || "");
+    if (fromUrl) return fromUrl as any;
+    const initialSite = getInitialParam("site", cachedFeedState?.filters.site || "all");
+    if (initialSite === "jjwxc") return "points";
+    return "likes";
+  });
   const [page, setPage] = useState<number>(() => {
     const pageStr = getInitialParam("page", "");
     const parsed = parseInt(pageStr, 10);
@@ -658,6 +705,15 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   // UI State
   const [expandedSummaryIds, setExpandedSummaryIds] = useState<Record<string, boolean>>({});
   const [showTropesDrawer, setShowTropesDrawer] = useState<boolean>(false);
+  // Language toggle state: cardId -> boolean (false = English translated (default), true = original Chinese)
+  const [chineseModeCards, setChineseModeCards] = useState<Record<string, boolean>>({});
+
+  const toggleCardLanguage = (cardId: string) => {
+    setChineseModeCards((prev) => ({
+      ...prev,
+      [cardId]: !prev[cardId],
+    }));
+  };
 
   // Chapter Preview & Import Modal State
   const [previewNovel, setPreviewNovel] = useState<StoreNovelDetail | null>(null);
@@ -680,9 +736,13 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     isLoading: boolean;
     item: ExploreNovelItem | null;
     chapterTitle: string;
+    chapterTitleZh?: string;
+    chapterTitleEn?: string;
     chapterIndex: number;
     totalChapters: number;
     content: string;
+    englishContent?: string;
+    isZh?: boolean;
     allChapters?: ChapterItem[];
     error?: string | null;
   }
@@ -694,6 +754,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     chapterIndex: 1,
     totalChapters: 0,
     content: "",
+    isZh: false,
   });
 
   // Save feed cache on unmount or update
@@ -724,12 +785,12 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   // Filtered/Computed novel list (or wishlist with 20-per-page slicing)
   const displayItems = useMemo(() => {
     if (showWishlistOnly) {
-      const sorted = sortNovelItems(wishlist, sortBy);
+      const sorted = sortNovelItems(wishlist, sortBy, selectedSite, searchQuery);
       const start = (wishlistPage - 1) * 20;
       return sorted.slice(start, start + 20);
     }
-    return sortNovelItems(items, sortBy);
-  }, [items, wishlist, showWishlistOnly, sortBy, wishlistPage]);
+    return sortNovelItems(items, sortBy, selectedSite, searchQuery);
+  }, [items, wishlist, showWishlistOnly, sortBy, wishlistPage, selectedSite, searchQuery]);
 
   // Total pages calculation (20 novels per page)
   const totalPages = useMemo(() => {
@@ -776,7 +837,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     // 1. Instant cache hit (reject if stale or contains legacy corrupted nutrient votes > 10000)
     const hasCorruptedVotes = cached?.items?.some((it) => it.aiquLikes && it.aiquLikes > 10000);
     if (!forceRefresh && !hasCorruptedVotes && cached && now - cached.timestamp < CLIENT_CACHE_TTL_MS) {
-      setItems(sortNovelItems(cached.items, sort));
+      setItems(sortNovelItems(cached.items, sort, site, query));
       setTotalAvailable(cached.total);
       setHasMore(cached.hasMore);
       setPage(pageIdx);
@@ -867,7 +928,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
 
       setTotalAvailable(totalCount);
       setHasMore(moreAvailable);
-      setItems(sortNovelItems(newItems, sort));
+      setItems(sortNovelItems(newItems, sort, site, query));
       setPage(pageIdx);
 
       // Save to client cache
@@ -906,7 +967,9 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
   // Filter handlers - update selection state only; search executes on Search button click or page change
   const handleSelectSite = (siteId: string) => {
     setSelectedSite(siteId);
-    if ((siteId === "aiqu226" || siteId === "52shuku" || siteId === "fuxsb") && sortBy === "points") {
+    if (siteId === "jjwxc") {
+      setSortBy("points");
+    } else if ((siteId === "czbooks" || siteId === "aiqu226" || siteId === "52shuku" || siteId === "fuxsb" || siteId === "dmxs") && sortBy === "points") {
       setSortBy("likes");
     }
   };
@@ -984,11 +1047,70 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
     fetchExploreFeed(1);
   };
 
-  const toggleSummary = (id: string) => {
+  const [loadingIntroIds, setLoadingIntroIds] = useState<Record<string, boolean>>({});
+
+  const toggleSummary = async (item: ExploreNovelItem) => {
+    const id = item.id;
+    const isCurrentlyExpanded = !!expandedSummaryIds[id];
+
+    // Toggle UI expansion immediately for instant responsiveness
     setExpandedSummaryIds((prev) => ({
       ...prev,
-      [id]: !prev[id],
+      [id]: !isCurrentlyExpanded,
     }));
+
+    // If expanding and summary is short, truncated, or JJWXC snippet, fetch unabridged full synopsis from source
+    const curSummary = item.summaryZh || item.summary || "";
+    const isTruncated =
+      item.siteId === "jjwxc"
+        ? !item.hasFullSynopsis && (curSummary.length < 250 || curSummary.endsWith("...") || curSummary.endsWith("…"))
+        : curSummary.endsWith("...") || curSummary.endsWith("…") || curSummary.length < 180;
+
+    if (!isCurrentlyExpanded && isTruncated && !loadingIntroIds[id]) {
+      setLoadingIntroIds((prev) => ({ ...prev, [id]: true }));
+      try {
+        const res = await fetch("/api/store/full-intro", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...getAuthHeaders(),
+          },
+          body: JSON.stringify({
+            novelUrl: item.novelUrl,
+            siteId: item.siteId,
+            title: item.title,
+            author: item.author,
+          }),
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success && (data.introZh || data.introEn)) {
+            setItems((prev) =>
+              prev.map((it) => {
+                if (it.id === id || it.novelUrl === item.novelUrl) {
+                  return {
+                    ...it,
+                    hasFullSynopsis: true,
+                    summaryZh: data.introZh || it.summaryZh,
+                    summaryEn: data.introEn || it.summaryEn,
+                    summary: data.intro || it.summary,
+                    authorZh: cleanAuthorName(data.author || it.authorZh),
+                    author: cleanAuthorName(data.author || it.author),
+                    fileSize: data.fileSize || it.fileSize,
+                  };
+                }
+                return it;
+              })
+            );
+          }
+        }
+      } catch (e) {
+        // Graceful fallback
+      } finally {
+        setLoadingIntroIds((prev) => ({ ...prev, [id]: false }));
+      }
+    }
   };
 
   // Open Chapter Selection Modal for a novel (with auto cross-mirror resolution)
@@ -1106,10 +1228,14 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
       setPeekState((prev) => ({
         ...prev,
         isLoading: false,
-        chapterTitle: data.chapterTitle || "Chapter 1",
+        chapterTitle: data.chapterTitleEn || data.chapterTitle || "Chapter 1",
+        chapterTitleZh: data.chapterTitleZh || data.chapterTitle || "Chapter 1",
+        chapterTitleEn: data.chapterTitleEn || data.chapterTitle || "Chapter 1",
         chapterIndex: data.chapterIndex || 1,
         totalChapters: data.totalChapters || prev.totalChapters,
         content: data.content || "No chapter content found.",
+        englishContent: data.englishContent || "",
+        isZh: false, // Default to English translation
         allChapters: data.allChapters,
       }));
     } catch (err: any) {
@@ -1157,8 +1283,11 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
       setPeekState((prev) => ({
         ...prev,
         isLoading: false,
-        chapterTitle: data.chapterTitle || targetChapter.title || `Chapter ${targetIndex}`,
+        chapterTitle: data.chapterTitleEn || data.chapterTitle || targetChapter.title || `Chapter ${targetIndex}`,
+        chapterTitleZh: data.chapterTitleZh || data.chapterTitle || targetChapter.title || `Chapter ${targetIndex}`,
+        chapterTitleEn: data.chapterTitleEn || data.chapterTitle || targetChapter.title || `Chapter ${targetIndex}`,
         content: data.content || "No chapter content found.",
+        englishContent: data.englishContent || "",
       }));
 
       // Scroll reader container to top
@@ -1177,12 +1306,15 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
 
   // Clean split paragraphs for the reader to ensure proper paragraph spacing
   const peekParagraphs = useMemo(() => {
-    if (!peekState.content) return [];
-    return peekState.content
+    const raw = peekState.isZh
+      ? peekState.content
+      : (peekState.englishContent || peekState.content);
+    if (!raw) return [];
+    return raw
       .split(/\r?\n+/)
       .map((p) => p.trim())
       .filter(Boolean);
-  }, [peekState.content]);
+  }, [peekState.isZh, peekState.content, peekState.englishContent]);
 
   // Direct 1-Click Import (Always imports ALL chapters as requested by user)
   const handleDirectImport = async (item: ExploreNovelItem) => {
@@ -1231,6 +1363,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
           novelUrl: detail.novelUrl || item.novelUrl,
           siteId: detail.siteId || item.siteId,
           title: item.title,
+          author: item.author,
           startChapter: 1,
           endChapter: totalChapters,
           importAll: true,
@@ -1274,6 +1407,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
           novelUrl: targetNovel.novelUrl,
           siteId: targetNovel.siteId,
           title: targetNovel.title,
+          author: (targetNovel as any).author,
           startChapter: 1,
           endChapter: targetNovel.chapters.length,
           importAll: true,
@@ -1358,6 +1492,24 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
         )}
       </>
     );
+  };
+
+  // Clean author name for store search (remove "作者：" or "by:" prefix if any)
+  const cleanAuthorName = (authorStr: string): string => {
+    if (!authorStr) return "";
+    return authorStr
+      .replace(/^作者[：:]\s*/i, "")
+      .replace(/^by\s*[:：]?\s*/i, "")
+      .trim();
+  };
+
+  const handleAuthorClick = (e: React.MouseEvent, rawAuthor: string) => {
+    e.stopPropagation();
+    const author = cleanAuthorName(rawAuthor);
+    if (!author) return;
+    if (onSearchStore) {
+      onSearchStore(author, "aiqu226");
+    }
   };
 
   // Reset all filters and clear all results
@@ -1605,6 +1757,12 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
           <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mr-1">Sort:</span>
           {SORT_OPTIONS.map((opt) => {
             const active = sortBy === opt.id;
+            const label =
+              selectedSite === "jjwxc" && opt.id === "points"
+                ? "⭐️ Article Points"
+                : selectedSite === "czbooks" && opt.id === "likes"
+                ? "🔖 Bookmarks"
+                : opt.shortLabel;
             return (
               <button
                 key={opt.id}
@@ -1616,7 +1774,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                     : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-purple-50 dark:hover:bg-slate-700"
                 }`}
               >
-                {opt.shortLabel}
+                {label}
               </button>
             );
           })}
@@ -1774,6 +1932,9 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                 const isJjwxc = item.siteId === "jjwxc";
                 const bookmarked = isWishlisted(item);
                 const rankNum = (currentActivePage - 1) * 20 + index + 1;
+                const isCardZh = !!chineseModeCards[item.id];
+                const cardTitle = isCardZh ? (item.titleZh || item.title) : (item.titleEn || item.title);
+                const cardAuthor = cleanAuthorName(isCardZh ? (item.authorZh || item.author) : (item.authorEn || item.author));
 
                 return (
                   <div
@@ -1786,13 +1947,20 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                       </span>
 
                       <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2 flex-wrap">
+                        <div className="flex items-center gap-1.5 flex-wrap">
                           <h3 className="text-sm font-bold text-slate-900 dark:text-white truncate">
-                            {renderHighlightedText(item.title, searchQuery)}
+                            {renderHighlightedText(cardTitle, searchQuery)}
                           </h3>
-                          <span className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                            / {renderHighlightedText(item.author, searchQuery)}
-                          </span>
+                          <span className="text-xs text-slate-400">/</span>
+                          <button
+                            type="button"
+                            onClick={(e) => handleAuthorClick(e, item.authorZh || item.author)}
+                            title={`Search all novels by "${cardAuthor}" in Store`}
+                            className="text-xs font-semibold text-purple-700 dark:text-purple-300 hover:text-purple-900 dark:hover:text-purple-100 hover:underline inline-flex items-center gap-1 truncate cursor-pointer transition"
+                          >
+                            <span>{renderHighlightedText(cardAuthor, searchQuery)}</span>
+                            <Search className="w-2.5 h-2.5 opacity-60" />
+                          </button>
                         </div>
 
                         <div className="flex items-center gap-2 mt-1 flex-wrap text-[11px] text-slate-500">
@@ -1801,8 +1969,12 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                           </span>
                           <span>•</span>
                           <span>{item.orientationLabel}</span>
-                          <span>•</span>
-                          <span>{item.year}</span>
+                          {(item.year || (item.dateStr && /^\d{4}/.test(item.dateStr))) && (
+                            <>
+                              <span>•</span>
+                              <span>{item.year || item.dateStr?.slice(0, 4)}</span>
+                            </>
+                          )}
                           {item.fileSize && (
                             <>
                               <span>•</span>
@@ -1840,14 +2012,39 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                           </span>
                         )}
                         {item.likes !== undefined && item.likes > 0 && (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-pink-50 dark:bg-pink-950/50 text-pink-700 dark:text-pink-300 text-[11px] font-bold border border-pink-200/60 dark:border-pink-900/40">
-                            <Heart className="h-3 w-3 fill-pink-500 text-pink-500" />
-                            <span>{formatDisplayLikes(item.likes)}</span>
-                          </span>
+                          item.siteId === "czbooks" ? (
+                            <span
+                              title={`Bookmarks (收藏數): ${item.likes.toLocaleString()}`}
+                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-sky-50 dark:bg-sky-950/50 text-sky-700 dark:text-sky-300 text-[11px] font-bold border border-sky-200/60 dark:border-sky-900/40"
+                            >
+                              <Bookmark className="h-3 w-3 fill-sky-400 text-sky-600" />
+                              <span>{formatDisplayLikes(item.likes)} bookmarks</span>
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-pink-50 dark:bg-pink-950/50 text-pink-700 dark:text-pink-300 text-[11px] font-bold border border-pink-200/60 dark:border-pink-900/40">
+                              <Heart className="h-3 w-3 fill-pink-500 text-pink-500" />
+                              <span>{formatDisplayLikes(item.likes)}</span>
+                            </span>
+                          )
                         )}
                       </div>
 
                       <div className="flex items-center gap-1.5">
+                        {/* Translate Icon Button */}
+                        <button
+                          type="button"
+                          onClick={() => toggleCardLanguage(item.id)}
+                          title={isCardZh ? "Switch back to English translation" : "Show original Chinese text (中文)"}
+                          aria-label={isCardZh ? "Switch to English" : "Switch to Chinese"}
+                          className={`p-1.5 rounded-lg border transition cursor-pointer ${
+                            isCardZh
+                              ? "border-purple-300 bg-purple-100 text-purple-700 dark:bg-purple-900/70 dark:border-purple-600 dark:text-purple-200"
+                              : "border-slate-200 dark:border-slate-800 text-slate-400 hover:text-purple-600 hover:bg-purple-50 dark:hover:bg-slate-800"
+                          }`}
+                        >
+                          <Languages className="h-3.5 w-3.5" />
+                        </button>
+
                         {/* Bookmark / Wishlist button */}
                         <button
                           type="button"
@@ -1868,8 +2065,8 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                           onClick={() => {
                             if (onOpenReader) {
                               onOpenReader({
-                                novelTitle: item.title,
-                                author: item.author,
+                                novelTitle: cardTitle,
+                                author: cardAuthor,
                                 coverUrl: item.coverUrl,
                                 novelUrl: item.novelUrl,
                                 siteId: item.siteId,
@@ -1910,34 +2107,64 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
             /* DETAILED CARD VIEW */
             displayItems.map((item, index) => {
               const isExpanded = !!expandedSummaryIds[item.id];
-              const displaySummary = item.summary || "No synopsis available for this novel.";
-              const isLongSummary = displaySummary.length > 50 || displaySummary.includes("\n");
+              const isCardZh = !!chineseModeCards[item.id];
+              const cardTitle = isCardZh ? (item.titleZh || item.title) : (item.titleEn || item.title);
+              const cardAuthor = cleanAuthorName(isCardZh ? (item.authorZh || item.author) : (item.authorEn || item.author));
+              const cardSummary = isCardZh ? (item.summaryZh || item.summary) : (item.summaryEn || item.summary);
+              const displaySummary = cleanSummaryText(cardSummary) || "No synopsis available for this novel.";
+              const isLongSummary = displaySummary.length > 70 || displaySummary.includes("\n") || displaySummary.endsWith("...") || displaySummary.endsWith("…");
               const isJjwxc = item.siteId === "jjwxc";
+              const canExpandSummary =
+                isJjwxc ||
+                isLongSummary ||
+                displaySummary.endsWith("...") ||
+                displaySummary.endsWith("…") ||
+                Boolean(item.hasFullSynopsis) ||
+                Boolean(item.summaryZh && item.summaryZh.length > 80);
               const bookmarked = isWishlisted(item);
               const cardTags = getAugmentedCardTags(item);
               const rankNum = (currentActivePage - 1) * 20 + index + 1;
+              const isLoadingThisIntro = !!loadingIntroIds[item.id];
 
               return (
                 <div
                   key={item.id || index}
                   className="group relative bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-3.5 sm:p-4 shadow-xs hover:shadow-md hover:border-purple-300 dark:hover:border-purple-600/60 transition-all duration-200"
                 >
-                  {/* Bookmark Button - Pinned cleanly inside the card's top-right corner */}
-                  <button
-                    type="button"
-                    onClick={() => toggleWishlist(item)}
-                    title={bookmarked ? "Remove from Reading List" : "Save to Reading List"}
-                    className={`absolute top-3 right-3 sm:top-3.5 sm:right-3.5 p-1.5 rounded-lg border transition-all z-10 cursor-pointer ${
-                      bookmarked
-                        ? "text-rose-600 bg-rose-50 border-rose-200 dark:bg-rose-950/60 dark:border-rose-800"
-                        : "text-slate-400 bg-slate-50/80 border-slate-200/80 hover:text-rose-500 hover:bg-slate-100 dark:bg-slate-800/80 dark:border-slate-700 dark:hover:bg-slate-700"
-                    }`}
-                  >
-                    <Bookmark className={`h-4 w-4 ${bookmarked ? "fill-rose-500 text-rose-500" : ""}`} />
-                  </button>
+                  {/* Language Toggle & Bookmark Buttons - Pinned cleanly inside the card's top-right corner */}
+                  <div className="absolute top-3 right-3 sm:top-3.5 sm:right-3.5 flex items-center gap-1.5 z-10">
+                    {/* Translate Icon Button (0 data client toggle between English & Chinese) */}
+                    <button
+                      type="button"
+                      onClick={() => toggleCardLanguage(item.id)}
+                      title={isCardZh ? "Switch back to English translation" : "Show original Chinese text (中文)"}
+                      aria-label={isCardZh ? "Switch to English" : "Switch to Chinese"}
+                      className={`p-1.5 rounded-lg border transition-all cursor-pointer ${
+                        isCardZh
+                          ? "text-purple-700 bg-purple-100 border-purple-300 dark:bg-purple-900/70 dark:border-purple-600 dark:text-purple-200 shadow-xs"
+                          : "text-slate-400 bg-slate-50/80 border-slate-200/80 hover:text-purple-600 hover:bg-purple-50 hover:border-purple-200 dark:bg-slate-800/80 dark:border-slate-700 dark:hover:bg-slate-700 dark:hover:text-purple-300"
+                      }`}
+                    >
+                      <Languages className="h-4 w-4" />
+                    </button>
 
-                  {/* Top Row: Rank, Badges, & Metrics (with right padding so it never overlaps bookmark) */}
-                  <div className="flex flex-wrap items-center gap-1.5 mb-2.5 pr-9">
+                    {/* Bookmark Button */}
+                    <button
+                      type="button"
+                      onClick={() => toggleWishlist(item)}
+                      title={bookmarked ? "Remove from Reading List" : "Save to Reading List"}
+                      className={`p-1.5 rounded-lg border transition-all cursor-pointer ${
+                        bookmarked
+                          ? "text-rose-600 bg-rose-50 border-rose-200 dark:bg-rose-950/60 dark:border-rose-800"
+                          : "text-slate-400 bg-slate-50/80 border-slate-200/80 hover:text-rose-500 hover:bg-slate-100 dark:bg-slate-800/80 dark:border-slate-700 dark:hover:bg-slate-700"
+                      }`}
+                    >
+                      <Bookmark className={`h-4 w-4 ${bookmarked ? "fill-rose-500 text-rose-500" : ""}`} />
+                    </button>
+                  </div>
+
+                  {/* Top Row: Rank, Badges, & Metrics (with right padding so it never overlaps buttons) */}
+                  <div className="flex flex-wrap items-center gap-1.5 mb-2.5 pr-20">
                     <span className="inline-flex h-5 min-w-[24px] px-1.5 items-center justify-center rounded-md bg-purple-100 dark:bg-purple-900/60 text-[10px] font-bold text-purple-700 dark:text-purple-300">
                       #{rankNum}
                     </span>
@@ -1982,9 +2209,11 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                       </span>
                     )}
 
-                    <span className="inline-flex items-center px-1.5 py-0.5 rounded-md bg-indigo-50 dark:bg-indigo-950/60 text-[10px] font-semibold text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-900/40">
-                      📅 {item.year}
-                    </span>
+                    {(item.year || (item.dateStr && /^\d{4}/.test(item.dateStr))) && (
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded-md bg-indigo-50 dark:bg-indigo-950/60 text-[10px] font-semibold text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-900/40">
+                        📅 {item.year || item.dateStr?.slice(0, 4)}
+                      </span>
+                    )}
 
                     {/* Metric Badges */}
                     {item.rating !== undefined && item.rating > 0 && (
@@ -2019,26 +2248,42 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                     )}
 
                     {item.likes !== undefined && item.likes > 0 && (
-                      <span
-                        title={`Likes / Bookmarks: ${item.likes.toLocaleString()}`}
-                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-pink-50 dark:bg-pink-950/50 text-pink-700 dark:text-pink-300 text-[10px] font-bold border border-pink-200/70 dark:border-pink-900/40"
-                      >
-                        <Heart className="h-3 w-3 fill-pink-500 text-pink-500" />
-                        <span>{formatDisplayLikes(item.likes)}</span>
-                      </span>
+                      item.siteId === "czbooks" ? (
+                        <span
+                          title={`Bookmarks (收藏數): ${item.likes.toLocaleString()}`}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-sky-50 dark:bg-sky-950/50 text-sky-700 dark:text-sky-300 text-[10px] font-bold border border-sky-200/70 dark:border-sky-900/40"
+                        >
+                          <Bookmark className="h-3 w-3 fill-sky-400 text-sky-600" />
+                          <span>{formatDisplayLikes(item.likes)} bookmarks</span>
+                        </span>
+                      ) : (
+                        <span
+                          title={`Likes: ${item.likes.toLocaleString()}`}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-pink-50 dark:bg-pink-950/50 text-pink-700 dark:text-pink-300 text-[10px] font-bold border border-pink-200/70 dark:border-pink-900/40"
+                        >
+                          <Heart className="h-3 w-3 fill-pink-500 text-pink-500" />
+                          <span>{formatDisplayLikes(item.likes)}</span>
+                        </span>
+                      )
                     )}
                   </div>
 
                   {/* Title & Author */}
                   <div className="mb-2">
                     <h3 className="text-sm sm:text-base font-bold text-slate-900 dark:text-white leading-snug">
-                      {renderHighlightedText(item.title, searchQuery)}
+                      {renderHighlightedText(cardTitle, searchQuery)}
                     </h3>
-                    <p className="text-[11px] sm:text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                      Author:{" "}
-                      <span className="font-semibold text-slate-700 dark:text-slate-200">
-                        {renderHighlightedText(item.author, searchQuery)}
-                      </span>
+                    <p className="text-[11px] sm:text-xs text-slate-500 dark:text-slate-400 mt-0.5 flex items-center gap-1 flex-wrap">
+                      <span>Author:</span>
+                      <button
+                        type="button"
+                        onClick={(e) => handleAuthorClick(e, item.authorZh || item.author)}
+                        title={`Search all novels by "${cardAuthor}" in Store`}
+                        className="font-semibold text-purple-700 dark:text-purple-300 hover:text-purple-900 dark:hover:text-purple-100 hover:underline inline-flex items-center gap-1 cursor-pointer transition"
+                      >
+                        <span>{renderHighlightedText(cardAuthor, searchQuery)}</span>
+                        <Search className="w-2.5 h-2.5 opacity-60" />
+                      </button>
                     </p>
                   </div>
 
@@ -2059,16 +2304,22 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                   {/* Synopsis Box */}
                   <div className="rounded-lg bg-slate-50/90 dark:bg-slate-800/40 border border-slate-200/80 dark:border-slate-800 p-2.5 sm:p-3 mb-2.5 text-[11px] sm:text-xs leading-relaxed text-slate-700 dark:text-slate-300">
                     <div className="flex items-center justify-between font-bold text-[10px] sm:text-[11px] text-purple-700 dark:text-purple-300 mb-1">
-                      <div className="flex items-center gap-1">
-                        <BookOpen className="h-3.5 w-3.5 text-purple-600 dark:text-purple-400" />
-                        <span>Synopsis / 简介:</span>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <BookOpen className="h-3.5 w-3.5 text-purple-600 dark:text-purple-400 shrink-0" />
+                        <span>{isCardZh ? "Synopsis / 简介 (中文):" : "Synopsis (English):"}</span>
+                        {isLoadingThisIntro && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-normal text-purple-600 dark:text-purple-400 animate-pulse ml-1">
+                            <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                            Loading full text...
+                          </span>
+                        )}
                       </div>
 
-                      {isLongSummary && (
+                      {canExpandSummary && (
                         <button
                           type="button"
-                          onClick={() => toggleSummary(item.id)}
-                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-950/60 transition cursor-pointer"
+                          onClick={() => toggleSummary(item)}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold text-purple-600 dark:text-purple-400 bg-purple-50 dark:bg-purple-950/50 hover:bg-purple-100 dark:hover:bg-purple-900/60 border border-purple-200/70 dark:border-purple-800/70 transition cursor-pointer"
                         >
                           {isExpanded ? (
                             <>
@@ -2077,7 +2328,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                             </>
                           ) : (
                             <>
-                              <span>Read More</span>
+                              <span>Show More</span>
                               <ChevronDown className="h-3 w-3" />
                             </>
                           )}
@@ -2086,10 +2337,12 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                     </div>
 
                     <div className="whitespace-pre-line text-slate-600 dark:text-slate-300">
-                      {isExpanded || !isLongSummary
+                      {isExpanded || (!isLongSummary && !isJjwxc && !displaySummary.endsWith("...") && !displaySummary.endsWith("…"))
                         ? renderHighlightedText(displaySummary, searchQuery)
                         : renderHighlightedText(
-                            displaySummary.slice(0, 85) + (displaySummary.length > 85 ? "..." : ""),
+                            displaySummary.length > 130
+                              ? displaySummary.slice(0, 130) + "..."
+                              : displaySummary,
                             searchQuery
                           )}
                     </div>
@@ -2121,7 +2374,7 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                       {onSearchStore && (
                         <button
                           type="button"
-                          onClick={() => onSearchStore(item.title)}
+                          onClick={() => onSearchStore(item.titleZh || item.title)}
                           className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-100 dark:bg-slate-800 hover:bg-purple-100 dark:hover:bg-purple-900/40 text-[10px] sm:text-[11px] font-semibold text-slate-600 dark:text-slate-300 hover:text-purple-700 dark:hover:text-purple-300 transition cursor-pointer"
                         >
                           <Search className="h-3 w-3" />
@@ -2137,8 +2390,8 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                         onClick={() => {
                           if (onOpenReader) {
                             onOpenReader({
-                              novelTitle: item.title,
-                              author: item.author,
+                              novelTitle: cardTitle,
+                              author: cardAuthor,
                               coverUrl: item.coverUrl,
                               novelUrl: item.novelUrl,
                               siteId: item.siteId,
@@ -2226,13 +2479,58 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                 <h3 className="text-base font-bold text-slate-900 dark:text-white leading-tight truncate">
                   {peekState.item?.title}
                 </h3>
-                <p className="text-xs text-slate-500 mt-0.5 truncate">
-                  Author: <span className="font-semibold text-slate-700 dark:text-slate-300">{peekState.item?.author}</span>
+                <p className="text-xs text-slate-500 mt-0.5 truncate flex items-center gap-1 flex-wrap">
+                  <span>Author:</span>
+                  {peekState.item?.author ? (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        setPeekState((prev) => ({ ...prev, isOpen: false }));
+                        handleAuthorClick(e, peekState.item!.author);
+                      }}
+                      title={`Search all novels by "${peekState.item.author}" in Store`}
+                      className="font-semibold text-purple-700 dark:text-purple-300 hover:text-purple-900 dark:hover:text-purple-100 hover:underline inline-flex items-center gap-1 cursor-pointer transition"
+                    >
+                      <span>{peekState.item.author}</span>
+                      <Search className="w-2.5 h-2.5 opacity-60" />
+                    </button>
+                  ) : (
+                    <span className="font-semibold text-slate-700 dark:text-slate-300">Unknown</span>
+                  )}
                   {peekState.totalChapters > 0 && ` • ${peekState.totalChapters} Chapters`}
                 </p>
               </div>
 
               <div className="flex items-center gap-1">
+                {/* Zero Mobile Data Language Toggle Button (Inline SVG, safe from image blockers) */}
+                <button
+                  type="button"
+                  onClick={() => setPeekState((prev) => ({ ...prev, isZh: !prev.isZh }))}
+                  title={
+                    peekState.isZh
+                      ? "Currently Original Chinese · Click for English Translation (0 Data)"
+                      : "Currently English · Click for Original Chinese (0 Data)"
+                  }
+                  className={`p-1.5 rounded-lg border transition cursor-pointer flex items-center justify-center relative ${
+                    peekState.isZh
+                      ? "bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30"
+                      : "bg-purple-600/15 text-purple-700 dark:text-purple-300 border-purple-500/30"
+                  }`}
+                  aria-label="Toggle Peek Language"
+                >
+                  <Languages className="h-4 w-4 shrink-0" />
+                  <span
+                    aria-hidden="true"
+                    className={`absolute -bottom-1 -right-1 text-[7px] font-black px-1 py-0.2 rounded-full border leading-tight ${
+                      peekState.isZh
+                        ? "bg-amber-600 text-white border-amber-700"
+                        : "bg-purple-600 text-white border-purple-700"
+                    }`}
+                  >
+                    {peekState.isZh ? "ZH" : "EN"}
+                  </span>
+                </button>
+
                 {/* Header Chapter Nav Arrows */}
                 <button
                   type="button"
@@ -2292,7 +2590,9 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                 <>
                   <div className="text-center pb-3 border-b border-slate-100 dark:border-slate-800 font-sans">
                     <h4 className="text-base font-bold text-purple-700 dark:text-purple-300">
-                      {peekState.chapterTitle}
+                      {peekState.isZh
+                        ? (peekState.chapterTitleZh || peekState.chapterTitle)
+                        : (peekState.chapterTitleEn || peekState.chapterTitle)}
                     </h4>
                   </div>
                   <div className="space-y-4 font-serif text-[15px] leading-relaxed text-slate-800 dark:text-slate-200">
@@ -2374,7 +2674,25 @@ export const ExploreView: React.FC<ExploreViewProps> = ({
                 <h3 className="text-base font-bold text-slate-900 dark:text-white leading-tight">
                   {previewNovel.title}
                 </h3>
-                <p className="text-xs text-slate-500">Author: {previewNovel.author}</p>
+                <p className="text-xs text-slate-500 flex items-center gap-1 flex-wrap mt-0.5">
+                  <span>Author:</span>
+                  {previewNovel.author ? (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        setPreviewNovel(null);
+                        handleAuthorClick(e, previewNovel.author);
+                      }}
+                      title={`Search all novels by "${previewNovel.author}" in Store`}
+                      className="font-semibold text-purple-700 dark:text-purple-300 hover:text-purple-900 dark:hover:text-purple-100 hover:underline inline-flex items-center gap-1 cursor-pointer transition"
+                    >
+                      <span>{previewNovel.author}</span>
+                      <Search className="w-2.5 h-2.5 opacity-60" />
+                    </button>
+                  ) : (
+                    <span>Unknown</span>
+                  )}
+                </p>
               </div>
               <button
                 onClick={() => setPreviewNovel(null)}

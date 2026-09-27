@@ -11,9 +11,16 @@ import {
   Clock,
   ArrowRight,
   TrendingUp,
+  Zap,
+  Cloud,
 } from "lucide-react";
 import { LibraryBook } from "../types";
-import { getLocalLibraryBooks, removeBookFromLibrary } from "../utils/indexedDbStorage";
+import {
+  getLocalLibraryBooks,
+  removeBookFromLibrary,
+  removeReadingHistoryItem,
+  getAllNovelCachedChapterCounts,
+} from "../utils/indexedDbStorage";
 
 interface LibraryViewProps {
   onOpenReader: (novel: {
@@ -25,20 +32,26 @@ interface LibraryViewProps {
     chapterIndex?: number;
     totalChapters?: number;
   }) => void;
-  onSearchStore?: (keyword: string) => void;
+  onSearchStore?: (keyword: string, site?: string) => void;
   onTranslateWholeBook?: (book: LibraryBook) => void;
+  onDeleteNovel?: (novelTitle: string) => void;
+  getAuthHeaders?: () => Record<string, string>;
 }
 
 export const LibraryView: React.FC<LibraryViewProps> = ({
   onOpenReader,
   onSearchStore,
   onTranslateWholeBook,
+  onDeleteNovel,
+  getAuthHeaders,
 }) => {
   const [books, setBooks] = useState<LibraryBook[]>(() => getLocalLibraryBooks());
   const [searchQuery, setSearchQuery] = useState("");
+  const [cacheCounts, setCacheCounts] = useState<Record<string, number>>({});
 
   const refreshBooks = () => {
     setBooks(getLocalLibraryBooks());
+    getAllNovelCachedChapterCounts().then(setCacheCounts).catch(() => {});
   };
 
   useEffect(() => {
@@ -54,8 +67,36 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
   const handleRemove = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    const book = books.find((b) => b.id === id);
+    if (!book) return;
+    if (!window.confirm(`Delete "${book.title}" from your library and delete its translations from the server?`)) {
+      return;
+    }
+
     const updated = removeBookFromLibrary(id);
     setBooks(updated);
+    removeReadingHistoryItem(id);
+    removeReadingHistoryItem(book.title);
+
+    try {
+      const headers = getAuthHeaders ? getAuthHeaders() : {};
+      fetch("/api/cloud-job/delete", {
+        method: "POST",
+        headers: {
+          ...headers,
+          "Content-Type": "application/json",
+          "x-novel-filename": encodeURIComponent(book.title),
+        },
+        body: JSON.stringify({
+          fileName: book.title,
+          jobId: book.id,
+        }),
+      }).catch(() => {});
+    } catch {}
+
+    if (onDeleteNovel) {
+      onDeleteNovel(book.title);
+    }
   };
 
   const filteredBooks = useMemo(() => {
@@ -143,6 +184,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             const currentCh = book.currentChapterIndex || 1;
             const totalCh = book.totalChapters || 1;
             const progressPercent = Math.min(100, Math.round((currentCh / Math.max(1, totalCh)) * 100));
+            const novelKey = book.id || `${book.siteId || "src"}_${book.title}`.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, "_");
+            const cachedChCount = cacheCounts[book.id] || cacheCounts[novelKey] || Object.entries(cacheCounts).find(([k]) => k.includes(book.title))?.[1] || 0;
 
             return (
               <div
@@ -169,6 +212,20 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                           {book.siteName}
                         </span>
                       )}
+
+                      {/* Offline Cached Badge */}
+                      {cachedChCount > 0 ? (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-md bg-emerald-100 dark:bg-emerald-950/80 text-emerald-700 dark:text-emerald-300 border border-emerald-300/60 dark:border-emerald-800/60">
+                          <Zap className="h-2.5 w-2.5 text-emerald-600 dark:text-emerald-400 fill-current" />
+                          <span>{cachedChCount} Ch Offline Ready</span>
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400">
+                          <Cloud className="h-2.5 w-2.5" />
+                          <span>Online Stream</span>
+                        </span>
+                      )}
+
                       <span className="text-[10px] text-slate-400 font-medium">
                         Added {new Date(book.addedAt || Date.now()).toLocaleDateString()}
                       </span>
@@ -177,8 +234,29 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                     <h3 className="text-sm sm:text-base font-bold text-slate-900 dark:text-white truncate group-hover:text-purple-600 dark:group-hover:text-purple-400 transition-colors">
                       {book.title}
                     </h3>
-                    <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                      {book.author ? `Author: ${book.author}` : "Web Novel"}
+                    <p className="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5">
+                      {book.author ? (
+                        <span className="inline-flex items-center gap-1">
+                          <span>Author:</span>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (onSearchStore && book.author) {
+                                const cleanAuthor = book.author.replace(/^作者[：:]\s*/i, "").replace(/^by\s*[:：]?\s*/i, "").trim();
+                                if (cleanAuthor) onSearchStore(cleanAuthor, "aiqu226");
+                              }
+                            }}
+                            title={`Search all novels by "${book.author}" in Store`}
+                            className="font-semibold text-purple-700 dark:text-purple-300 hover:text-purple-900 dark:hover:text-purple-100 hover:underline inline-flex items-center gap-1 cursor-pointer transition"
+                          >
+                            <span>{book.author}</span>
+                            <Search className="w-2.5 h-2.5 opacity-60" />
+                          </button>
+                        </span>
+                      ) : (
+                        "Web Novel"
+                      )}
                     </p>
                   </div>
 

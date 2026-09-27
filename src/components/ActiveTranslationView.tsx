@@ -22,6 +22,8 @@ import {
   Search,
   ExternalLink,
   ListOrdered,
+  Cloud,
+  PlusCircle,
 } from "lucide-react";
 import {
   TranslationSession,
@@ -55,11 +57,14 @@ interface ActiveTranslationViewProps {
   onDownloadProgress: (format?: "epub" | "txt") => void;
   onTranslateChunk: (chunkId: string) => void;
   onReset: () => void;
+  onTranslateNewNovel?: () => void;
   completedEnglishWords: number;
   lastDownloadedWords: number;
   onSyncProgress?: () => void;
   isSyncing?: boolean;
   onOpenReader?: () => void;
+  firestoreStatus?: { isQuotaExhausted: boolean; isAvailable: boolean };
+  aiCooldownSecondsRemaining?: number;
 }
 
 function formatDuration(seconds: number): string {
@@ -97,11 +102,14 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
   onDownloadProgress,
   onTranslateChunk,
   onReset,
+  onTranslateNewNovel,
   completedEnglishWords,
   lastDownloadedWords,
   onSyncProgress,
   isSyncing = false,
   onOpenReader,
+  firestoreStatus,
+  aiCooldownSecondsRemaining = 0,
 }) => {
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | "completed" | "processing" | "pending">("all");
@@ -113,8 +121,18 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
   const pendingChunks = session.chunks.filter((c) => c.status === "pending");
   const errorChunks = session.chunks.filter((c) => c.status === "error");
 
-  const effectiveCompletedCount = Math.max(metrics.completedChunks, completedChunks.length);
-  const percent = totalChunks > 0 ? Math.min(100, Math.round((effectiveCompletedCount / totalChunks) * 100)) : 0;
+  const isAllDone =
+    session.status === "completed" ||
+    (totalChunks > 0 && (metrics.completedChunks >= totalChunks || completedChunks.length >= totalChunks));
+  const effectiveCompletedCount =
+    isAllDone && totalChunks > 0
+      ? totalChunks
+      : Math.max(metrics.completedChunks, completedChunks.length);
+  const percent = totalChunks > 0
+    ? isAllDone
+      ? 100
+      : Math.min(99, Math.round((effectiveCompletedCount / totalChunks) * 100))
+    : 0;
   const charPercent = metrics.totalChars > 0 ? Math.min(100, Math.round((metrics.completedChars / metrics.totalChars) * 100)) : 0;
 
   // Find active chunk
@@ -197,6 +215,55 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
           </div>
         </div>
       </div>
+
+      {/* AI Free-Tier Rate Limit Cooldown Countdown Banner */}
+      {aiCooldownSecondsRemaining > 0 && (
+        <div className="rounded-2xl border border-amber-300 dark:border-amber-700/80 bg-gradient-to-r from-amber-50 to-orange-50 dark:from-amber-950/40 dark:to-orange-950/30 p-3.5 text-amber-900 dark:text-amber-200 flex items-center justify-between gap-3 shadow-sm shadow-amber-500/5">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-amber-100 dark:bg-amber-900/60 text-amber-600 dark:text-amber-300">
+              <Clock className="h-5 w-5 animate-pulse" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-amber-900 dark:text-amber-100">
+                  AI Rate Limit Cooldown Active
+                </span>
+                <span className="rounded-md bg-amber-200/80 dark:bg-amber-900/80 px-1.5 py-0.5 font-mono text-[10px] font-extrabold text-amber-950 dark:text-amber-100">
+                  Auto-resuming in {aiCooldownSecondsRemaining}s
+                </span>
+              </div>
+              <p className="text-[11px] text-amber-700/90 dark:text-amber-300/90 truncate">
+                Respecting Google Gemini free tier rate limit. Translation will automatically continue — no need to click pause or resume!
+              </p>
+            </div>
+          </div>
+          <div className="shrink-0 font-mono text-base font-extrabold px-3 py-1.5 rounded-xl bg-white/80 dark:bg-slate-900/80 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-300">
+            {aiCooldownSecondsRemaining}s
+          </div>
+        </div>
+      )}
+
+      {/* Local Disk Storage Mode Badge (Firestore Free-Tier Quota Limit) */}
+      {firestoreStatus?.isQuotaExhausted && (
+        <div className="rounded-2xl border border-sky-200 dark:border-sky-800/70 bg-gradient-to-r from-sky-50 to-indigo-50 dark:from-sky-950/30 dark:to-indigo-950/20 p-3 text-sky-900 dark:text-sky-200 flex items-center justify-between gap-3 shadow-xs">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-100 dark:bg-sky-900/60 text-sky-600 dark:text-sky-300">
+              <Cloud className="h-4 w-4" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-xs font-bold text-sky-900 dark:text-sky-100">
+                Operating in Local Disk Mode
+              </p>
+              <p className="text-[11px] text-sky-700/90 dark:text-sky-300/80 truncate">
+                Cloud sync daily free read limit reached. All translations & chapters are safely protected and stored directly on disk and in your browser.
+              </p>
+            </div>
+          </div>
+          <span className="shrink-0 text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-lg bg-sky-100 dark:bg-sky-900/80 text-sky-800 dark:text-sky-200 border border-sky-300/60 dark:border-sky-700/60">
+            Protected
+          </span>
+        </div>
+      )}
 
       {/* 2. Big Circular Progress Card (Reference Screen 2) */}
       <div className="relative rounded-3xl border border-purple-100/80 dark:border-purple-900/40 bg-white/95 dark:bg-slate-900/95 p-4 sm:p-5 shadow-md shadow-purple-500/5 transition-colors">
@@ -395,19 +462,19 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
             <Loader2 className="h-4 w-4 animate-spin" />
             <span>Starting translation...</span>
           </button>
-        ) : isRunning ? (
+        ) : isRunning || session?.status === "running" ? (
           <button
             id="active-pause-btn"
-            onClick={onPause}
+            onClick={() => onPause()}
             className="flex w-full items-center justify-center gap-2.5 rounded-2xl bg-[#C084FC] hover:bg-[#A855F7] py-3.5 px-4 text-sm font-bold text-white shadow-md shadow-purple-500/15 active:scale-98 transition cursor-pointer"
           >
             <span className="font-mono text-base leading-none">❚❚</span>
             <span>Pause Translation</span>
           </button>
-        ) : isPaused || (metrics.completedChunks > 0 && metrics.completedChunks < metrics.totalChunks) ? (
+        ) : isPaused || (session?.status === "paused") || (metrics.completedChunks > 0 && metrics.completedChunks < metrics.totalChunks) ? (
           <button
             id="active-resume-btn"
-            onClick={isPaused ? onResume : onStart}
+            onClick={() => (isPaused || session?.status === "paused" ? onResume() : onStart())}
             className="flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 hover:opacity-95 py-3.5 px-4 text-sm font-bold text-white shadow-md shadow-purple-500/20 active:scale-98 transition cursor-pointer"
           >
             <Play className="h-4 w-4 fill-white" />
@@ -416,7 +483,7 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
         ) : (
           <button
             id="active-start-btn"
-            onClick={onStart}
+            onClick={() => onStart()}
             className="flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 hover:opacity-95 py-3.5 px-4 text-sm font-bold text-white shadow-md shadow-purple-500/20 active:scale-98 transition cursor-pointer"
           >
             <Play className="h-4 w-4 fill-white" />
@@ -437,14 +504,15 @@ export const ActiveTranslationView: React.FC<ActiveTranslationViewProps> = ({
           <span className="truncate">Download Current EPUB</span>
         </button>
 
-        {/* Delete Translation Button */}
+        {/* Translate New Novel Button */}
         <button
-          id="active-reset-book-btn"
-          onClick={onReset}
-          className="flex items-center justify-center gap-2 rounded-2xl border border-rose-200 dark:border-rose-900/60 bg-rose-50/60 dark:bg-rose-950/30 hover:bg-rose-100 dark:hover:bg-rose-900/40 py-3 px-3 text-xs font-extrabold text-rose-700 dark:text-rose-300 transition active:scale-98 cursor-pointer shadow-2xs"
+          id="active-translate-new-novel-btn"
+          onClick={() => (onTranslateNewNovel ? onTranslateNewNovel() : onReset())}
+          className="flex items-center justify-center gap-2 rounded-2xl border border-purple-200 dark:border-purple-800/80 bg-purple-50/80 dark:bg-purple-950/40 hover:bg-purple-100 dark:hover:bg-purple-900/60 py-3 px-3 text-xs font-extrabold text-purple-700 dark:text-purple-300 transition active:scale-98 cursor-pointer shadow-2xs"
+          title="Pause current novel, save progress to Cloud History, and translate a new novel"
         >
-          <Trash2 className="h-4 w-4 text-rose-500" />
-          <span className="truncate">Delete Translation</span>
+          <PlusCircle className="h-4 w-4 text-purple-600 dark:text-purple-400" />
+          <span className="truncate">Translate New Novel</span>
         </button>
       </div>
 

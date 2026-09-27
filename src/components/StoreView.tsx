@@ -18,18 +18,27 @@ import {
   Flame,
   Calendar,
   ThumbsUp,
+  Languages,
 } from "lucide-react";
+import { cleanAuthorName, cleanSummaryText } from "../utils/storeFormatters";
+import { downloadFile } from "../utils/fileDownloader";
 
 export interface StoreSearchResult {
   id: string;
   title: string;
   author: string;
+  titleZh?: string;
+  authorZh?: string;
+  titleEn?: string;
+  authorEn?: string;
   siteId: string;
   siteName: string;
   novelUrl: string;
   latestChapter?: string;
   chapterCount?: number;
   intro?: string;
+  introZh?: string;
+  introEn?: string;
   coverUrl?: string;
   likes?: number;
   aiquLikes?: number;
@@ -77,9 +86,9 @@ export function formatCleanSiteName(siteId?: string, siteName?: string): string 
 }
 
 interface StoreViewProps {
-  onImportNovel: (title: string, rawText: string) => void;
+  onImportNovel: (title: string, rawText: string, autoStart?: boolean) => void;
   getAuthHeaders: () => Record<string, string>;
-  externalSearchTrigger?: { query: string; timestamp: number } | null;
+  externalSearchTrigger?: { query: string; site?: string; timestamp: number } | null;
   onOpenReader?: (novel: {
     novelTitle: string;
     author?: string;
@@ -197,15 +206,70 @@ export const StoreView: React.FC<StoreViewProps> = ({
   const [results, setResults] = useState<StoreSearchResult[]>(savedState.results || []);
   const [hasSearched, setHasSearched] = useState<boolean>(savedState.hasSearched || false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isExportingRaw, setIsExportingRaw] = useState(false);
 
   // Synopsis dropdown toggle state
   const [expandedSummaryIds, setExpandedSummaryIds] = useState<Record<string, boolean>>({});
+  const [loadingIntroIds, setLoadingIntroIds] = useState<Record<string, boolean>>({});
 
-  const toggleSummary = (id: string) => {
+  const toggleSummary = async (novel: StoreSearchResult) => {
+    const id = novel.id;
+    const isCurrentlyExpanded = !!expandedSummaryIds[id];
+
+    // Toggle UI expansion immediately
     setExpandedSummaryIds((prev) => ({
       ...prev,
-      [id]: !prev[id],
+      [id]: !isCurrentlyExpanded,
     }));
+
+    // If expanding and intro is short or ends with ellipsis, fetch full synopsis
+    const curIntro = novel.introZh || novel.intro || "";
+    const isTruncated = curIntro.endsWith("...") || curIntro.endsWith("…") || curIntro.length < 180;
+
+    if (!isCurrentlyExpanded && isTruncated && !loadingIntroIds[id]) {
+      setLoadingIntroIds((prev) => ({ ...prev, [id]: true }));
+      try {
+        const res = await fetch("/api/store/full-intro", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...getAuthHeaders(),
+          },
+          body: JSON.stringify({
+            novelUrl: novel.novelUrl,
+            siteId: novel.siteId,
+            title: novel.title,
+            author: novel.author,
+          }),
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success && (data.introZh || data.introEn)) {
+            setResults((prev) =>
+              prev.map((it) => {
+                if (it.id === id || it.novelUrl === novel.novelUrl) {
+                  return {
+                    ...it,
+                    introZh: data.introZh || it.introZh,
+                    introEn: data.introEn || it.introEn,
+                    intro: data.intro || it.intro,
+                    authorZh: cleanAuthorName(data.author || it.authorZh),
+                    author: cleanAuthorName(data.author || it.author),
+                    fileSize: data.fileSize || it.fileSize,
+                  };
+                }
+                return it;
+              })
+            );
+          }
+        }
+      } catch (e) {
+        // Fallback gracefully
+      } finally {
+        setLoadingIntroIds((prev) => ({ ...prev, [id]: false }));
+      }
+    }
   };
 
   // Keyword highlighting
@@ -236,21 +300,62 @@ export const StoreView: React.FC<StoreViewProps> = ({
   // Handle external search trigger from Explore tab
   useEffect(() => {
     if (externalSearchTrigger && externalSearchTrigger.query) {
+      const targetSite = externalSearchTrigger.site || "aiqu226";
       setQuery(externalSearchTrigger.query);
-      setSelectedSite("all");
-      handleSearch(externalSearchTrigger.query, "all");
+      setSelectedSite(targetSite);
+      handleSearch(externalSearchTrigger.query, targetSite);
     }
   }, [externalSearchTrigger]);
 
   // Novel detail & chapter selection state
   const [selectedNovel, setSelectedNovel] = useState<StoreNovelDetail | null>(savedState.selectedNovel || null);
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
+  // Language toggle state: cardId -> boolean (false = English translated (default), true = original Chinese)
+  const [chineseModeCards, setChineseModeCards] = useState<Record<string, boolean>>({});
+
+  const toggleCardLanguage = (cardId: string) => {
+    setChineseModeCards((prev) => ({
+      ...prev,
+      [cardId]: !prev[cardId],
+    }));
+  };
 
   // Chapter range selection
   const [startChapter, setStartChapter] = useState<number>(savedState.startChapter || 1);
-  const [endChapter, setEndChapter] = useState<number>(savedState.endChapter || 100);
+  const [endChapter, setEndChapter] = useState<number>(savedState.endChapter || 30);
   const [isScraping, setIsScraping] = useState(false);
   const [scrapeProgress, setScrapeProgress] = useState<string | null>(null);
+  const [scrapePercentage, setScrapePercentage] = useState<number>(0);
+  const [scrapeElapsedSec, setScrapeElapsedSec] = useState(0);
+  const activeAbortControllerRef = React.useRef<AbortController | null>(null);
+
+  const handleCancelScrape = () => {
+    if (activeAbortControllerRef.current) {
+      activeAbortControllerRef.current.abort();
+      activeAbortControllerRef.current = null;
+    }
+    setIsScraping(false);
+    setIsExportingRaw(false);
+    setScrapeProgress(null);
+    setScrapePercentage(0);
+    setSelectedNovel(null);
+  };
+
+  // Live timer during chapter download to reassure user it is actively progressing
+  useEffect(() => {
+    let timer: any = null;
+    if (isScraping) {
+      setScrapeElapsedSec(0);
+      timer = setInterval(() => {
+        setScrapeElapsedSec((prev) => prev + 1);
+      }, 1000);
+    } else {
+      setScrapeElapsedSec(0);
+    }
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [isScraping]);
 
   // Persist state across tab navigation
   useEffect(() => {
@@ -366,7 +471,7 @@ export const StoreView: React.FC<StoreViewProps> = ({
 
       setSelectedNovel(resolvedDetail);
       setStartChapter(1);
-      setEndChapter(resolvedChapters.length > 0 ? resolvedChapters.length : 100);
+      setEndChapter(resolvedChapters.length > 0 ? Math.min(30, resolvedChapters.length) : 30);
     } catch (err: any) {
       console.error("Fetch TOC error:", err);
       setSelectedNovel({
@@ -381,50 +486,242 @@ export const StoreView: React.FC<StoreViewProps> = ({
         chapters: [],
       });
       setStartChapter(1);
-      setEndChapter(100);
+      setEndChapter(30);
     } finally {
       setIsLoadingDetail(false);
     }
   };
 
-  // Import novel chapters into translation queue
-  const handleStartImport = async () => {
+  // Import novel chapters into translation queue with progressive batching
+  const handleStartImport = async (autoStartTranslation: boolean = false) => {
     if (!selectedNovel) return;
 
+    if (activeAbortControllerRef.current) {
+      activeAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    activeAbortControllerRef.current = controller;
+
+    setIsExportingRaw(false);
     setIsScraping(true);
-    setScrapeProgress("Fetching and compiling raw Chinese text chapters...");
+    setScrapePercentage(5);
+    setScrapeProgress("Preparing chapter download queue...");
 
     try {
-      const res = await fetch("/api/store/import-novel", {
-        method: "POST",
-        headers: getAuthHeaders(),
-        body: JSON.stringify({
-          novelUrl: selectedNovel.novelUrl,
-          siteId: selectedNovel.siteId,
-          title: selectedNovel.title,
-          startChapter,
-          endChapter,
-          chapters: selectedNovel.chapters,
-        }),
-      });
-
-      if (!res.ok) {
-        throw new Error(`Import failed with status ${res.status}`);
+      const CHUNK_SIZE = 15;
+      const slices: { start: number; end: number }[] = [];
+      for (let s = startChapter; s <= endChapter; s += CHUNK_SIZE) {
+        slices.push({
+          start: s,
+          end: Math.min(endChapter, s + CHUNK_SIZE - 1),
+        });
       }
 
-      const data = await res.json();
-      if (!data.rawText || !data.rawText.trim()) {
-        throw new Error("No readable raw text found in selected chapters.");
+      const collectedTexts: string[] = [];
+
+      for (let i = 0; i < slices.length; i++) {
+        const currentSlice = slices[i];
+        const percent = Math.max(5, Math.round((i / slices.length) * 100));
+        setScrapePercentage(percent);
+        setScrapeProgress(
+          `Importing chapters ${currentSlice.start}–${currentSlice.end} of ${endChapter} (${percent}%)...`
+        );
+
+        let sliceSuccess = false;
+        let lastSliceErr: any = null;
+
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            if (attempt > 0) {
+              await new Promise((r) => setTimeout(r, (attempt + 1) * 800));
+            }
+            const res = await fetch("/api/store/import-novel", {
+              method: "POST",
+              headers: getAuthHeaders(),
+              signal: controller.signal,
+              body: JSON.stringify({
+                novelUrl: selectedNovel.novelUrl,
+                siteId: selectedNovel.siteId,
+                title: selectedNovel.title,
+                author: selectedNovel.author,
+                startChapter: currentSlice.start,
+                endChapter: currentSlice.end,
+                chapters: selectedNovel.chapters,
+              }),
+            });
+
+            if (!res.ok) {
+              throw new Error(`Batch failed with status ${res.status}`);
+            }
+
+            const data = await res.json();
+            const hasFailure = (data.failedChaptersCount && data.failedChaptersCount > 0) || (data.rawText && data.rawText.includes("[Content from this chapter could not be retrieved"));
+
+            if (data.rawText && data.rawText.trim()) {
+              if (hasFailure && attempt < 2) {
+                console.warn(`[Store Import] Slice ${currentSlice.start}-${currentSlice.end} had incomplete chapters. Retrying attempt ${attempt + 2}...`);
+                continue;
+              }
+              collectedTexts.push(data.rawText.trim());
+              sliceSuccess = true;
+              break;
+            } else {
+              throw new Error("Empty batch text received.");
+            }
+          } catch (err: any) {
+            lastSliceErr = err;
+            if (err?.name === "AbortError") throw err;
+          }
+        }
+
+        if (!sliceSuccess) {
+          console.warn(`Could not import batch ${currentSlice.start}-${currentSlice.end}:`, lastSliceErr?.message);
+        }
       }
 
+      setScrapePercentage(100);
+
+      if (collectedTexts.length === 0) {
+        throw new Error("No readable chapters could be retrieved from this source. The site may be rate-limiting or anti-bot protected. Try selecting fewer chapters or another novel.");
+      }
+
+      const fullRawText = collectedTexts.join("\n\n\n");
       onImportNovel(
         `${selectedNovel.title}_Ch${startChapter}_to_${endChapter}.txt`,
-        data.rawText
+        fullRawText,
+        autoStartTranslation
       );
     } catch (err: any) {
+      if (err.name === "AbortError") {
+        console.log("Import process aborted by user.");
+        return;
+      }
       console.error("Import error:", err);
       setErrorMessage(err.message || "Failed to import novel chapters.");
+    } finally {
       setIsScraping(false);
+      setScrapePercentage(0);
+      activeAbortControllerRef.current = null;
+    }
+  };
+
+  // Export raw Chinese TXT file directly for offline reading without putting into translator
+  const handleExportRawTxt = async () => {
+    if (!selectedNovel) return;
+
+    if (activeAbortControllerRef.current) {
+      activeAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    activeAbortControllerRef.current = controller;
+
+    setIsExportingRaw(true);
+    setIsScraping(true);
+    setScrapePercentage(5);
+    setScrapeProgress("Preparing raw text download...");
+
+    try {
+      const CHUNK_SIZE = 15;
+      const slices: { start: number; end: number }[] = [];
+      for (let s = startChapter; s <= endChapter; s += CHUNK_SIZE) {
+        slices.push({
+          start: s,
+          end: Math.min(endChapter, s + CHUNK_SIZE - 1),
+        });
+      }
+
+      const collectedTexts: string[] = [];
+
+      for (let i = 0; i < slices.length; i++) {
+        const currentSlice = slices[i];
+        const percent = Math.max(5, Math.round((i / slices.length) * 100));
+        setScrapePercentage(percent);
+        setScrapeProgress(
+          `Fetching raw Chinese chapters ${currentSlice.start}–${currentSlice.end} of ${endChapter} (${percent}%)...`
+        );
+
+        let sliceSuccess = false;
+        let lastSliceErr: any = null;
+
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            if (attempt > 0) {
+              await new Promise((r) => setTimeout(r, (attempt + 1) * 800));
+            }
+            const res = await fetch("/api/store/import-novel", {
+              method: "POST",
+              headers: getAuthHeaders(),
+              signal: controller.signal,
+              body: JSON.stringify({
+                novelUrl: selectedNovel.novelUrl,
+                siteId: selectedNovel.siteId,
+                title: selectedNovel.title,
+                author: selectedNovel.author,
+                startChapter: currentSlice.start,
+                endChapter: currentSlice.end,
+                chapters: selectedNovel.chapters,
+              }),
+            });
+
+            if (!res.ok) {
+              throw new Error(`Batch failed with status ${res.status}`);
+            }
+
+            const data = await res.json();
+            const hasFailure =
+              (data.failedChaptersCount && data.failedChaptersCount > 0) ||
+              (data.rawText && data.rawText.includes("[Content from this chapter could not be retrieved"));
+
+            if (data.rawText && data.rawText.trim()) {
+              if (hasFailure && attempt < 2) {
+                console.warn(
+                  `[Raw TXT Export] Slice ${currentSlice.start}-${currentSlice.end} had incomplete chapters. Retrying attempt ${attempt + 2}...`
+                );
+                continue;
+              }
+              collectedTexts.push(data.rawText.trim());
+              sliceSuccess = true;
+              break;
+            } else {
+              throw new Error("Empty batch text received.");
+            }
+          } catch (err: any) {
+            lastSliceErr = err;
+            if (err?.name === "AbortError") throw err;
+          }
+        }
+
+        if (!sliceSuccess) {
+          console.warn(`Could not export batch ${currentSlice.start}-${currentSlice.end}:`, lastSliceErr?.message);
+        }
+      }
+
+      setScrapePercentage(100);
+
+      if (collectedTexts.length === 0) {
+        throw new Error(
+          "No readable chapters could be retrieved from this source. The site may be rate-limiting. Try selecting fewer chapters."
+        );
+      }
+
+      const fullRawText = collectedTexts.join("\n\n\n");
+      const downloadFileName = `${selectedNovel.title}_Ch${startChapter}_to_${endChapter}_Raw_ZH.txt`;
+
+      await downloadFile(fullRawText, downloadFileName, "text/plain;charset=utf-8");
+
+      setSelectedNovel(null);
+    } catch (err: any) {
+      if (err.name === "AbortError") {
+        console.log("Export process aborted by user.");
+        return;
+      }
+      console.error("Raw TXT Export error:", err);
+      setErrorMessage(err.message || "Failed to export raw text.");
+    } finally {
+      setIsExportingRaw(false);
+      setIsScraping(false);
+      setScrapePercentage(0);
+      activeAbortControllerRef.current = null;
     }
   };
 
@@ -821,8 +1118,13 @@ export const StoreView: React.FC<StoreViewProps> = ({
         <div className="space-y-3.5">
           {filteredAndSortedResults.map((novel, index) => {
             const isExpanded = !!expandedSummaryIds[novel.id];
-            const displayIntro = novel.intro || "No synopsis available.";
-            const isLongIntro = displayIntro.length > 60 || displayIntro.includes("\n");
+            const isCardZh = !!chineseModeCards[novel.id];
+            const cardTitle = isCardZh ? (novel.titleZh || novel.title) : (novel.titleEn || novel.title);
+            const cardAuthor = cleanAuthorName(isCardZh ? (novel.authorZh || novel.author) : (novel.authorEn || novel.author));
+            const cardIntro = isCardZh ? (novel.introZh || novel.intro) : (novel.introEn || novel.intro);
+            const displayIntro = cleanSummaryText(cardIntro) || "No synopsis available.";
+            const isLongIntro = displayIntro.length > 70 || displayIntro.includes("\n") || displayIntro.endsWith("...") || displayIntro.endsWith("…");
+            const isLoadingThisIntro = !!loadingIntroIds[novel.id];
 
             return (
               <div
@@ -859,8 +1161,23 @@ export const StoreView: React.FC<StoreViewProps> = ({
                     )}
                   </div>
 
-                  {/* Rating, Likes and Points */}
+                  {/* Rating, Likes, Points and Translate Button */}
                   <div className="flex items-center gap-1.5 shrink-0">
+                    {/* Translate Icon Button */}
+                    <button
+                      type="button"
+                      onClick={() => toggleCardLanguage(novel.id)}
+                      title={isCardZh ? "Switch back to English translation" : "Show original Chinese text (中文)"}
+                      aria-label={isCardZh ? "Switch to English" : "Switch to Chinese"}
+                      className={`p-1 rounded-md border transition cursor-pointer ${
+                        isCardZh
+                          ? "border-purple-300 bg-purple-100 text-purple-700 dark:bg-purple-900/70 dark:border-purple-600 dark:text-purple-200"
+                          : "border-slate-200 dark:border-slate-800 text-slate-400 hover:text-purple-600 hover:bg-purple-50 dark:hover:bg-slate-800"
+                      }`}
+                    >
+                      <Languages className="h-3.5 w-3.5" />
+                    </button>
+
                     {novel.rating !== undefined && novel.rating > 0 && (
                       <span
                         title={`Rating: ${novel.rating.toFixed(1)} / 5.0 (${novel.ratingCount || 1} votes)`}
@@ -905,12 +1222,12 @@ export const StoreView: React.FC<StoreViewProps> = ({
                 <div className="flex items-start justify-between gap-3 mb-2">
                   <div className="flex flex-col gap-0.5">
                     <h4 className="font-bold text-slate-900 dark:text-slate-100 text-sm sm:text-base group-hover:text-purple-600 dark:group-hover:text-purple-400 transition leading-snug">
-                      {renderHighlightedText(novel.title, query)}
+                      {renderHighlightedText(cardTitle, query)}
                     </h4>
                     <p className="text-[11px] sm:text-xs text-slate-500 dark:text-slate-400">
                       Author:{" "}
                       <span className="font-semibold text-slate-700 dark:text-slate-200">
-                        {renderHighlightedText(novel.author, query)}
+                        {renderHighlightedText(cardAuthor, query)}
                       </span>
                     </p>
                   </div>
@@ -918,25 +1235,31 @@ export const StoreView: React.FC<StoreViewProps> = ({
                   {novel.coverUrl && (
                     <img
                       src={novel.coverUrl}
-                      alt={novel.title}
+                      alt={cardTitle}
                       className="h-16 w-12 rounded-lg object-cover border border-slate-200 dark:border-slate-800 shrink-0"
                     />
                   )}
                 </div>
 
                 {/* Synopsis / Intro with Dropdown Toggle */}
-                {novel.intro && (
+                {displayIntro && (
                   <div className="rounded-lg bg-slate-50/90 dark:bg-slate-800/40 border border-slate-200/80 dark:border-slate-800 p-2.5 sm:p-3 mb-2.5 text-[11px] sm:text-xs leading-relaxed text-slate-700 dark:text-slate-300">
                     <div className="flex items-center justify-between font-bold text-[10px] sm:text-[11px] text-purple-700 dark:text-purple-300 mb-1">
-                      <div className="flex items-center gap-1">
-                        <BookOpen className="h-3.5 w-3.5 text-purple-600 dark:text-purple-400" />
-                        <span>Synopsis / 简介:</span>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <BookOpen className="h-3.5 w-3.5 text-purple-600 dark:text-purple-400 shrink-0" />
+                        <span>{isCardZh ? "Synopsis / 简介 (中文):" : "Synopsis (English):"}</span>
+                        {isLoadingThisIntro && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-normal text-purple-600 dark:text-purple-400 animate-pulse ml-1">
+                            <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                            Loading full text...
+                          </span>
+                        )}
                       </div>
 
                       {isLongIntro && (
                         <button
                           type="button"
-                          onClick={() => toggleSummary(novel.id)}
+                          onClick={() => toggleSummary(novel)}
                           className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-950/60 transition cursor-pointer"
                         >
                           {isExpanded ? (
@@ -958,7 +1281,7 @@ export const StoreView: React.FC<StoreViewProps> = ({
                       {isExpanded || !isLongIntro
                         ? renderHighlightedText(displayIntro, query)
                         : renderHighlightedText(
-                            displayIntro.slice(0, 95) + (displayIntro.length > 95 ? "..." : ""),
+                            displayIntro.slice(0, 110) + (displayIntro.length > 110 ? "..." : ""),
                             query
                           )}
                     </div>
@@ -990,8 +1313,8 @@ export const StoreView: React.FC<StoreViewProps> = ({
                       type="button"
                       onClick={() =>
                         onOpenReader({
-                          novelTitle: novel.title,
-                          author: novel.author,
+                          novelTitle: cardTitle,
+                          author: cardAuthor,
                           coverUrl: novel.coverUrl,
                           novelUrl: novel.novelUrl,
                           siteId: novel.siteId,
@@ -1024,7 +1347,7 @@ export const StoreView: React.FC<StoreViewProps> = ({
       {/* Novel Detail & Chapter Range Modal */}
       {(selectedNovel || isLoadingDetail) && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-in fade-in">
-          <div className="w-full max-w-lg rounded-3xl border border-purple-100 dark:border-purple-900 bg-white dark:bg-slate-900 p-6 shadow-2xl flex flex-col gap-4 max-h-[90vh] overflow-y-auto">
+          <div className="w-full max-w-xl rounded-3xl border border-purple-100 dark:border-purple-900 bg-white dark:bg-slate-900 p-6 shadow-2xl flex flex-col gap-4 max-h-[92vh] overflow-y-auto">
             {isLoadingDetail ? (
               <div className="flex flex-col items-center justify-center py-12 gap-3">
                 <Loader2 className="h-8 w-8 animate-spin text-purple-600" />
@@ -1032,26 +1355,41 @@ export const StoreView: React.FC<StoreViewProps> = ({
               </div>
             ) : selectedNovel ? (
               <>
+                {/* Header */}
                 <div className="flex items-start justify-between gap-3 border-b border-slate-100 dark:border-slate-800 pb-3">
-                  <div>
-                    <span className="text-[10px] font-bold text-purple-600 uppercase tracking-wider">
-                      {selectedNovel.siteName}
-                    </span>
-                    <h3 className="text-lg font-bold text-slate-900 dark:text-slate-100">
-                      {selectedNovel.title}
-                    </h3>
-                    <p className="text-xs text-slate-500">Author: {selectedNovel.author}</p>
+                  <div className="flex items-start gap-3 min-w-0">
+                    {selectedNovel.coverUrl ? (
+                      <img
+                        src={selectedNovel.coverUrl}
+                        alt={selectedNovel.title}
+                        className="w-12 h-16 object-cover rounded-xl border border-black/10 shrink-0 shadow-xs"
+                      />
+                    ) : null}
+                    <div className="min-w-0">
+                      <span className="text-[10px] font-bold text-purple-600 dark:text-purple-400 uppercase tracking-wider">
+                        {selectedNovel.siteName || "Novel Store"}
+                      </span>
+                      <h3 className="text-base sm:text-lg font-bold text-slate-900 dark:text-slate-100 line-clamp-2">
+                        {selectedNovel.title}
+                      </h3>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        Author: {selectedNovel.author || "Unknown"}
+                      </p>
+                    </div>
                   </div>
                   <button
-                    onClick={() => setSelectedNovel(null)}
-                    className="rounded-full p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition"
+                    type="button"
+                    onClick={handleCancelScrape}
+                    className="rounded-full p-1.5 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition shrink-0 cursor-pointer"
+                    title="Close / Cancel Import"
                   >
                     <X className="h-5 w-5" />
                   </button>
                 </div>
 
+                {/* Synopsis */}
                 {selectedNovel.intro && (
-                  <div className="rounded-2xl bg-purple-50/50 dark:bg-slate-800/50 p-3 text-xs text-slate-600 dark:text-slate-300 leading-relaxed max-h-40 overflow-y-auto whitespace-pre-line">
+                  <div className="rounded-2xl bg-purple-50/50 dark:bg-slate-800/50 p-3 text-xs text-slate-600 dark:text-slate-300 leading-relaxed max-h-36 overflow-y-auto whitespace-pre-line border border-purple-100/50 dark:border-purple-900/30">
                     {selectedNovel.intro}
                   </div>
                 )}
@@ -1062,14 +1400,65 @@ export const StoreView: React.FC<StoreViewProps> = ({
                     <span className="text-xs font-bold text-slate-800 dark:text-slate-200">
                       Select Chapter Range to Import:
                     </span>
-                    <span className="text-xs font-semibold text-purple-600">
-                      Total Chapters Found: {selectedNovel.chapters.length || "100+"}
+                    <span className="text-xs font-semibold text-purple-600 dark:text-purple-400">
+                      Total Chapters: {selectedNovel.chapters.length || "100+"}
                     </span>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-3">
+                  {/* Quick Preset Buttons */}
+                  <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                    <span className="text-slate-400 font-medium mr-1">Presets:</span>
+                    <button
+                      type="button"
+                      disabled={isScraping}
+                      onClick={() => {
+                        setStartChapter(1);
+                        setEndChapter(Math.min(20, selectedNovel.chapters.length || 20));
+                      }}
+                      className="px-2.5 py-1 rounded-lg border border-purple-200 dark:border-purple-800/80 bg-white dark:bg-slate-900 hover:bg-purple-50 dark:hover:bg-purple-950/50 font-bold text-purple-700 dark:text-purple-300 transition cursor-pointer text-xs"
+                    >
+                      First 20 Ch
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isScraping}
+                      onClick={() => {
+                        setStartChapter(1);
+                        setEndChapter(Math.min(50, selectedNovel.chapters.length || 50));
+                      }}
+                      className="px-2.5 py-1 rounded-lg border border-purple-200 dark:border-purple-800/80 bg-white dark:bg-slate-900 hover:bg-purple-50 dark:hover:bg-purple-950/50 font-bold text-purple-700 dark:text-purple-300 transition cursor-pointer text-xs"
+                    >
+                      First 50 Ch
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isScraping}
+                      onClick={() => {
+                        setStartChapter(1);
+                        setEndChapter(Math.min(100, selectedNovel.chapters.length || 100));
+                      }}
+                      className="px-2.5 py-1 rounded-lg border border-purple-200 dark:border-purple-800/80 bg-white dark:bg-slate-900 hover:bg-purple-50 dark:hover:bg-purple-950/50 font-bold text-purple-700 dark:text-purple-300 transition cursor-pointer text-xs"
+                    >
+                      First 100 Ch
+                    </button>
+                    {selectedNovel.chapters.length > 0 && (
+                      <button
+                        type="button"
+                        disabled={isScraping}
+                        onClick={() => {
+                          setStartChapter(1);
+                          setEndChapter(selectedNovel.chapters.length);
+                        }}
+                        className="px-2.5 py-1 rounded-lg border border-purple-200 dark:border-purple-800/80 bg-white dark:bg-slate-900 hover:bg-purple-50 dark:hover:bg-purple-950/50 font-bold text-purple-700 dark:text-purple-300 transition cursor-pointer text-xs"
+                      >
+                        All ({selectedNovel.chapters.length} Ch)
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3 pt-1">
                     <div>
-                      <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                      <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">
                         Start Chapter
                       </label>
                       <input
@@ -1077,12 +1466,13 @@ export const StoreView: React.FC<StoreViewProps> = ({
                         min={1}
                         max={selectedNovel.chapters.length || 1000}
                         value={startChapter}
+                        disabled={isScraping}
                         onChange={(e) => setStartChapter(Math.max(1, parseInt(e.target.value) || 1))}
-                        className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100"
+                        className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 disabled:opacity-60"
                       />
                     </div>
                     <div>
-                      <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                      <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">
                         End Chapter
                       </label>
                       <input
@@ -1090,78 +1480,132 @@ export const StoreView: React.FC<StoreViewProps> = ({
                         min={startChapter}
                         max={selectedNovel.chapters.length || 1000}
                         value={endChapter}
+                        disabled={isScraping}
                         onChange={(e) =>
                           setEndChapter(
                             Math.max(startChapter, parseInt(e.target.value) || startChapter)
                           )
                         }
-                        className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100"
+                        className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 disabled:opacity-60"
                       />
                     </div>
                   </div>
 
-                  <div className="text-[11px] text-slate-500 flex items-center justify-between">
+                  <div className="text-[11px] text-slate-500 dark:text-slate-400 flex items-center justify-between">
                     <span>
-                      Will compile chapters {startChapter} to {endChapter} (
+                      Will download chapters {startChapter} through {endChapter} (
                       {Math.max(0, endChapter - startChapter + 1)} chapters)
                     </span>
                   </div>
                 </div>
 
-                {/* Import Action Buttons */}
-                <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
-                  {onOpenReader && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        onOpenReader({
-                          novelTitle: selectedNovel.title,
-                          author: selectedNovel.author,
-                          coverUrl: selectedNovel.coverUrl,
-                          novelUrl: selectedNovel.novelUrl,
-                          siteId: selectedNovel.siteId,
-                          chapterIndex: startChapter,
-                          totalChapters: selectedNovel.chapters.length,
-                          allChapters: selectedNovel.chapters.map((c, i) => ({
-                            title: c.title,
-                            url: c.url,
-                            index: i + 1,
-                          })),
-                        });
-                        setSelectedNovel(null);
-                      }}
-                      className="inline-flex items-center gap-1.5 rounded-xl border border-purple-200 dark:border-purple-800 bg-purple-50/80 dark:bg-purple-950/50 px-4 py-2 text-xs font-bold text-purple-700 dark:text-purple-300 hover:bg-purple-100 transition cursor-pointer"
-                    >
-                      <BookOpen className="h-4 w-4" />
-                      <span>Read in Reader Mode</span>
-                    </button>
-                  )}
+                {/* Active Scraping Progress Card with Live Timer & Percentage */}
+                {isScraping && (
+                  <div className="rounded-2xl border border-purple-200 dark:border-purple-800 bg-purple-50/70 dark:bg-purple-950/40 p-3.5 space-y-2 animate-in fade-in">
+                    <div className="flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-2 font-bold text-purple-700 dark:text-purple-300">
+                        <Loader2 className="h-4 w-4 animate-spin text-purple-600 shrink-0" />
+                        <span>{scrapeProgress || `Fetching chapters (${startChapter}–${endChapter})...`}</span>
+                      </div>
+                      <span className="font-mono text-[11px] font-semibold text-purple-700 dark:text-purple-300 bg-purple-100 dark:bg-purple-900/60 px-2 py-0.5 rounded-full">
+                        {scrapePercentage > 0 ? `${scrapePercentage}% • ` : ""}{scrapeElapsedSec}s elapsed
+                      </span>
+                    </div>
+                    <div className="w-full bg-purple-100 dark:bg-purple-900/50 h-2 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-gradient-to-r from-purple-500 via-indigo-500 to-pink-500 transition-all duration-300 rounded-full"
+                        style={{ width: `${Math.max(5, scrapePercentage)}%` }}
+                      />
+                    </div>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-tight">
+                      {isExportingRaw
+                        ? "Downloading raw Chinese text directly to your device as a .txt file. No translation will be started."
+                        : "Downloaded in fast parallel slices to guarantee zero gateway timeouts. Translation starts automatically as soon as downloads complete."}
+                    </p>
+                  </div>
+                )}
+
+                {/* Import Action Buttons - Stacked Cleanly so no button is cut off */}
+                <div className="flex flex-col gap-2.5 pt-2 border-t border-slate-100 dark:border-slate-800">
+                  {/* Primary 1-Click Action */}
                   <button
                     type="button"
-                    onClick={() => setSelectedNovel(null)}
+                    onClick={() => handleStartImport(true)}
                     disabled={isScraping}
-                    className="rounded-xl px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800 transition"
+                    className="w-full flex items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-purple-600 via-indigo-600 to-purple-700 hover:from-purple-700 hover:to-indigo-800 px-5 py-3 text-sm font-extrabold text-white shadow-md hover:shadow-purple-500/25 active:scale-98 transition cursor-pointer disabled:opacity-60"
                   >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleStartImport}
-                    disabled={isScraping}
-                    className="inline-flex items-center gap-2 rounded-xl bg-purple-600 hover:bg-purple-700 px-5 py-2.5 text-xs font-bold text-white shadow-md hover:shadow-purple-500/25 active:scale-95 transition"
-                  >
-                    {isScraping ? (
+                    {isExportingRaw ? (
                       <>
                         <Loader2 className="h-4 w-4 animate-spin" />
-                        <span>{scrapeProgress || "Compiling text..."}</span>
+                        <span>Exporting Raw Chinese Text ({scrapeElapsedSec}s)...</span>
+                      </>
+                    ) : isScraping ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        <span>Compiling & Starting Instant Translation ({scrapeElapsedSec}s)...</span>
                       </>
                     ) : (
                       <>
-                        <Download className="h-4 w-4" />
-                        <span>Import {Math.max(0, endChapter - startChapter + 1)} Chapters Now</span>
+                        <Sparkles className="h-4 w-4 text-amber-300" />
+                        <span>⚡ Translate Now (1-Click Instant Start)</span>
                       </>
                     )}
                   </button>
+
+                  {/* Secondary Actions Row */}
+                  <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-2">
+                    <button
+                      type="button"
+                      onClick={handleCancelScrape}
+                      className={`px-4 py-2 text-xs font-bold rounded-xl transition cursor-pointer ${
+                        isScraping
+                          ? "bg-rose-100 hover:bg-rose-200 text-rose-700 dark:bg-rose-950/80 dark:hover:bg-rose-900 dark:text-rose-200 border border-rose-300 dark:border-rose-800 shadow-xs"
+                          : "text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
+                      }`}
+                    >
+                      {isExportingRaw ? "Cancel Export" : isScraping ? "Cancel Import" : "Cancel"}
+                    </button>
+
+                    <div className="flex items-center gap-2">
+                      {onOpenReader && (
+                        <button
+                          type="button"
+                          disabled={isScraping}
+                          onClick={() => {
+                            onOpenReader({
+                              novelTitle: selectedNovel.title,
+                              author: selectedNovel.author,
+                              coverUrl: selectedNovel.coverUrl,
+                              novelUrl: selectedNovel.novelUrl,
+                              siteId: selectedNovel.siteId,
+                              chapterIndex: startChapter,
+                              totalChapters: selectedNovel.chapters.length,
+                              allChapters: selectedNovel.chapters.map((c, i) => ({
+                                title: c.title,
+                                url: c.url,
+                                index: i + 1,
+                              })),
+                            });
+                            setSelectedNovel(null);
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-xl border border-purple-200 dark:border-purple-800 bg-purple-50/70 dark:bg-purple-950/40 px-3.5 py-2 text-xs font-bold text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-900/60 transition cursor-pointer disabled:opacity-50 shadow-2xs"
+                        >
+                          <BookOpen className="h-3.5 w-3.5" />
+                          <span>Read in Reader</span>
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={handleExportRawTxt}
+                        disabled={isScraping}
+                        className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700/60 px-3.5 py-2 text-xs font-bold text-slate-700 dark:text-slate-200 transition cursor-pointer disabled:opacity-50 shadow-2xs"
+                      >
+                        <Download className="h-3.5 w-3.5" />
+                        <span>Export Raw TXT</span>
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </>
             ) : null}

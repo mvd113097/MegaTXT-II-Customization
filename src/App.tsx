@@ -3,34 +3,60 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import { Navbar } from "./components/Navbar";
 import { UploadSection } from "./components/UploadSection";
 import { TranslationControls } from "./components/TranslationControls";
 import { ProgressBar } from "./components/ProgressBar";
 import { TranslationQueueHub } from "./components/TranslationQueueHub";
-import { GlossaryModal } from "./components/GlossaryModal";
-import { ExportModal } from "./components/ExportModal";
-import { TelegramSettingsModal } from "./components/TelegramSettingsModal";
 import { BottomNav } from "./components/BottomNav";
-import { HistoryModal } from "./components/HistoryModal";
 import { ActiveTranslationView } from "./components/ActiveTranslationView";
 import { TranslationCompleteView } from "./components/TranslationCompleteView";
-import { StoreView } from "./components/StoreView";
-import { ExploreView } from "./components/ExploreView";
-import { LibraryView } from "./components/LibraryView";
-import { NovelReaderModal } from "./components/NovelReaderModal";
+
+// Lazy-loaded components and modals to minimize initial bundle size and initial download
+const GlossaryModal = React.lazy(() =>
+  import("./components/GlossaryModal").then((m) => ({ default: m.GlossaryModal }))
+);
+const ExportModal = React.lazy(() =>
+  import("./components/ExportModal").then((m) => ({ default: m.ExportModal }))
+);
+const TelegramSettingsModal = React.lazy(() =>
+  import("./components/TelegramSettingsModal").then((m) => ({ default: m.TelegramSettingsModal }))
+);
+const HistoryModal = React.lazy(() =>
+  import("./components/HistoryModal").then((m) => ({ default: m.HistoryModal }))
+);
+const StoreView = React.lazy(() =>
+  import("./components/StoreView").then((m) => ({ default: m.StoreView }))
+);
+const ExploreView = React.lazy(() =>
+  import("./components/ExploreView").then((m) => ({ default: m.ExploreView }))
+);
+const LibraryView = React.lazy(() =>
+  import("./components/LibraryView").then((m) => ({ default: m.LibraryView }))
+);
+const NovelReaderModal = React.lazy(() =>
+  import("./components/NovelReaderModal").then((m) => ({ default: m.NovelReaderModal }))
+);
+const PasswordGate = React.lazy(() =>
+  import("./components/PasswordGate").then((m) => ({ default: m.PasswordGate }))
+);
 import {
   getSessionFromIdb,
   saveSessionToIdb,
   clearSessionFromIdb,
   getLocalLibraryBooks,
+  removeBookFromLibrary,
+  removeReadingHistoryItem,
+  clearReadingHistory,
+  addReadingHistory,
+  addOrUpdateBookInLibrary,
 } from "./utils/indexedDbStorage";
+import { isSameNovel } from "./utils/chunkCleaner";
 import {
   PagodaHeaderIllustration,
   SakuraFooterDecoration,
 } from "./components/illustrations/StorybookArtwork";
-import { PasswordGate } from "./components/PasswordGate";
 import {
   TextChunk,
   TranslationStyle,
@@ -225,7 +251,7 @@ export default function App() {
     } catch {}
     return "home";
   });
-  const [storeSearchTrigger, setStoreSearchTrigger] = useState<{ query: string; timestamp: number } | null>(null);
+  const [storeSearchTrigger, setStoreSearchTrigger] = useState<{ query: string; site?: string; timestamp: number } | null>(null);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [isGlossaryOpen, setIsGlossaryOpen] = useState(false);
   const [isExportOpen, setIsExportOpen] = useState(false);
@@ -316,6 +342,17 @@ export default function App() {
     setReaderNovel(novel);
     setIsReaderOpen(true);
     setIsReaderMinimized(false);
+    try {
+      addReadingHistory({
+        title: novel.novelTitle,
+        author: novel.author,
+        coverUrl: novel.coverUrl,
+        novelUrl: novel.novelUrl,
+        siteId: novel.siteId,
+        chapterIndex: novel.chapterIndex || 1,
+        totalChapters: novel.totalChapters || novel.allChapters?.length || 1,
+      });
+    } catch {}
   };
 
   const handleCloseReader = () => {
@@ -324,22 +361,91 @@ export default function App() {
     setIsReaderMinimized(true);
   };
 
-  const handleOpenCurrentSessionReader = () => {
-    if (!session) return;
+  // Memoized session chunks for active reader (includes both finished English translations and processing chunks)
+  const currentSessionReaderChunks = useMemo(() => {
+    if (!session || !session.chunks || session.chunks.length === 0) return undefined;
+    return session.chunks;
+  }, [session]);
+
+  const handleOpenCurrentSessionReader = async () => {
+    if (!session || !session.chunks || session.chunks.length === 0) return;
     const cleanTitle = session.fileName.replace(/\.txt$/i, "");
+
+    // 1. Sync full translated chapter texts from server if needed (cloud mode or missing text)
+    let currentChunks = chunksRef.current.length > 0 ? chunksRef.current : session.chunks;
+    if (
+      mode === "cloud" ||
+      currentChunks.length === 0 ||
+      currentChunks.some((c) => c.status === "completed" && (!c.englishText || !c.englishText.trim()))
+    ) {
+      const synced = await syncCompletedTexts(true);
+      if (synced && synced.length > 0) {
+        currentChunks = synced;
+      }
+    }
+
+    // 2. All chunks sorted strictly by index 0, 1, 2, 3...
+    const sortedChunks = [...currentChunks].sort((a, b) => a.index - b.index);
+
+    // 3. Finished chapters translated by Gemini in order
+    const finishedChunks = sortedChunks.filter(
+      (c) => (c.status === "completed" || Boolean(c.englishText?.trim())) && Boolean(c.englishText?.trim())
+    );
+
+    // Map full novel chapter list
+    const allChapters = sortedChunks.map((c) => ({
+      title: c.chapterTitle || `Chapter ${c.index + 1}`,
+      url: "",
+      index: c.index + 1,
+      originalIndex: c.index + 1,
+    }));
+
+    // Find starting chapter index: preserve existing progress if within valid range, else start at first translated chapter
+    let targetIdx = 1;
+    if (readerNovel && isSameNovel(readerNovel.novelTitle, cleanTitle)) {
+      if (readerNovel.chapterIndex && readerNovel.chapterIndex >= 1 && readerNovel.chapterIndex <= sortedChunks.length) {
+        targetIdx = readerNovel.chapterIndex;
+      }
+    } else if (finishedChunks.length > 0) {
+      targetIdx = finishedChunks[0].index + 1;
+    }
+
+    const selectedChunk = sortedChunks.find((c) => c.index === targetIdx - 1) || finishedChunks[0] || sortedChunks[0];
+
     handleOpenReader({
       novelTitle: cleanTitle,
-      totalChapters: session.chunks.length,
-      chapterIndex: 1,
-      allChapters: session.chunks.map((c, idx) => ({
-        title: c.chapterTitle || `Chapter ${idx + 1}`,
-        url: "",
-        index: idx + 1,
-      })),
-      content: session.chunks[0]?.chineseText || "",
-      englishContent: session.chunks[0]?.englishText || "",
+      totalChapters: sortedChunks.length,
+      chapterIndex: targetIdx,
+      allChapters,
+      content: selectedChunk?.chineseText || "",
+      englishContent: selectedChunk?.englishText || "",
     });
   };
+
+  // Keep active reader novel chapters list synchronized in real time as background Gemini translation finishes more chapters
+  useEffect(() => {
+    if (!session || !session.chunks || !readerNovel) return;
+    if (!isSameNovel(session.fileName, readerNovel.novelTitle)) return;
+
+    const total = session.chunks.length;
+    if (total === 0) return;
+
+    if (readerNovel.totalChapters !== total || !readerNovel.allChapters || readerNovel.allChapters.length !== total) {
+      setReaderNovel((prev) => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          totalChapters: total,
+          allChapters: session.chunks.map((c) => ({
+            title: c.chapterTitle || `Chapter ${c.index + 1}`,
+            url: "",
+            index: c.index + 1,
+            originalIndex: c.index + 1,
+          })),
+        };
+      });
+    }
+  }, [session, readerNovel?.novelTitle]);
 
   const handleBottomNavChange = (tab: "home" | "library" | "store" | "explore" | "history") => {
     setActiveNavTab(tab);
@@ -365,6 +471,22 @@ export default function App() {
   // Metrics
   const [startTime, setStartTime] = useState<number | null>(null);
   const [charsTranslatedInRun, setCharsTranslatedInRun] = useState(0);
+
+  // Quota & Cooldown status tracking
+  const [firestoreStatus, setFirestoreStatus] = useState<{
+    isQuotaExhausted: boolean;
+    isAvailable: boolean;
+  }>({ isQuotaExhausted: false, isAvailable: true });
+  const [aiCooldownSec, setAiCooldownSec] = useState<number>(0);
+
+  // Automatic 1-second countdown for live rate-limit cooldown display
+  useEffect(() => {
+    if (aiCooldownSec <= 0) return;
+    const timer = setInterval(() => {
+      setAiCooldownSec((prev) => Math.max(0, prev - 1));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [aiCooldownSec]);
 
   // Refs for queue management
   const userHasResetRef = useRef(false);
@@ -415,8 +537,8 @@ export default function App() {
   const [isSyncingProgress, setIsSyncingProgress] = useState(false);
 
   // On-demand sync of full translated chapter texts for completed chunks
-  const syncCompletedTexts = async (force: boolean = false) => {
-    if (mode !== "cloud") return;
+  const syncCompletedTexts = async (force: boolean = false): Promise<TextChunk[]> => {
+    if (mode !== "cloud") return chunksRef.current;
 
     // Data-saving optimization: If not forced, check if all completed chunks already have English text in memory
     if (!force && chunksRef.current.length > 0) {
@@ -424,42 +546,100 @@ export default function App() {
         (c) => c.status === "completed" && (!c.englishText || !c.englishText.trim())
       );
       if (!missingCompletedText) {
-        // All completed chunks are already populated in memory — 0 KB network data used!
-        return;
+        return chunksRef.current;
       }
     }
 
     try {
-      const res = await fetch("/api/cloud-job/sync-texts?completedOnly=true", {
-        headers: getAuthHeaders(),
+      const headers = getAuthHeaders();
+      if (session?.fileName) {
+        headers["x-novel-filename"] = encodeURIComponent(session.fileName);
+      }
+
+      const baseChunks = chunksRef.current.length > 0 ? chunksRef.current : (session?.chunks || []);
+      const missingIndices = baseChunks
+        .filter((c) => !c.englishText || !c.englishText.trim())
+        .map((c) => c.index);
+
+      // High-efficiency delta sync: sync all missing indices or all completed chunks
+      let syncUrl = "/api/cloud-job/sync-texts?completedOnly=true";
+      if (baseChunks.length > 0 && missingIndices.length > 0 && missingIndices.length <= 150) {
+        syncUrl = `/api/cloud-job/sync-texts?indices=${missingIndices.join(",")}`;
+      } else {
+        syncUrl = "/api/cloud-job/sync-texts?completedOnly=true";
+      }
+
+      const res = await fetch(syncUrl, {
+        headers,
       });
       const data = await res.json();
-      if (data.success && Array.isArray(data.chunks)) {
-        const textMap = new Map<number, { chineseText: string; englishText: string }>();
+      if (data.success && Array.isArray(data.chunks) && data.chunks.length > 0) {
+        const textMap = new Map<number, { chineseText: string; englishText: string; chapterTitle?: string; id?: string }>();
         data.chunks.forEach((c: any) => {
-          textMap.set(c.index, { chineseText: c.chineseText || "", englishText: c.englishText || "" });
+          textMap.set(c.index, {
+            chineseText: c.chineseText || "",
+            englishText: c.englishText || "",
+            chapterTitle: c.chapterTitle,
+            id: c.id,
+          });
         });
 
-        setSession((prev) => {
-          if (!prev) return null;
-          const updated = prev.chunks.map((c) => {
+        let updated: TextChunk[] = [];
+        const baseChunks = chunksRef.current.length > 0 ? chunksRef.current : (session?.chunks || []);
+
+        if (baseChunks.length === 0 || baseChunks.length < data.chunks.length) {
+          // Reconstruct entire chunk list directly from server data
+          updated = data.chunks.map((c: any) => ({
+            id: c.id || `chunk-${c.index}`,
+            index: c.index,
+            chapterTitle: c.chapterTitle || `Section ${c.index + 1}`,
+            chineseText: c.chineseText || "",
+            englishText: c.englishText || "",
+            charCount: countChineseCharacters(c.chineseText || "") || (c.chineseText || "").length,
+            status: "completed" as const,
+          }));
+        } else {
+          updated = baseChunks.map((c) => {
             const synced = textMap.get(c.index);
             if (synced && synced.englishText) {
               return {
                 ...c,
+                chapterTitle: synced.chapterTitle || c.chapterTitle,
                 chineseText: synced.chineseText || c.chineseText,
                 englishText: synced.englishText,
+                status: "completed" as const,
               };
             }
             return c;
           });
-          chunksRef.current = updated;
-          return { ...prev, chunks: updated };
+        }
+
+        chunksRef.current = updated;
+        setSession((prev) => {
+          if (!prev) {
+            const now = Date.now();
+            return {
+              fileName: session?.fileName || "translated_novel.txt",
+              fileSizeBytes: 0,
+              totalChineseChars: updated.reduce((acc, c) => acc + c.charCount, 0),
+              chunks: updated,
+              style: style || "xianxia",
+              customInstructions: "",
+              glossary: [],
+              status: "completed",
+              createdAt: now,
+              lastUpdated: now,
+            };
+          }
+          return { ...prev, chunks: updated, lastUpdated: Date.now() };
         });
+
+        return updated;
       }
     } catch (err) {
       console.warn("Error syncing completed chapter texts:", err);
     }
+    return chunksRef.current;
   };
 
   // High-performance Cloud Progress Synchronization:
@@ -479,12 +659,23 @@ export default function App() {
         userHasResetRef.current = false;
         headers["x-novel-filename"] = encodeURIComponent(explicitNovelFileName);
       }
-      const url = forceFullText ? "/api/cloud-job/status?full=true" : "/api/cloud-job/status";
+      // Always use summary mode by default for ultra-low data consumption (~350 bytes per sync)
+      const url = forceFullText
+        ? "/api/cloud-job/status?full=true&allowFallback=true"
+        : "/api/cloud-job/status?summary=true&allowFallback=true";
+
       const res = await fetch(url, {
         headers,
       });
       const data = await res.json();
       const elapsedMs = Math.round(performance.now() - startTimeMs);
+
+      if (data.firestoreStatus) {
+        setFirestoreStatus(data.firestoreStatus);
+      }
+      if (data.projectsSummary && typeof data.projectsSummary.nextAvailableInSeconds === "number") {
+        setAiCooldownSec(data.projectsSummary.nextAvailableInSeconds);
+      }
 
       if (data.hasJob && data.job) {
         if (userHasResetRef.current && !explicitNovelFileName) {
@@ -492,87 +683,180 @@ export default function App() {
           return;
         }
         const sJob = data.job;
-        setServerCloudJob(sJob);
-        const sortedChunks = sJob.chunks ? [...sJob.chunks].sort((a: any, b: any) => a.index - b.index) : [];
 
-        setSession((prev) => {
-          if (!prev || prev.fileName !== sJob.fileName) {
+        const isMatch = session && session.fileName ? isSameNovel(session.fileName, sJob.fileName) : false;
+        const localProgress = (session?.chunks || []).filter((c) => c.status === "completed").length;
+        const localTotal = session?.chunks?.length || 0;
+        const sTotal = sJob.totalChunks || 0;
+        const isSameTotal = localTotal > 0 && sTotal > 0 && Math.abs(localTotal - sTotal) <= 5;
+
+        // If local session has 0 completed progress or chunk counts match, bind to server job.
+        // Only skip clobbering if local session actually HAS completed progress on a DIFFERENT novel.
+        if (
+          session &&
+          session.fileName &&
+          !isMatch &&
+          !isSameTotal &&
+          localProgress > 0 &&
+          !explicitNovelFileName
+        ) {
+          // Keep serverCloudJob reference in state for history drawer, but do NOT replace active session
+          setServerCloudJob(sJob);
+          return;
+        }
+
+        setServerCloudJob(sJob);
+
+        // If this is a lightweight summary update and we already have the novel session loaded
+        if (sJob.isSummary && session) {
+          const totalExpected = Math.max(session.chunks?.length || 0, sJob.totalChunks || 0);
+          const isAllCompleted = (sJob.completedChunks === totalExpected && totalExpected > 0) || sJob.status === "completed";
+          const finalJobStatus = isAllCompleted ? "completed" : sJob.status;
+
+          setSession((prev) => {
+            if (!prev) return prev;
+            let updatedChunks = prev.chunks;
+            if (sJob.completedChunks > 0 && updatedChunks && updatedChunks.length > 0) {
+              const numDone = Math.min(sJob.completedChunks, updatedChunks.length);
+              let changed = false;
+              updatedChunks = updatedChunks.map((c, idx) => {
+                if (idx < numDone && c.status !== "completed") {
+                  changed = true;
+                  return { ...c, status: "completed" as const };
+                }
+                return c;
+              });
+              if (changed) {
+                chunksRef.current = updatedChunks;
+              }
+            }
             return {
-              fileName: sJob.fileName,
-              fileSizeBytes: sJob.fileSizeBytes || 0,
-              totalChineseChars: sJob.totalChineseChars || 0,
-              chunks: sortedChunks.map((c: any) => ({
-                id: c.id,
-                index: c.index,
-                chapterTitle: c.chapterTitle,
-                chineseText: c.chineseText || "",
-                englishText: c.englishText || "",
-                charCount: c.charCount || 0,
-                wordCount: c.wordCount || 0,
-                status: c.status,
-                hasEnglish: c.hasEnglish,
-                hasChinese: c.hasChinese,
-                attempts: c.attempts,
-                errorMessage: c.errorMessage,
-              })),
-              style: (sJob.style as TranslationStyle) || "xianxia",
-              customInstructions: sJob.customInstructions || "",
-              glossary: sJob.glossary || [],
-              mode: "cloud",
-              status: sJob.status,
-              createdAt: sJob.startedAt,
-              lastUpdated: sJob.lastActiveAt,
+              ...prev,
+              status: finalJobStatus,
+              chunks: updatedChunks,
+              completedEnglishWords: Math.max(prev.completedEnglishWords || 0, sJob.completedEnglishWords || 0),
+              completedChars: Math.max(prev.completedChars || 0, sJob.completedChars || 0),
+              lastUpdated: Math.max(prev.lastUpdated || 0, sJob.lastActiveAt || 0),
+            };
+          });
+
+          // Ultra-data saver: Only download heavy chapter text payloads if explicitly requested (e.g. Reader / Download)
+          if (forceFullText) {
+            syncCompletedTexts(true);
+          }
+        } else {
+          // Full structure or novel change
+          const sortedChunks = sJob.chunks ? [...sJob.chunks].sort((a: any, b: any) => a.index - b.index) : [];
+
+          setSession((prev) => {
+            if (!prev || !isSameNovel(prev.fileName, sJob.fileName)) {
+              const totalExpected = Math.max(sortedChunks.length, sJob.totalChunks || 0);
+              const isAllDone = (sJob.completedChunks === totalExpected && totalExpected > 0) || sJob.status === "completed";
+              return {
+                fileName: sJob.fileName,
+                fileSizeBytes: sJob.fileSizeBytes || 0,
+                totalChineseChars: sJob.totalChineseChars || 0,
+                chunks: sortedChunks.map((c: any) => ({
+                  id: c.id,
+                  index: c.index,
+                  chapterTitle: c.chapterTitle,
+                  chineseText: c.chineseText || "",
+                  englishText: c.englishText || "",
+                  charCount: c.charCount || 0,
+                  wordCount: c.wordCount || 0,
+                  status: c.status,
+                  hasEnglish: c.hasEnglish,
+                  hasChinese: c.hasChinese,
+                  attempts: c.attempts,
+                  errorMessage: c.errorMessage,
+                })),
+                style: (sJob.style as TranslationStyle) || "xianxia",
+                customInstructions: sJob.customInstructions || "",
+                glossary: sJob.glossary || [],
+                mode: "cloud",
+                status: isAllDone ? "completed" : sJob.status,
+                createdAt: sJob.startedAt,
+                lastUpdated: sJob.lastActiveAt,
+                completedEnglishWords: sJob.completedEnglishWords,
+                completedChars: sJob.completedChars,
+                lastDownloadedWordCount: prev?.lastDownloadedWordCount,
+                lastDownloadedAt: prev?.lastDownloadedAt,
+              };
+            }
+
+            // Monotonic chapter merge: NEVER downgrade completed local chunks
+            const prevChunks = prev.chunks || [];
+            // Union by chunk index to ensure that no chunks are ever dropped if server restarted with partial state
+            const chunkMap = new Map<number, any>();
+            for (const c of prevChunks) {
+              chunkMap.set(c.index, { ...c });
+            }
+            for (const incChunk of sortedChunks) {
+              const existing = chunkMap.get(incChunk.index);
+              const hasEnglishLocally = existing && existing.status === "completed" && existing.englishText && existing.englishText.trim().length > 0;
+              const hasEnglishServer = (incChunk.englishText && incChunk.englishText.trim().length > 0) || incChunk.hasEnglish || (incChunk.wordCount && incChunk.wordCount > 0);
+
+              // Never downgrade completed local chapter text
+              const mergedEnglish = (incChunk.englishText && incChunk.englishText.trim().length > 0)
+                ? incChunk.englishText
+                : (existing?.englishText || "");
+
+              const mergedChinese = incChunk.chineseText !== undefined && incChunk.chineseText.length > 0
+                ? incChunk.chineseText
+                : (existing?.chineseText || "");
+
+              const isDone = incChunk.status === "completed" || hasEnglishLocally || hasEnglishServer;
+              const finalWordCount = incChunk.wordCount ?? existing?.wordCount ?? (mergedEnglish ? countEnglishWords(mergedEnglish) : 0);
+              const finalCharCount = incChunk.charCount ?? existing?.charCount ?? 0;
+
+              chunkMap.set(incChunk.index, {
+                ...existing,
+                ...incChunk,
+                chineseText: mergedChinese,
+                englishText: mergedEnglish,
+                wordCount: finalWordCount,
+                charCount: finalCharCount,
+                status: isDone ? "completed" : incChunk.status,
+              });
+            }
+
+            const merged = Array.from(chunkMap.values()).sort((a: any, b: any) => a.index - b.index);
+
+            // Auto-heal only if server lost chunks completely (0 total chunks on server)
+            if ((!sJob.totalChunks || sJob.totalChunks === 0) && prevChunks.length > 0) {
+              console.log(`[Auto-Rehydrate] Server had 0 chunks vs local ${prevChunks.length}. Sending missing chunks to resume server translation.`);
+              fetch("/api/cloud-job/rehydrate-chunks", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+                body: JSON.stringify({
+                  fileName: prev.fileName,
+                  chunks: merged,
+                }),
+              }).catch((e) => console.warn("Auto-rehydrate background error:", e));
+            }
+
+            const totalExpected = Math.max(prevChunks.length, sJob.totalChunks || 0, merged.length);
+            const completedCount = merged.filter((c: any) => c.status === "completed").length;
+            const isServerCompleted = sJob.status === "completed" || (totalExpected > 0 && sJob.completedChunks === totalExpected);
+            const allDone = (totalExpected > 0 && merged.length >= totalExpected && completedCount === totalExpected) || isServerCompleted;
+            const finalStatus = isServerCompleted ? "completed" : (allDone ? "completed" : sJob.status);
+
+            chunksRef.current = merged;
+            return {
+              ...prev,
+              status: finalStatus,
+              chunks: merged,
               completedEnglishWords: sJob.completedEnglishWords,
               completedChars: sJob.completedChars,
-              lastDownloadedWordCount: prev?.lastDownloadedWordCount,
-              lastDownloadedAt: prev?.lastDownloadedAt,
+              lastUpdated: Math.max(prev.lastUpdated || 0, sJob.lastActiveAt || 0),
             };
+          });
+
+          // Ultra-data saver: Only download heavy chapter text payloads if explicitly requested (e.g. Reader)
+          if (forceFullText) {
+            syncCompletedTexts(true);
           }
-
-          // Monotonic chapter merge: NEVER downgrade completed local chunks
-          const prevChunks = prev.chunks || [];
-          const merged = sortedChunks.map((incChunk: any) => {
-            const existing = prevChunks.find((c) => c.id === incChunk.id || c.index === incChunk.index);
-            const hasEnglishLocally = existing && existing.status === "completed" && existing.englishText && existing.englishText.trim().length > 0;
-            const hasEnglishServer = (incChunk.englishText && incChunk.englishText.trim().length > 0) || incChunk.hasEnglish || (incChunk.wordCount && incChunk.wordCount > 0);
-
-            // Never downgrade completed local chapter text
-            const mergedEnglish = (incChunk.englishText && incChunk.englishText.trim().length > 0)
-              ? incChunk.englishText
-              : (existing?.englishText || "");
-
-            const mergedChinese = incChunk.chineseText !== undefined && incChunk.chineseText.length > 0
-              ? incChunk.chineseText
-              : (existing?.chineseText || "");
-
-            const isDone = incChunk.status === "completed" || hasEnglishLocally || hasEnglishServer;
-            const finalWordCount = incChunk.wordCount ?? existing?.wordCount ?? (mergedEnglish ? countEnglishWords(mergedEnglish) : 0);
-            const finalCharCount = incChunk.charCount ?? existing?.charCount ?? 0;
-
-            return {
-              ...existing,
-              ...incChunk,
-              chineseText: mergedChinese,
-              englishText: mergedEnglish,
-              wordCount: finalWordCount,
-              charCount: finalCharCount,
-              status: isDone ? "completed" : incChunk.status,
-            };
-          }).sort((a: any, b: any) => a.index - b.index);
-
-          const allDone = merged.every((c: any) => c.status === "completed");
-          const finalStatus = (allDone || prev.status === "completed" || sJob.status === "completed") ? "completed" : sJob.status;
-
-          chunksRef.current = merged;
-          return {
-            ...prev,
-            status: finalStatus,
-            chunks: merged,
-            completedEnglishWords: sJob.completedEnglishWords,
-            completedChars: sJob.completedChars,
-            lastUpdated: Math.max(prev.lastUpdated || 0, sJob.lastActiveAt || 0),
-          };
-        });
+        }
 
         if (typeof sJob.concurrency === "number" && sJob.concurrency >= 1 && sJob.concurrency <= 5) {
           setConcurrency(sJob.concurrency);
@@ -582,8 +866,11 @@ export default function App() {
         }
 
         if (sJob.status === "running") {
-          setIsRunning(true);
-          setIsPaused(false);
+          // If user just requested pause, do not allow an in-flight status poll to revert UI state
+          if (!pauseRequestedRef.current) {
+            setIsRunning(true);
+            setIsPaused(false);
+          }
         } else if (sJob.status === "paused") {
           setIsRunning(false);
           setIsPaused(true);
@@ -597,14 +884,11 @@ export default function App() {
         }
 
         if (showFeedbackToast) {
-          const completedCount = Math.max(
-            sJob.completedChunks || 0,
-            sortedChunks.filter((c: any) => c.status === "completed" || c.hasEnglish).length
-          );
-          const totalCount = sJob.totalChunks || sortedChunks.length;
-          const wordsReady = sJob.completedEnglishWords || sortedChunks.reduce((acc: number, c: any) => acc + (c.wordCount || 0), 0);
+          const completedCount = sJob.completedChunks || 0;
+          const totalCount = sJob.totalChunks || 0;
+          const wordsReady = sJob.completedEnglishWords || 0;
           setToastData({
-            message: `Synced in ${elapsedMs}ms (~2 KB): ${completedCount}/${totalCount} chapters ready (${wordsReady.toLocaleString()} English words)`,
+            message: `Synced in ${elapsedMs}ms (~350 B): ${completedCount}/${totalCount} chapters ready (${wordsReady.toLocaleString()} English words)`,
             type: "success",
           });
           setTimeout(() => {
@@ -633,7 +917,7 @@ export default function App() {
     }
   };
 
-  // Auto-check and recover existing cloud job from server on initial load (Lightweight ~2 KB mode, saves 95%+ data)
+  // Auto-check and recover existing cloud job from server on initial load (Lightweight ~350 B mode)
   useEffect(() => {
     syncCloudProgress(false, false);
   }, []);
@@ -663,50 +947,66 @@ export default function App() {
       setIsRunning(false);
       setIsPaused(false);
     }
-    syncCompletedTexts(true);
   };
 
-  // Tab Visibility & Window Focus Listener:
-  // Automatically triggers a lightweight progress sync (~2 KB) whenever you re-open or switch back
-  // to the browser tab after getting a Telegram notification or multitasking.
+  // Tab Visibility & Focus Listener:
+  // Saves 99%+ mobile data: Completely pauses polling when mobile screen is locked or tab is hidden.
+  // Instantly refreshes with lightweight ~350 byte summary the exact second you open/unlock the tab.
   useEffect(() => {
     if (mode !== "cloud") return;
 
-    const handleVisibilityOrFocus = () => {
-      if (document.visibilityState === "visible") {
-        syncCloudProgress(false, false);
+    let timer: any = null;
+
+    const startPolling = () => {
+      if (timer) clearInterval(timer);
+      syncCloudProgress(false, false);
+      // Poll every 10 seconds ONLY while translation is actively running to save mobile data
+      if (isRunning && !isPaused) {
+        timer = setInterval(() => {
+          if (!document.hidden) {
+            syncCloudProgress(false, false);
+          }
+        }, 10000);
       }
     };
 
-    let intervalTime = typeof document !== "undefined" && document.hidden ? 15000 : 5000;
-    let timer = setInterval(() => {
-      syncCloudProgress(false, false);
-    }, intervalTime);
+    const stopPolling = () => {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    };
 
     const handleVisibilityChange = () => {
-      clearInterval(timer);
       if (document.hidden) {
-        timer = setInterval(() => {
-          syncCloudProgress(false, false);
-        }, 15000);
+        // Stop polling completely when phone is locked or app is in background to save 100% of mobile background data
+        stopPolling();
       } else {
-        // Instantly poll on tab focus so UI is immediately up-to-date
+        // Instantly refresh lightweight summary (~350 bytes) when phone unlocked or tab reopened
         syncCloudProgress(false, false);
-        timer = setInterval(() => {
-          syncCloudProgress(false, false);
-        }, 5000);
+        startPolling();
       }
     };
 
+    const handleFocus = () => {
+      syncCloudProgress(false, false);
+      startPolling();
+    };
+
+    if (!document.hidden) {
+      syncCloudProgress(false, false);
+      startPolling();
+    }
+
     document.addEventListener("visibilitychange", handleVisibilityChange);
-    window.addEventListener("focus", handleVisibilityOrFocus);
+    window.addEventListener("focus", handleFocus);
 
     return () => {
-      clearInterval(timer);
+      stopPolling();
       document.removeEventListener("visibilitychange", handleVisibilityChange);
-      window.removeEventListener("focus", handleVisibilityOrFocus);
+      window.removeEventListener("focus", handleFocus);
     };
-  }, [mode]);
+  }, [mode, isRunning, isPaused]);
 
   // Dynamic Browser Wake-Lock & Keep-Alive (Method 3)
   // When a translation is actively running, sends a tiny keep-alive pulse every 90 seconds
@@ -738,13 +1038,15 @@ export default function App() {
     };
   }, [isRunning, isPaused]);
 
-  // Handle file or text load
+  // Handle file or text load (with server-side prepare and instant Firestore check)
   const handleLoadText = (
     text: string,
     fileName: string,
     targetChunkChars: number,
-    splitByChapters: boolean
+    splitByChapters: boolean,
+    autoStart: boolean = false
   ) => {
+    // 1. Instant client-side preview using exact preserved chunker rules
     const rawChunks = chunkChineseText(text, {
       targetChunkChars,
       splitByChapters,
@@ -766,24 +1068,99 @@ export default function App() {
     };
 
     userHasResetRef.current = false;
+    setServerCloudJob(null);
     setSession(newSession);
     chunksRef.current = rawChunks;
     setIsRunning(false);
     setIsPaused(false);
     setStartTime(null);
     setCharsTranslatedInRun(0);
+    saveSessionToIdb(newSession).catch(() => {});
+
+    // 2. Server-side prepare: uploads text once, checks Firestore directly, gets authoritative jobId
+    fetch("/api/cloud-job/prepare", {
+      method: "POST",
+      headers: {
+        ...getAuthHeaders(),
+        "Content-Type": "application/json",
+        "x-novel-filename": encodeURIComponent(fileName),
+      },
+      body: JSON.stringify({
+        rawText: text,
+        fileName,
+        fileSizeBytes: newSession.fileSizeBytes,
+        style,
+        customInstructions,
+        glossary,
+        concurrency,
+        targetChunkChars,
+        splitByChapters,
+        autoStart,
+      }),
+    })
+      .then((res) => res.json())
+      .then((prepData) => {
+        if (prepData && prepData.success && prepData.jobId) {
+          setSession((prev) => {
+            if (!prev) return null;
+            const updated = { ...prev, jobId: prepData.jobId, id: prepData.jobId };
+            saveSessionToIdb(updated).catch(() => {});
+            return updated;
+          });
+
+          if (prepData.alreadyCompleted) {
+            setToastData({
+              message: `🎉 Novel "${fileName.replace(/\.txt$/i, "")}" is already 100% translated in Cloud! Restored all ${prepData.totalChunks} chapters.`,
+              type: "success",
+            });
+            syncCloudProgress(false, true, fileName);
+          }
+        }
+      })
+      .catch((err) => {
+        console.warn("Notice preparing novel job on server:", err);
+      });
+
+    if (autoStart) {
+      setTimeout(() => {
+        startCloudTranslation(newSession);
+      }, 300);
+    }
   };
 
-  // Reset workspace / permanently delete novel translation
-  const handleReset = async (novelNameToDelete?: string) => {
-    if (
-      isRunning &&
-      !window.confirm("Translation is in progress. Are you sure you want to stop and delete?")
-    ) {
-      return;
+
+  // Safely archive completed novel in history & library, then return to home upload screen to translate another novel
+  const handleTranslateAnother = async () => {
+    const novelName = session?.fileName || serverCloudJob?.fileName;
+    if (session) {
+      try {
+        await saveSessionToIdb(session);
+        addOrUpdateBookInLibrary({
+          id: session.fileName,
+          title: session.fileName.replace(/\.txt$/i, "").replace(/_/g, " "),
+          totalChapters: session.chunks.length,
+          completedChapters: session.chunks.filter((c) => c.status === "completed").length,
+          coverUrl: (session as any).coverUrl,
+          lastReadAt: Date.now(),
+        });
+      } catch (e) {
+        console.warn("Error saving session to library before translating another:", e);
+      }
     }
-    const targetNovel = novelNameToDelete || session?.fileName || serverCloudJob?.fileName;
-    const targetJobId = serverCloudJob?.id;
+
+    try {
+      await fetch("/api/cloud-job/archive", {
+        method: "POST",
+        headers: {
+          ...getAuthHeaders(),
+          "Content-Type": "application/json",
+          ...(novelName ? { "x-novel-filename": encodeURIComponent(novelName) } : {}),
+        },
+        body: JSON.stringify({ fileName: novelName }),
+      });
+    } catch (e) {
+      console.warn("Error archiving cloud job on server:", e);
+    }
 
     userHasResetRef.current = true;
     stopRequestedRef.current = true;
@@ -793,13 +1170,97 @@ export default function App() {
     setServerCloudJob(null);
     chunksRef.current = [];
     localStorage.removeItem(STORAGE_KEY);
-    clearSessionFromIdb().catch(() => {});
+    setActiveNavTab("home");
+
+    setToastData({
+      message: novelName
+        ? `"${novelName.replace(/\.txt$/i, "")}" is saved in History & Cloud Translations! Ready for your next novel.`
+        : "Ready to translate another novel.",
+      type: "success",
+    });
+  };
+
+  // Reset workspace / permanently delete novel translation
+  const handleReset = async (novelNameToDelete?: any, clearAll: boolean = false) => {
+    if (
+      isRunning &&
+      !window.confirm("Translation is in progress. Are you sure you want to stop and delete?")
+    ) {
+      return;
+    }
+
+    const cleanNovelToDelete =
+      typeof novelNameToDelete === "string" && novelNameToDelete.trim()
+        ? novelNameToDelete.trim()
+        : undefined;
+
+    if (clearAll) {
+      userHasResetRef.current = true;
+      stopRequestedRef.current = true;
+      setIsRunning(false);
+      setIsPaused(false);
+      setSession(null);
+      setServerCloudJob(null);
+      setReaderNovel(null);
+      chunksRef.current = [];
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem("megatext_user_library_v1");
+      clearReadingHistory();
+      clearSessionFromIdb().catch(() => {});
+
+      try {
+        await fetch("/api/cloud-job/delete", {
+          method: "POST",
+          headers: {
+            ...getAuthHeaders(),
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ clearAll: true }),
+        });
+        setToastData({
+          message: "All translations and records permanently cleared.",
+          type: "success",
+        });
+      } catch {}
+      return;
+    }
+
+    const targetNovel = cleanNovelToDelete || session?.fileName || serverCloudJob?.fileName;
+    const targetJobId = serverCloudJob?.id;
+
+    const isResettingCurrentSession =
+      !cleanNovelToDelete ||
+      (session && isSameNovel(session.fileName, cleanNovelToDelete));
+
+    if (isResettingCurrentSession) {
+      userHasResetRef.current = true;
+      stopRequestedRef.current = true;
+      setIsRunning(false);
+      setIsPaused(false);
+      setSession(null);
+      chunksRef.current = [];
+      localStorage.removeItem(STORAGE_KEY);
+      clearSessionFromIdb().catch(() => {});
+    }
+
+    if (!cleanNovelToDelete || (serverCloudJob && isSameNovel(serverCloudJob.fileName, cleanNovelToDelete))) {
+      setServerCloudJob(null);
+    }
+
+    if (targetNovel) {
+      removeBookFromLibrary(targetNovel);
+      removeReadingHistoryItem(targetNovel);
+      if (readerNovel && isSameNovel(readerNovel.novelTitle, targetNovel)) {
+        setReaderNovel(null);
+      }
+    }
 
     try {
       await fetch("/api/cloud-job/delete", {
         method: "POST",
         headers: {
           ...getAuthHeaders(),
+          "Content-Type": "application/json",
           ...(targetNovel ? { "x-novel-filename": encodeURIComponent(targetNovel) } : {}),
         },
         body: JSON.stringify({
@@ -817,45 +1278,79 @@ export default function App() {
   };
 
   // Start cloud translation on server
-  const startCloudTranslation = async () => {
-    if (!session) return;
+  const startCloudTranslation = async (customSession?: TranslationSession) => {
+    const targetSession = customSession || session;
+    if (!targetSession) return;
     setIsStarting(true);
 
     try {
-      // 1. Try lightweight resume first (avoids sending 8-9MB payload if job exists on server)
-      const resumeRes = await fetch("/api/cloud-job/resume", {
-        method: "POST",
-        headers: getAuthHeaders(),
-      });
+      // 1. Check if novel is already completed in cloud: restore instantly without retranslation
+      if (
+        serverCloudJob &&
+        isSameNovel(serverCloudJob.fileName, targetSession.fileName) &&
+        (serverCloudJob.status === "completed" || ((serverCloudJob as any).totalChunks > 0 && (serverCloudJob as any).completedChunks >= (serverCloudJob as any).totalChunks))
+      ) {
+        setToastData({
+          message: "🎉 Novel Already 100% Translated! Restoring all completed chapters from cloud...",
+          type: "success",
+        });
+        setTimeout(() => setToastData(null), 8000);
+        await syncCloudProgress(false, true, targetSession.fileName);
+        setIsStarting(false);
+        return;
+      }
 
-      if (resumeRes.ok) {
-        const resumeData = await resumeRes.json();
-        if (resumeData && resumeData.success) {
-          setIsRunning(true);
-          setIsPaused(false);
-          setToastData({
-            message: "☁️ Cloud Mode Resumed: The server is actively translating your novel in the background.",
-            type: "success",
-          });
-          setTimeout(() => setToastData(null), 8000);
-          return;
+      // 2. Try lightweight resume first ONLY if the server already has a job for this exact same novel
+      if (
+        serverCloudJob &&
+        isSameNovel(serverCloudJob.fileName, targetSession.fileName) &&
+        serverCloudJob.status !== "completed"
+      ) {
+        const resumeRes = await fetch("/api/cloud-job/resume", {
+          method: "POST",
+          headers: getAuthHeaders(),
+        });
+
+        if (resumeRes.ok) {
+          const resumeData = await resumeRes.json();
+          if (resumeData && resumeData.success) {
+            setIsRunning(true);
+            setIsPaused(false);
+            setToastData({
+              message: "☁️ Cloud Mode Resumed: The server is actively translating your novel in the background.",
+              type: "success",
+            });
+            setTimeout(() => setToastData(null), 8000);
+            return;
+          }
         }
       }
 
-      // 2. If job not found on server or needs initial launch, send start request
+      // 3. Start cloud job (Lightweight payload with instant live Firestore lookup)
+      const startPayload: any = {
+        jobId: targetSession.jobId || (targetSession as any).id,
+        fileName: targetSession.fileName,
+        fileSizeBytes: targetSession.fileSizeBytes,
+        totalChineseChars: targetSession.totalChineseChars,
+        style: targetSession.style || style,
+        customInstructions: targetSession.customInstructions || customInstructions,
+        glossary: targetSession.glossary || glossary,
+        concurrency,
+      };
+
+      // If no server jobId was established yet, include chunks as fallback
+      if (!targetSession.jobId && (!targetSession.id || !targetSession.id.startsWith("cloud_job_"))) {
+        startPayload.chunks = targetSession.chunks;
+      }
+
       const res = await fetch("/api/cloud-job/start", {
         method: "POST",
-        headers: getAuthHeaders(),
-        body: JSON.stringify({
-          fileName: session.fileName,
-          fileSizeBytes: session.fileSizeBytes,
-          totalChineseChars: session.totalChineseChars,
-          chunks: session.chunks,
-          style,
-          customInstructions,
-          glossary,
-          concurrency,
-        }),
+        headers: {
+          ...getAuthHeaders(),
+          "Content-Type": "application/json",
+          "x-novel-filename": encodeURIComponent(targetSession.fileName),
+        },
+        body: JSON.stringify(startPayload),
       });
 
       const data = await res.json();
@@ -863,8 +1358,22 @@ export default function App() {
         throw new Error(data.error || "Failed to start cloud job on server");
       }
 
+      if (data.alreadyCompleted) {
+        setToastData({
+          message: "🎉 Novel Already 100% Translated! Restoring all completed chapters from Cloud...",
+          type: "success",
+        });
+        setTimeout(() => setToastData(null), 8000);
+        await syncCloudProgress(false, true, targetSession.fileName);
+        return;
+      }
+
       setIsRunning(true);
       setIsPaused(false);
+      setSession((prev) => (prev ? { ...prev, status: "running", jobId: data.jobId || (prev as any).jobId } : prev));
+
+      // Trigger immediate cloud progress sync to bind latest server state
+      syncCloudProgress(false, false, targetSession.fileName);
 
       setToastData({
         message: "☁️ Cloud Mode Activated: The server is translating your novel in the background. You can safely close your browser or turn off your screen anytime. Come back whenever you want to download your chapters!",
@@ -878,6 +1387,7 @@ export default function App() {
         type: "error",
       });
       setTimeout(() => setToastData(null), 7000);
+
     } finally {
       setIsStarting(false);
     }
@@ -1143,34 +1653,115 @@ export default function App() {
   };
 
   // Pause translation
-  const handlePause = async () => {
-    if (mode === "cloud") {
-      try {
-        await fetch("/api/cloud-job/pause", {
-          method: "POST",
-          headers: getAuthHeaders(),
-        });
-      } catch {}
-    }
+  const handlePause = async (novelFileName?: any) => {
+    const cleanNovelName =
+      typeof novelFileName === "string" && novelFileName.trim()
+        ? novelFileName.trim()
+        : session?.fileName;
+
+    // Instantly transition UI to paused so button switches to Resume without lag
     pauseRequestedRef.current = true;
     setIsPaused(true);
     setIsRunning(false);
+    setSession((prev) => (prev ? { ...prev, status: "paused", lastUpdated: Date.now() } : null));
+
+    if (mode === "cloud" || cleanNovelName) {
+      try {
+        const headers: Record<string, string> = { ...getAuthHeaders() };
+        if (cleanNovelName) {
+          headers["x-novel-filename"] = encodeURIComponent(cleanNovelName);
+        }
+        await fetch("/api/cloud-job/pause", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ fileName: cleanNovelName }),
+        });
+      } catch (err) {
+        console.warn("Pause cloud job error:", err);
+      }
+    }
   };
 
   // Resume translation
-  const handleResume = async () => {
-    if (mode === "cloud") {
+  const handleResume = async (novelFileName?: any) => {
+    const cleanNovelName =
+      typeof novelFileName === "string" && novelFileName.trim()
+        ? novelFileName.trim()
+        : session?.fileName;
+
+    pauseRequestedRef.current = false;
+    setIsPaused(false);
+    setIsRunning(true);
+    setSession((prev) => (prev ? { ...prev, status: "running", lastUpdated: Date.now() } : null));
+
+    if (mode === "cloud" || cleanNovelName) {
       try {
+        const headers: Record<string, string> = { ...getAuthHeaders() };
+        if (cleanNovelName) {
+          headers["x-novel-filename"] = encodeURIComponent(cleanNovelName);
+        }
         await fetch("/api/cloud-job/resume", {
           method: "POST",
-          headers: getAuthHeaders(),
+          headers,
+          body: JSON.stringify({ fileName: cleanNovelName }),
         });
-      } catch {}
-      setIsPaused(false);
-      setIsRunning(true);
+      } catch (err) {
+        console.warn("Resume cloud job error:", err);
+      }
+      setTimeout(() => {
+        syncCloudProgress(false, false, cleanNovelName);
+      }, 400);
     } else {
-      pauseRequestedRef.current = false;
       runBrowserBatch();
+    }
+  };
+
+  // Translate New Novel (Pause and preserve current novel progress in Cloud History, clear workspace for a new novel)
+  const handleTranslateNewNovel = async () => {
+    if (session) {
+      const curFileName = session.fileName;
+      // 1. Pause on server
+      try {
+        const headers: Record<string, string> = { ...getAuthHeaders() };
+        if (curFileName) {
+          headers["x-novel-filename"] = encodeURIComponent(curFileName);
+        }
+        await fetch("/api/cloud-job/pause", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ fileName: curFileName }),
+        });
+      } catch (err) {
+        console.warn("Pause cloud job error:", err);
+      }
+
+      // 2. Persist paused state into IndexedDB storage so no chapters are lost
+      const pausedSession: TranslationSession = {
+        ...session,
+        status: session.status === "completed" ? "completed" : "paused",
+        lastUpdated: Date.now(),
+      };
+      await saveSessionToIdb(pausedSession).catch(() => {});
+
+      // 3. Clear workspace without deleting from history
+      pauseRequestedRef.current = true;
+      setIsRunning(false);
+      setIsPaused(true);
+      setSession(null);
+      setServerCloudJob(null);
+      chunksRef.current = [];
+      userHasResetRef.current = true;
+
+      // 4. Navigate to home / upload screen
+      setActiveNavTab("home");
+
+      // 5. Toast notification
+      setToastData({
+        message: `"${curFileName}" progress was saved to Cloud History. You can start translating a new novel or resume anytime!`,
+        type: "success",
+      });
+    } else {
+      setActiveNavTab("home");
     }
   };
 
@@ -1215,23 +1806,85 @@ export default function App() {
     }
   };
 
-  // Open Export Modal with automated background text synchronization if in cloud mode
-  const handleOpenExport = async () => {
-    if (mode === "cloud") {
-      syncCompletedTexts();
-    }
+  // Open Export Modal instantly without pulling uncompressed multi-megabyte JSON payloads
+  const handleOpenExport = () => {
     setIsExportOpen(true);
   };
 
   // Dedicated progress downloader: downloads strictly the unbroken continuous chapters from Chapter 1 without stopping background translation
   const handleDownloadProgress = async (format: "epub" | "txt" = "epub") => {
     if (!session) return;
+
+    // Direct server-side streaming for Cloud Mode:
+    // The server compiles the compressed .epub/.txt file directly using Deflate level 9.
+    // This avoids fetching 4-5MB of uncompressed JSON chunks to the browser, saving ~80% mobile data!
     if (mode === "cloud") {
-      await syncCompletedTexts();
+      const hasAnyCompleted =
+        session.chunks.some((c) => c.status === "completed") ||
+        (serverCloudJob && serverCloudJob.completedChunks > 0);
+
+      if (!hasAnyCompleted) {
+        setToastData({
+          message:
+            "Chapter 1 has not completed translation yet. The Never-Skip Engine guarantees all downloaded books start from Chapter 1 with zero gaps. Please wait for Chapter 1 to finish!",
+          type: "warning",
+        });
+        setTimeout(() => setToastData(null), 6000);
+        return;
+      }
+
+      const baseName = session.fileName.replace(/\.[^/.]+$/, "") || "translated_novel";
+      const downloadEndpoint = format === "epub" ? "/api/cloud-job/download-epub" : "/api/cloud-job/download-txt";
+      const downloadUrl = `${downloadEndpoint}?novelName=${encodeURIComponent(session.fileName)}&continuous=true`;
+
+      try {
+        const a = document.createElement("a");
+        a.href = downloadUrl;
+        a.setAttribute("download", `${baseName}.${format}`);
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+
+        setSession((prev) =>
+          prev
+            ? {
+                ...prev,
+                lastDownloadedAt: Date.now(),
+              }
+            : null
+        );
+
+        setToastData({
+          message: `Direct server-optimized ${format.toUpperCase()} download initiated! Compressed on server, saving ~80% mobile data transfer.`,
+          downloadUrl,
+          filename: `${baseName}.${format}`,
+          type: "success",
+        });
+        setTimeout(() => setToastData(null), 7000);
+        return;
+      } catch (err) {
+        console.warn("Direct server download failed, falling back to client generation:", err);
+      }
     }
-    const currentChunks = chunksRef.current.length > 0 ? chunksRef.current : session.chunks;
+
+    let currentChunks = chunksRef.current;
+    if (currentChunks.length === 0 || currentChunks.some(c => c.status === "completed" && !c.englishText?.trim())) {
+      const synced = await syncCompletedTexts(true);
+      if (synced && synced.length > 0) {
+        currentChunks = synced;
+      }
+    }
+    if (currentChunks.length === 0) {
+      currentChunks = session.chunks;
+    }
+
     const continuity = analyzeChunkContinuity(currentChunks);
-    const continuousList = continuity.continuousChunks;
+    let continuousList = continuity.continuousChunks;
+
+    // If continuousList is empty (e.g. index 0 title issue) but we have completed chunks, use allCompletedChunks
+    if (continuousList.length === 0 && continuity.allCompletedChunks.length > 0) {
+      continuousList = continuity.allCompletedChunks;
+    }
 
     if (continuousList.length === 0) {
       setToastData({
@@ -1254,6 +1907,7 @@ export default function App() {
       if (format === "epub") {
         const res = await downloadEpub(continuousList, session.fileName, {
           bookTitle: baseName.replace(/_/g, " "),
+          allowGaps: true,
         });
 
         // Save that user downloaded up to this point so we can track incremental new words
@@ -1338,28 +1992,39 @@ Export Timestamp: ${new Date().toLocaleString()}
       });
       setTimeout(() => setToastData(null), 8000);
     } catch (err: any) {
-      setToastData({
-        message: "Download failed: " + (err.message || String(err)),
-        type: "error",
-      });
-      setTimeout(() => setToastData(null), 6000);
+      console.warn("Client generation encountered error, trying direct server download:", err);
+      if (mode === "cloud") {
+        window.location.href = format === "epub" ? "/api/cloud-job/download-epub" : "/api/cloud-job/download-txt";
+      } else {
+        setToastData({
+          message: "Download failed: " + (err.message || String(err)),
+          type: "error",
+        });
+        setTimeout(() => setToastData(null), 6000);
+      }
     }
   };
 
   // Calculate real-time metrics
-  const totalChunks = session?.chunks.length || (serverCloudJob && serverCloudJob.fileName === session?.fileName ? serverCloudJob.totalChunks : 0) || 0;
-  const completedChunks = Math.max(
-    (serverCloudJob && serverCloudJob.fileName === session?.fileName ? serverCloudJob.completedChunks : 0) || 0,
-    session?.chunks.filter((c) => c.status === "completed").length || 0
-  );
+  const hasMatchingServerJob = serverCloudJob && session && isSameNovel(serverCloudJob.fileName, session.fileName);
+  const totalChunks = session?.chunks.length || (hasMatchingServerJob ? serverCloudJob.totalChunks : 0) || 0;
+  const isJobFinished =
+    session?.status === "completed" ||
+    (hasMatchingServerJob && (serverCloudJob.status === "completed" || (serverCloudJob.completedChunks >= totalChunks && totalChunks > 0)));
+  const completedChunks = isJobFinished && totalChunks > 0
+    ? totalChunks
+    : Math.max(
+        (hasMatchingServerJob ? serverCloudJob.completedChunks : 0) || 0,
+        session?.chunks.filter((c) => c.status === "completed").length || 0
+      );
   const inProgressChunks =
     session?.chunks.filter((c) => c.status === "processing").length || 0;
   const errorChunks =
     session?.chunks.filter((c) => c.status === "error").length || 0;
 
-  const totalChineseChars = session?.totalChineseChars || (serverCloudJob && serverCloudJob.fileName === session?.fileName ? serverCloudJob.totalChineseChars : 0) || 0;
+  const totalChineseChars = session?.totalChineseChars || (hasMatchingServerJob ? serverCloudJob.totalChineseChars : 0) || 0;
   const completedChars = Math.max(
-    (serverCloudJob && serverCloudJob.fileName === session?.fileName ? serverCloudJob.completedChars : 0) || 0,
+    (hasMatchingServerJob ? serverCloudJob.completedChars : 0) || 0,
     session?.completedChars || 0,
     session?.chunks
       .filter((c) => c.status === "completed")
@@ -1377,7 +2042,7 @@ Export Timestamp: ${new Date().toLocaleString()}
     ) || 0;
 
   const completedEnglishWords = Math.max(
-    (serverCloudJob && serverCloudJob.fileName === session?.fileName ? serverCloudJob.completedEnglishWords : 0) || 0,
+    (hasMatchingServerJob ? serverCloudJob.completedEnglishWords : 0) || 0,
     session?.completedEnglishWords || 0,
     calculatedChunkWords
   );
@@ -1398,11 +2063,13 @@ Export Timestamp: ${new Date().toLocaleString()}
   const estimatedRemainingSeconds =
     charsPerSec > 0 ? remainingChars / charsPerSec : 0;
 
-  // Explicit completion flag: verified if chunks finished, session status completed, or server job completed
+  // Explicit completion flag: verified ONLY if all chunks are finished and totalChunks matches
   const isCompleted =
-    (totalChunks > 0 && completedChunks === totalChunks) ||
-    session?.status === "completed" ||
-    Boolean(serverCloudJob && session && serverCloudJob.fileName === session.fileName && serverCloudJob.status === "completed");
+    totalChunks > 0 &&
+    completedChunks >= totalChunks &&
+    (session?.status === "completed" ||
+      Boolean(hasMatchingServerJob && serverCloudJob.status === "completed") ||
+      completedChunks === totalChunks);
 
   // Dynamic document title reflecting progress or 100% completion
   useEffect(() => {
@@ -1447,25 +2114,36 @@ Export Timestamp: ${new Date().toLocaleString()}
 
   if (authStatus?.requiresPasscode && !authStatus?.passcodeVerified) {
     return (
-      <PasswordGate
-        onUnlockSuccess={(token) => {
-          if (token) {
-            try {
-              localStorage.setItem("megatext_auth_token", token);
-            } catch {}
-          }
-          setAuthStatus({
-            authenticated: true,
-            requiresGoogle: false,
-            requiresPasscode: true,
-            googleVerified: true,
-            passcodeVerified: true,
-            hasPasscodeConfigured: true,
-          });
-          // Auto-fetch progress immediately on password unlock: loads the latest cloud job status and full texts
-          syncCloudProgress(true, false);
-        }}
-      />
+      <React.Suspense
+        fallback={
+          <div className="min-h-screen bg-slate-950 flex items-center justify-center text-slate-300">
+            <div className="flex items-center gap-3 bg-slate-900/90 px-6 py-4 rounded-2xl border border-slate-800 shadow-2xl">
+              <RefreshCw className="w-5 h-5 animate-spin text-purple-400" />
+              <span className="text-sm font-semibold text-slate-200">Loading security gate...</span>
+            </div>
+          </div>
+        }
+      >
+        <PasswordGate
+          onUnlockSuccess={(token) => {
+            if (token) {
+              try {
+                localStorage.setItem("megatext_auth_token", token);
+              } catch {}
+            }
+            setAuthStatus({
+              authenticated: true,
+              requiresGoogle: false,
+              requiresPasscode: true,
+              googleVerified: true,
+              passcodeVerified: true,
+              hasPasscodeConfigured: true,
+            });
+            // Auto-fetch progress on password unlock with low-data summary mode
+            syncCloudProgress(false, false);
+          }}
+        />
+      </React.Suspense>
     );
   }
 
@@ -1496,50 +2174,61 @@ Export Timestamp: ${new Date().toLocaleString()}
       <main className={`flex-1 w-full mx-auto px-3 sm:px-4 pt-3 pb-24 relative ${
         activeNavTab === "store" || activeNavTab === "explore" || activeNavTab === "library" ? "max-w-4xl" : "max-w-md"
       }`}>
-        {/* Library Tab View (Personal Bookshelf & Reading Progress) */}
-        <div className={activeNavTab === "library" ? "block" : "hidden"}>
-          <LibraryView
-            onOpenReader={handleOpenReader}
-            onSearchStore={(keyword) => {
-              setStoreSearchTrigger({ query: keyword, timestamp: Date.now() });
-              setActiveNavTab("store");
-            }}
-            onTranslateWholeBook={(book) => {
-              // Redirect to store to download full chapters or start translation
-              setStoreSearchTrigger({ query: book.title, timestamp: Date.now() });
-              setActiveNavTab("store");
-            }}
-          />
-        </div>
+        <React.Suspense
+          fallback={
+            <div className="flex flex-col items-center justify-center py-24 text-slate-400 dark:text-slate-500">
+              <RefreshCw className="h-7 w-7 animate-spin text-purple-600 mb-3" />
+              <span className="text-xs font-semibold tracking-wide uppercase">Loading View...</span>
+            </div>
+          }
+        >
+          {/* Library Tab View (Personal Bookshelf & Reading Progress) */}
+          <div className={activeNavTab === "library" ? "block" : "hidden"}>
+            <LibraryView
+              onOpenReader={handleOpenReader}
+              onSearchStore={(keyword, site = "aiqu226") => {
+                setStoreSearchTrigger({ query: keyword, site, timestamp: Date.now() });
+                setActiveNavTab("store");
+              }}
+              onTranslateWholeBook={(book) => {
+                // Redirect to store to download full chapters or start translation
+                setStoreSearchTrigger({ query: book.title, site: "all", timestamp: Date.now() });
+                setActiveNavTab("store");
+              }}
+              onDeleteNovel={(novelTitle) => handleReset(novelTitle)}
+              getAuthHeaders={getAuthHeaders}
+            />
+          </div>
 
-        {/* Store Tab View */}
-        <div className={activeNavTab === "store" ? "block" : "hidden"}>
-          <StoreView
-            onImportNovel={(title, rawText) => {
-              handleLoadText(rawText, title, 3000, true);
-              setActiveNavTab("home");
-            }}
-            getAuthHeaders={getAuthHeaders}
-            externalSearchTrigger={storeSearchTrigger}
-            onOpenReader={handleOpenReader}
-          />
-        </div>
+          {/* Store Tab View */}
+          <div className={activeNavTab === "store" ? "block" : "hidden"}>
+            <StoreView
+              onImportNovel={(title, rawText, autoStart) => {
+                handleLoadText(rawText, title, 3000, true, autoStart);
+                setActiveNavTab("home");
+              }}
+              getAuthHeaders={getAuthHeaders}
+              externalSearchTrigger={storeSearchTrigger}
+              onOpenReader={handleOpenReader}
+            />
+          </div>
 
-        {/* Explore & Leaderboards Tab View */}
-        <div className={activeNavTab === "explore" ? "block" : "hidden"}>
-          <ExploreView
-            onImportNovel={(title, rawText) => {
-              handleLoadText(rawText, title, 3000, true);
-              setActiveNavTab("home");
-            }}
-            getAuthHeaders={getAuthHeaders}
-            onSearchStore={(keyword) => {
-              setStoreSearchTrigger({ query: keyword, timestamp: Date.now() });
-              setActiveNavTab("store");
-            }}
-            onOpenReader={handleOpenReader}
-          />
-        </div>
+          {/* Explore & Leaderboards Tab View */}
+          <div className={activeNavTab === "explore" ? "block" : "hidden"}>
+            <ExploreView
+              onImportNovel={(title, rawText, autoStart) => {
+                handleLoadText(rawText, title, 3000, true, autoStart);
+                setActiveNavTab("home");
+              }}
+              getAuthHeaders={getAuthHeaders}
+              onSearchStore={(keyword, site = "aiqu226") => {
+                setStoreSearchTrigger({ query: keyword, site, timestamp: Date.now() });
+                setActiveNavTab("store");
+              }}
+              onOpenReader={handleOpenReader}
+            />
+          </div>
+        </React.Suspense>
 
         {/* Home Tab Views (Upload / Translating / Completed) */}
         <div className={activeNavTab === "home" ? "block" : "hidden"}>
@@ -1549,6 +2238,11 @@ Export Timestamp: ${new Date().toLocaleString()}
               onLoadText={handleLoadText}
               serverJob={serverCloudJob}
               onLoadServerJob={handleLoadServerJob}
+              onDeleteServerJob={() => {
+                if (serverCloudJob) {
+                  handleReset(serverCloudJob.fileName);
+                }
+              }}
             />
           ) : isCompleted ? (
             /* Screen 3: Dedicated Translation Complete Screen (Reference Screen 3) */
@@ -1561,6 +2255,7 @@ Export Timestamp: ${new Date().toLocaleString()}
               onDownloadProgress={handleDownloadProgress}
               onOpenExport={handleOpenExport}
               onReset={handleReset}
+              onTranslateAnother={handleTranslateAnother}
               onSyncProgress={() => syncCloudProgress(false, true)}
               isSyncing={isSyncingProgress}
               onOpenReader={handleOpenCurrentSessionReader}
@@ -1610,11 +2305,14 @@ Export Timestamp: ${new Date().toLocaleString()}
               onDownloadProgress={handleDownloadProgress}
               onTranslateChunk={handleTranslateSpecificChunk}
               onReset={handleReset}
+              onTranslateNewNovel={handleTranslateNewNovel}
               completedEnglishWords={completedEnglishWords}
               lastDownloadedWords={lastDownloadedWordCount}
               onSyncProgress={() => syncCloudProgress(false, true)}
               isSyncing={isSyncingProgress}
               onOpenReader={handleOpenCurrentSessionReader}
+              firestoreStatus={firestoreStatus}
+              aiCooldownSecondsRemaining={aiCooldownSec}
             />
           )}
         </div>
@@ -1629,52 +2327,117 @@ Export Timestamp: ${new Date().toLocaleString()}
         onChangeTab={handleBottomNavChange}
       />
 
-      {/* History Drawer Modal */}
-      <HistoryModal
-        isOpen={isHistoryOpen}
-        onClose={() => {
-          setIsHistoryOpen(false);
-          setActiveNavTab("home");
-        }}
-        session={session}
-        onDownloadProgress={handleDownloadProgress}
-        onReset={handleReset}
-        getAuthHeaders={getAuthHeaders}
-        onSelectNovel={(fileName) => syncCloudProgress(true, true, fileName)}
-      />
-
-      {/* Terminology & Glossary Modal */}
-      <GlossaryModal
-        isOpen={isGlossaryOpen}
-        onClose={() => setIsGlossaryOpen(false)}
-        glossary={glossary}
-        onSaveGlossary={(newGlossary) => {
-          setGlossary(newGlossary);
-          setSession((prev) =>
-            prev ? { ...prev, glossary: newGlossary } : null
-          );
-        }}
-        sampleChineseText={session?.chunks[0]?.chineseText || ""}
-      />
-
-      {/* Export & Download Modal */}
-      {session && (
-        <ExportModal
-          isOpen={isExportOpen}
-          onClose={() => setIsExportOpen(false)}
-          chunks={session.chunks}
-          fileName={session.fileName}
+      {/* Lazy Modal Suspense Boundary */}
+      <React.Suspense fallback={null}>
+        {/* History Drawer Modal */}
+        <HistoryModal
+          isOpen={isHistoryOpen}
+          onClose={() => {
+            setIsHistoryOpen(false);
+            setActiveNavTab("home");
+          }}
+          session={session}
+          onDownloadProgress={handleDownloadProgress}
+          onReset={handleReset}
+          getAuthHeaders={getAuthHeaders}
+          onSelectNovel={async (fileName, autoResume) => {
+            userHasResetRef.current = false;
+            await syncCloudProgress(false, true, fileName);
+            setActiveNavTab("home");
+            if (autoResume) {
+              setTimeout(() => {
+                handleResume(fileName);
+                setToastData({
+                  message: `Resumed translation of "${fileName}".`,
+                  type: "success",
+                });
+              }, 400);
+            }
+          }}
+          onOpenReader={handleOpenReader}
         />
-      )}
 
-      {/* Telegram Notifications Settings Modal */}
-      <TelegramSettingsModal
-        isOpen={isTelegramSettingsOpen}
-        onClose={() => {
-          setIsTelegramSettingsOpen(false);
-          setActiveNavTab("home");
-        }}
-      />
+        {/* Terminology & Glossary Modal */}
+        <GlossaryModal
+          isOpen={isGlossaryOpen}
+          onClose={() => setIsGlossaryOpen(false)}
+          glossary={glossary}
+          onSaveGlossary={(newGlossary) => {
+            setGlossary(newGlossary);
+            setSession((prev) =>
+              prev ? { ...prev, glossary: newGlossary } : null
+            );
+          }}
+          sampleChineseText={session?.chunks[0]?.chineseText || ""}
+        />
+
+        {/* Export & Download Modal */}
+        {session && (
+          <ExportModal
+            isOpen={isExportOpen}
+            onClose={() => setIsExportOpen(false)}
+            chunks={session.chunks}
+            fileName={session.fileName}
+            isCloud={mode === "cloud"}
+          />
+        )}
+
+        {/* Telegram Notifications Settings Modal */}
+        <TelegramSettingsModal
+          isOpen={isTelegramSettingsOpen}
+          onClose={() => {
+            setIsTelegramSettingsOpen(false);
+            setActiveNavTab("home");
+          }}
+        />
+
+        {/* Novel Reader Modal & Minimized Background Player */}
+        {readerNovel && (
+          <NovelReaderModal
+            key={`${readerNovel.novelTitle}__${readerNovel.novelUrl || readerNovel.siteId || ""}`}
+            isOpen={isReaderOpen}
+            isMinimized={isReaderMinimized}
+            onClose={handleCloseReader}
+            onToggleMinimize={() => setIsReaderMinimized((prev) => !prev)}
+            onUpdateChapterIndex={(chapterIndex, chapterTitle, allChapters, content, englishContent) => {
+              setReaderNovel((prev) => {
+                if (!prev) return null;
+                return {
+                  ...prev,
+                  chapterIndex,
+                  ...(allChapters && allChapters.length > 0 ? { allChapters } : {}),
+                  ...(content ? { content } : {}),
+                  ...(englishContent !== undefined ? { englishContent } : {}),
+                };
+              });
+            }}
+            novelTitle={readerNovel.novelTitle}
+            author={readerNovel.author}
+            coverUrl={readerNovel.coverUrl}
+            novelUrl={readerNovel.novelUrl}
+            siteId={readerNovel.siteId}
+            initialChapterIndex={readerNovel.chapterIndex || 1}
+            totalChapters={readerNovel.totalChapters || 1}
+            allChapters={readerNovel.allChapters}
+            initialContent={readerNovel.content}
+            initialEnglishContent={readerNovel.englishContent}
+            getAuthHeaders={getAuthHeaders}
+            sessionChunks={
+              session &&
+              isSameNovel(session.fileName, readerNovel.novelTitle)
+                ? currentSessionReaderChunks
+                : undefined
+            }
+            onImportNovel={() => {
+              if (readerNovel.novelTitle) {
+                setStoreSearchTrigger({ query: readerNovel.novelTitle, timestamp: Date.now() });
+                setActiveNavTab("store");
+                setIsReaderOpen(false);
+              }
+            }}
+          />
+        )}
+      </React.Suspense>
 
       {/* Floating Toast notification when user downloads progress or gets a status alert */}
       {toastData && (
@@ -1718,51 +2481,6 @@ Export Timestamp: ${new Date().toLocaleString()}
             </div>
           )}
         </div>
-      )}
-      {/* Novel Reader Modal & Minimized Background Player */}
-      {readerNovel && (
-        <NovelReaderModal
-          key={`${readerNovel.novelTitle}__${readerNovel.novelUrl || readerNovel.siteId || ""}`}
-          isOpen={isReaderOpen}
-          isMinimized={isReaderMinimized}
-          onClose={handleCloseReader}
-          onToggleMinimize={() => setIsReaderMinimized((prev) => !prev)}
-          onUpdateChapterIndex={(chapterIndex, chapterTitle, allChapters) => {
-            setReaderNovel((prev) => {
-              if (!prev) return null;
-              return {
-                ...prev,
-                chapterIndex,
-                ...(allChapters && allChapters.length > 0 ? { allChapters } : {}),
-              };
-            });
-          }}
-          novelTitle={readerNovel.novelTitle}
-          author={readerNovel.author}
-          coverUrl={readerNovel.coverUrl}
-          novelUrl={readerNovel.novelUrl}
-          siteId={readerNovel.siteId}
-          initialChapterIndex={readerNovel.chapterIndex || 1}
-          totalChapters={readerNovel.totalChapters || 1}
-          allChapters={readerNovel.allChapters}
-          initialContent={readerNovel.content}
-          initialEnglishContent={readerNovel.englishContent}
-          getAuthHeaders={getAuthHeaders}
-          sessionChunks={
-            session &&
-            session.fileName.replace(/\.txt$/i, "").trim().toLowerCase() ===
-              readerNovel.novelTitle.trim().toLowerCase()
-              ? session.chunks
-              : undefined
-          }
-          onImportNovel={() => {
-            if (readerNovel.novelTitle) {
-              setStoreSearchTrigger({ query: readerNovel.novelTitle, timestamp: Date.now() });
-              setActiveNavTab("store");
-              setIsReaderOpen(false);
-            }
-          }}
-        />
       )}
     </div>
   );

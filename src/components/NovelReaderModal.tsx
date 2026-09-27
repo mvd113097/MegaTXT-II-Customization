@@ -35,6 +35,10 @@ import {
   MoreHorizontal,
   Radio,
   RotateCw,
+  BookMarked,
+  Infinity,
+  Zap,
+  CheckCircle2,
 } from "lucide-react";
 import {
   getCachedChapter,
@@ -45,8 +49,16 @@ import {
   getLocalLibraryBooks,
   addOrUpdateBookInLibrary,
   removeBookFromLibrary,
+  getNovelGlossary,
+  applyGlossaryToText,
+  replaceTermsInNovelCache,
+  NovelGlossaryTerm,
+  addReadingHistory,
+  getNovelCachedChaptersCount,
 } from "../utils/indexedDbStorage";
+import { NovelGlossaryDrawer } from "./NovelGlossaryDrawer";
 import { TextChunk } from "../types";
+import { cleanAndDeduplicateChapterList, cleanAndDeduplicateChunks, isStubOrEmptyChunk } from "../utils/chunker";
 
 export interface NovelReaderModalProps {
   isOpen: boolean;
@@ -69,7 +81,9 @@ export interface NovelReaderModalProps {
   onUpdateChapterIndex?: (
     chapterIndex: number,
     chapterTitle: string,
-    allChapters?: Array<{ title: string; url: string; index?: number }>
+    allChapters?: Array<{ title: string; url: string; index?: number }>,
+    content?: string,
+    englishContent?: string
   ) => void;
 }
 
@@ -98,12 +112,24 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
     return `${siteId}_${novelTitle}`.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, "_");
   }, [siteId, novelTitle]);
 
+  // Cleaned session chunks to eliminate empty crawler stubs and merged duplicates
+  const cleanedSessionChunks = useMemo(() => {
+    return sessionChunks && sessionChunks.length > 0 ? cleanAndDeduplicateChunks(sessionChunks) : sessionChunks;
+  }, [sessionChunks]);
+
+  // Cleaned chapter list for TOC drawer
+  const cleanedInitialChapters = useMemo(() => {
+    return allChapters && allChapters.length > 0 ? cleanAndDeduplicateChapterList(allChapters) : allChapters;
+  }, [allChapters]);
+
   // Current Chapter State
   const [currentChapterIndex, setCurrentChapterIndex] = useState<number>(initialChapterIndex);
   const [chapterTitle, setChapterTitle] = useState<string>(`Chapter ${initialChapterIndex}`);
+  const [chapterTitleZh, setChapterTitleZh] = useState<string>("");
+  const [chapterTitleEn, setChapterTitleEn] = useState<string>("");
   const [chineseContent, setChineseContent] = useState<string>(initialContent);
   const [englishContent, setEnglishContent] = useState<string>(initialEnglishContent);
-  const [chapterList, setChapterList] = useState<Array<{ title: string; url: string; index?: number }>>(allChapters);
+  const [chapterList, setChapterList] = useState<Array<{ title: string; url: string; index?: number }>>(cleanedInitialChapters);
   const [isLoadingChapter, setIsLoadingChapter] = useState(false);
   const [chapterError, setChapterError] = useState<string | null>(null);
   const [isDataSavedFromCache, setIsDataSavedFromCache] = useState(false);
@@ -112,6 +138,22 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
   const [isTranslatingSingleChapter, setIsTranslatingSingleChapter] = useState(false);
   const [singleChapterTranslateError, setSingleChapterTranslateError] = useState<string | null>(null);
 
+  // Continuous Scroll (Infinite Chapter Flow) State
+  const [flowingChapters, setFlowingChapters] = useState<Array<{
+    index: number;
+    title: string;
+    titleZh?: string;
+    titleEn?: string;
+    chineseContent: string;
+    englishContent: string;
+    chineseParagraphs: string[];
+    englishParagraphs: string[];
+  }>>([]);
+  const [isContinuousLoadingNext, setIsContinuousLoadingNext] = useState(false);
+
+  // Novel Glossary Drawer State
+  const [showGlossaryDrawer, setShowGlossaryDrawer] = useState(false);
+
   // Settings & Preferences (stored in IndexedDB)
   const [prefs, setPrefs] = useState<ReaderPreferences>({
     theme: "sepia",
@@ -119,6 +161,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
     lineHeight: "normal",
     fontFamily: "serif",
     bilingualMode: "english",
+    scrollMode: "continuous",
     ttsEngine: "browser-native",
     ttsRate: 1.0,
     ttsPitch: 1.0,
@@ -162,11 +205,239 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
     return books.some((b) => b.id === novelId || (b.title === novelTitle && (b.author === author || !author)));
   });
 
+  // Offline pre-caching state
+  const [isPreCaching, setIsPreCaching] = useState(false);
+  const [preCacheProgress, setPreCacheProgress] = useState<{ current: number; total: number; message: string } | null>(null);
+  const [offlineCachedCount, setOfflineCachedCount] = useState<number>(0);
+
+  // Load offline cached count for this novel
+  const refreshOfflineCount = useCallback(() => {
+    if (novelId) {
+      getNovelCachedChaptersCount(novelId).then(setOfflineCachedCount).catch(() => {});
+    }
+  }, [novelId]);
+
+  useEffect(() => {
+    if (novelId && isOpen) {
+      refreshOfflineCount();
+    }
+  }, [novelId, isOpen, currentChapterIndex, refreshOfflineCount]);
+
   // Sync library status whenever novel changes
   useEffect(() => {
     const books = getLocalLibraryBooks();
     setIsInLibrary(books.some((b) => b.id === novelId || (b.title === novelTitle && (b.author === author || !author))));
   }, [novelId, novelTitle, author]);
+
+  // Pre-Cache Next 10 Chapters for Zero-Data Offline Reading
+  const handlePreCacheNextChapters = async (count: number = 10) => {
+    if (isPreCaching) return;
+    setIsPreCaching(true);
+
+    const total = totalChapters || chapterList.length || (currentChapterIndex + count);
+    const startIdx = currentChapterIndex + 1;
+    const endIdx = Math.min(total, currentChapterIndex + count);
+    const totalToFetch = Math.max(1, endIdx - startIdx + 1);
+
+    if (startIdx > total) {
+      setPreCacheProgress({ current: 0, total: 0, message: "Already at the end of the novel!" });
+      setTimeout(() => {
+        setIsPreCaching(false);
+        setPreCacheProgress(null);
+      }, 3000);
+      return;
+    }
+
+    setPreCacheProgress({
+      current: 0,
+      total: totalToFetch,
+      message: `Pre-caching next ${totalToFetch} chapters for offline reading...`,
+    });
+
+    let cachedCount = 0;
+    for (let targetIdx = startIdx; targetIdx <= endIdx; targetIdx++) {
+      try {
+        // 1. Check if already in IndexedDB cache
+        const existing = await getCachedChapter(novelId, targetIdx);
+        if (existing && existing.chineseContent) {
+          cachedCount++;
+          setPreCacheProgress({
+            current: cachedCount,
+            total: totalToFetch,
+            message: `Chapter ${targetIdx} already offline (Cached)`,
+          });
+          continue;
+        }
+
+        // 2. Fetch from active session chunks if available
+        if (sessionChunks && sessionChunks.length > 0) {
+          const chunk = sessionChunks.find((c) => c.index === targetIdx - 1);
+          if (chunk && chunk.chineseText) {
+            await setCachedChapter(novelId, targetIdx, {
+              chapterIndex: targetIdx,
+              chapterTitle: chunk.chapterTitle || `Chapter ${targetIdx}`,
+              chineseContent: chunk.chineseText,
+              englishContent: chunk.englishText || "",
+              totalChapters: total,
+            });
+            cachedCount++;
+            setPreCacheProgress({
+              current: cachedCount,
+              total: totalToFetch,
+              message: `Saved Chapter ${targetIdx} (${cachedCount}/${totalToFetch})`,
+            });
+            continue;
+          }
+        }
+
+        // 3. Fetch from store crawler
+        const chapterObj = chapterList.find((c) => (c.index || 0) === targetIdx) || chapterList[targetIdx - 1];
+        let res;
+        if (chapterObj && chapterObj.url) {
+          res = await fetch("/api/store/fetch-chapter", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+            body: JSON.stringify({ chapterUrl: chapterObj.url, chapterTitle: chapterObj.title }),
+          });
+        } else {
+          res = await fetch("/api/store/peek-chapter", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+            body: JSON.stringify({ novelUrl, siteId, title: novelTitle, author, targetIndex: targetIdx }),
+          });
+        }
+
+        if (res.ok) {
+          const data = await res.json();
+          const fTitle = data.chapterTitle || chapterObj?.title || `Chapter ${targetIdx}`;
+          await setCachedChapter(novelId, targetIdx, {
+            chapterIndex: targetIdx,
+            chapterTitle: fTitle,
+            chineseContent: data.content || "",
+            englishContent: data.englishContent || "",
+            totalChapters: data.totalChapters || total,
+          });
+          cachedCount++;
+          setPreCacheProgress({
+            current: cachedCount,
+            total: totalToFetch,
+            message: `Cached Chapter ${targetIdx} (${cachedCount}/${totalToFetch})`,
+          });
+        }
+      } catch (err) {
+        console.warn(`Error pre-caching chapter ${targetIdx}:`, err);
+      }
+    }
+
+    refreshOfflineCount();
+    setPreCacheProgress({
+      current: totalToFetch,
+      total: totalToFetch,
+      message: `✅ Pre-cached ${cachedCount} chapters! Ready for zero-data reading.`,
+    });
+
+    setTimeout(() => {
+      setIsPreCaching(false);
+      setPreCacheProgress(null);
+    }, 4500);
+  };
+
+  // Persistent Novel Glossary state & ref
+  const [novelGlossary, setNovelGlossary] = useState<NovelGlossaryTerm[]>([]);
+  const novelGlossaryRef = useRef<NovelGlossaryTerm[]>([]);
+
+  useEffect(() => {
+    novelGlossaryRef.current = novelGlossary;
+  }, [novelGlossary]);
+
+  // Automatically load novel glossary when novelId changes or modal opens
+  useEffect(() => {
+    if (novelId && isOpen) {
+      getNovelGlossary(novelId).then((terms) => {
+        setNovelGlossary(terms || []);
+      });
+    }
+  }, [novelId, isOpen]);
+
+  // Real-time Glossary term replacements into active reader state
+  const handleApplyReplacementsToCurrentReader = useCallback(
+    (replacements: Array<{ from: string; to: string }>) => {
+      let updatedCount = 0;
+      if (!replacements || replacements.length === 0) return { updatedCount: 0 };
+
+      // Update active chapter englishContent
+      setEnglishContent((prev) => {
+        if (!prev) return prev;
+        let text = prev;
+        for (const { from, to } of replacements) {
+          if (!from || !to) continue;
+          const isWord = /^[A-Za-z0-9_]+$/.test(from);
+          const pattern = isWord
+            ? new RegExp(`\\b${from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi")
+            : new RegExp(from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+
+          text = text.replace(pattern, (match) => {
+            updatedCount++;
+            if (match === match.toUpperCase() && match.length > 1) return to.toUpperCase();
+            if (match[0] === match[0].toUpperCase()) return to.charAt(0).toUpperCase() + to.slice(1);
+            return to;
+          });
+        }
+        return text;
+      });
+
+      // Update active chapter English title
+      setChapterTitleEn((prev) => {
+        if (!prev) return prev;
+        let t = prev;
+        for (const { from, to } of replacements) {
+          if (!from || !to) continue;
+          const isWord = /^[A-Za-z0-9_]+$/.test(from);
+          const pattern = isWord
+            ? new RegExp(`\\b${from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi")
+            : new RegExp(from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+          t = t.replace(pattern, to);
+        }
+        return t;
+      });
+
+      // Update infinite continuous flowing chapters
+      setFlowingChapters((prev) =>
+        prev.map((ch) => {
+          let ec = ch.englishContent;
+          let ct = ch.title;
+          let cte = ch.titleEn;
+          for (const { from, to } of replacements) {
+            if (!from || !to) continue;
+            const isWord = /^[A-Za-z0-9_]+$/.test(from);
+            const pattern = isWord
+              ? new RegExp(`\\b${from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi")
+              : new RegExp(from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+            ec = ec.replace(pattern, to);
+            ct = ct.replace(pattern, to);
+            if (cte) cte = cte.replace(pattern, to);
+          }
+          const ep = ec.split("\n\n").map((p) => p.trim()).filter(Boolean);
+          return { ...ch, englishContent: ec, title: ct, titleEn: cte, englishParagraphs: ep };
+        })
+      );
+
+      return { updatedCount };
+    },
+    []
+  );
+
+  const handleGlossaryChanged = useCallback(
+    (nextTerms: NovelGlossaryTerm[]) => {
+      setNovelGlossary(nextTerms);
+      const replacements = nextTerms.map((t) => ({ from: t.original, to: t.translation }));
+      handleApplyReplacementsToCurrentReader(replacements);
+      if (novelId) {
+        replaceTermsInNovelCache(novelId, replacements);
+      }
+    },
+    [novelId, handleApplyReplacementsToCurrentReader]
+  );
 
   const handleToggleLibrary = () => {
     if (isInLibrary) {
@@ -221,6 +492,13 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
   const sleepTimerIdRef = useRef<any>(null);
   const pendingTtsStartRef = useRef(false);
   const ttsSessionIdRef = useRef<number>(0);
+  const currentChapterIndexRef = useRef<number>(initialChapterIndex || 1);
+  const ttsChapterIndexRef = useRef<number>(initialChapterIndex || 1);
+
+  // Keep refs synchronized with active current chapter
+  useEffect(() => {
+    currentChapterIndexRef.current = currentChapterIndex;
+  }, [currentChapterIndex]);
 
   // Draggable Floating Button Position State
   // Default: bottom: 92px (comfortably above bottom navigation bar's 64px), right: 16px
@@ -244,6 +522,198 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
   const isDraggingBubbleRef = useRef(false);
   const bubbleDragStartRef = useRef<{ clientX: number; clientY: number; startBottom: number }>({ clientX: 0, clientY: 0, startBottom: 92 });
   const bubbleHasMovedRef = useRef(false);
+  const justUnminimizedTimeRef = useRef<number>(0);
+  const speakParagraphAtIndexRef = useRef<(index: number) => void>(() => {});
+
+  // Guard click handler to eliminate ghost tap / click-through when restoring from floating reader bubble
+  const guardUnminimizeClick = useCallback(<T extends (...args: any[]) => any>(fn: T): T => {
+    return ((...args: any[]) => {
+      if (Date.now() - justUnminimizedTimeRef.current < 550) {
+        return;
+      }
+      return fn(...args);
+    }) as T;
+  }, []);
+
+  // Handler to smoothly restore reader from minimized pill without opening drawers or interrupting speech
+  const handleRestoreReader = useCallback(() => {
+    justUnminimizedTimeRef.current = Date.now();
+    setShowChapterDrawer(false);
+    setShowSettingsMenu(false);
+    setShowTopMoreMenu(false);
+    onToggleMinimize();
+
+    // Resume speech synthesis if browser suspended it in the background
+    if (isTtsPlaying && !isTtsPaused) {
+      if (typeof window !== "undefined" && window.speechSynthesis && window.speechSynthesis.paused) {
+        try {
+          window.speechSynthesis.resume();
+        } catch {}
+      }
+    }
+
+    // Smoothly focus/scroll directly to where TTS is reading
+    if (activeParagraphIndexRef.current >= 0) {
+      setTimeout(() => {
+        const el =
+          document.getElementById(`reader-paragraph-${activeParagraphIndexRef.current}`) ||
+          document.getElementById(`reader-ch-${currentChapterIndex}-para-${activeParagraphIndexRef.current}`);
+        if (el && readerBodyRef.current) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      }, 100);
+    }
+  }, [onToggleMinimize, isTtsPlaying, isTtsPaused, currentChapterIndex]);
+
+  // Synchronize layout and scroll position when returning from minimized state
+  useEffect(() => {
+    if (!isMinimized && isOpen) {
+      setShowChapterDrawer(false);
+      setShowSettingsMenu(false);
+      setShowTopMoreMenu(false);
+
+      // Refresh current chapter content from session chunks if available
+      if (sessionChunks && sessionChunks.length > 0 && currentChapterIndex >= 1 && currentChapterIndex <= sessionChunks.length) {
+        const chunk = sessionChunks[currentChapterIndex - 1];
+        if (chunk && chunk.englishText) {
+          const finalEng = applyGlossaryToText(chunk.englishText || "", novelGlossaryRef.current);
+          if (finalEng && finalEng !== englishContent) {
+            setEnglishContent(finalEng);
+          }
+          if (chunk.chineseText && chunk.chineseText !== chineseContent) {
+            setChineseContent(chunk.chineseText);
+          }
+          const title = chunk.chapterTitle || `Chapter ${currentChapterIndex}`;
+          setChapterTitle(title);
+          setChapterTitleZh(chunk.chapterTitle || `Chapter ${currentChapterIndex}`);
+          setChapterTitleEn(title.startsWith("Chapter") ? title : `Chapter ${currentChapterIndex}`);
+        }
+      }
+
+      if (isTtsPlaying && !isTtsPaused) {
+        if (typeof window !== "undefined" && window.speechSynthesis && window.speechSynthesis.paused) {
+          try {
+            window.speechSynthesis.resume();
+          } catch {}
+        }
+      }
+
+      if (activeParagraphIndexRef.current >= 0) {
+        setTimeout(() => {
+          const el =
+            document.getElementById(`reader-paragraph-${activeParagraphIndexRef.current}`) ||
+            document.getElementById(`reader-ch-${currentChapterIndex}-para-${activeParagraphIndexRef.current}`);
+          if (el && readerBodyRef.current) {
+            el.scrollIntoView({ behavior: "smooth", block: "center" });
+          }
+        }, 120);
+      }
+    }
+  }, [isMinimized, isOpen, isTtsPlaying, isTtsPaused, currentChapterIndex, sessionChunks]);
+
+  // Mobile Back Gesture & Hardware Back Button Integration:
+  // When reader is in full-screen mode, back gesture minimizes the reader instead of closing the tab.
+  const isReaderActiveRef = useRef({
+    isOpen,
+    isMinimized,
+    showChapterDrawer,
+    showSettingsMenu,
+    showTopMoreMenu,
+    showTranslateModal,
+    showSleepTimerPopup,
+    showTtsSpeedPopup,
+  });
+
+  useEffect(() => {
+    isReaderActiveRef.current = {
+      isOpen,
+      isMinimized,
+      showChapterDrawer,
+      showSettingsMenu,
+      showTopMoreMenu,
+      showTranslateModal,
+      showSleepTimerPopup,
+      showTtsSpeedPopup,
+    };
+  }, [
+    isOpen,
+    isMinimized,
+    showChapterDrawer,
+    showSettingsMenu,
+    showTopMoreMenu,
+    showTranslateModal,
+    showSleepTimerPopup,
+    showTtsSpeedPopup,
+  ]);
+
+  useEffect(() => {
+    if (!isOpen || isMinimized) return;
+
+    // Push history state entry representing the active reader modal
+    const stateKey = `reader_modal_${Date.now()}`;
+    try {
+      window.history.pushState({ readerOpen: true, key: stateKey }, "");
+    } catch {}
+
+    const handlePopState = (e: PopStateEvent) => {
+      const state = isReaderActiveRef.current;
+      if (!state.isOpen) return;
+
+      // 1. If any drawer / popup menu is open inside reader, close the topmost menu first
+      if (state.showTranslateModal) {
+        setShowTranslateModal(false);
+        try {
+          window.history.pushState({ readerOpen: true, key: stateKey }, "");
+        } catch {}
+        return;
+      }
+      if (state.showChapterDrawer) {
+        setShowChapterDrawer(false);
+        try {
+          window.history.pushState({ readerOpen: true, key: stateKey }, "");
+        } catch {}
+        return;
+      }
+      if (state.showSettingsMenu) {
+        setShowSettingsMenu(false);
+        try {
+          window.history.pushState({ readerOpen: true, key: stateKey }, "");
+        } catch {}
+        return;
+      }
+      if (state.showTopMoreMenu) {
+        setShowTopMoreMenu(false);
+        try {
+          window.history.pushState({ readerOpen: true, key: stateKey }, "");
+        } catch {}
+        return;
+      }
+      if (state.showSleepTimerPopup) {
+        setShowSleepTimerPopup(false);
+        try {
+          window.history.pushState({ readerOpen: true, key: stateKey }, "");
+        } catch {}
+        return;
+      }
+      if (state.showTtsSpeedPopup) {
+        setShowTtsSpeedPopup(false);
+        try {
+          window.history.pushState({ readerOpen: true, key: stateKey }, "");
+        } catch {}
+        return;
+      }
+
+      // 2. If reader itself is open in full view, minimize it to floating pill!
+      if (!state.isMinimized) {
+        onToggleMinimize();
+      }
+    };
+
+    window.addEventListener("popstate", handlePopState);
+    return () => {
+      window.removeEventListener("popstate", handlePopState);
+    };
+  }, [isOpen, isMinimized, onToggleMinimize]);
 
   // Load preferences from IndexedDB on mount
   useEffect(() => {
@@ -261,15 +731,23 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
     });
   };
 
-  // Sync initial content or index changes
+  // Keep active reader chapter content live-synced when background translation completes
   useEffect(() => {
-    if (initialChapterIndex) {
-      setCurrentChapterIndex(initialChapterIndex);
+    if (sessionChunks && sessionChunks.length > 0) {
+      const activeChunk = sessionChunks.find((c) => c.index === currentChapterIndex - 1) || sessionChunks[currentChapterIndex - 1];
+      if (activeChunk && activeChunk.englishText && activeChunk.englishText.trim().length > 0 && activeChunk.englishText !== englishContent) {
+        const finalEng = applyGlossaryToText(activeChunk.englishText, novelGlossaryRef.current);
+        setEnglishContent(finalEng);
+        if (activeChunk.chineseText && (!chineseContent || chineseContent !== activeChunk.chineseText)) {
+          setChineseContent(activeChunk.chineseText);
+        }
+        const title = activeChunk.chapterTitle || (chapterList[currentChapterIndex - 1]?.title) || `Chapter ${currentChapterIndex}`;
+        setChapterTitle(title);
+        setChapterTitleZh(activeChunk.chapterTitle || title);
+        setChapterTitleEn(title.startsWith("Chapter") ? title : `Chapter ${currentChapterIndex}`);
+      }
     }
-    if (allChapters && allChapters.length > 0) {
-      setChapterList(allChapters);
-    }
-  }, [initialChapterIndex, allChapters]);
+  }, [sessionChunks, currentChapterIndex]);
 
   // Find the optimal Google US Female / Android voice
   const findGoogleUsFemaleVoice = useCallback((voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null => {
@@ -541,21 +1019,149 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
     }
   }, [sleepTimerMinutes]);
 
+  // Helper to sanitize text and clean out any HTML/br artifacts, comments, rogue attributes, or download links
+  const cleanReaderParagraphs = (raw: string): string[] => {
+    if (!raw) return [];
+    const text = raw
+      .replace(/&lt;br\s*\/??&gt;/gi, "\n")
+      .replace(/&lt;\/br&gt;/gi, "\n")
+      .replace(/<br\s*\/??>/gi, "\n")
+      .replace(/<\/br>/gi, "\n")
+      .replace(/<!--[\s\S]*?-->/g, "\n") // strip HTML comments
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&#160;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&quot;/gi, '"')
+      .replace(/&apos;/gi, "'")
+      .replace(/\u3000/g, " ")
+      .replace(/<[^>]+>/g, "\n") // strip all embedded HTML tags
+      .replace(/52书库\s*>\s*[^\n]*/gi, "")
+      .replace(/小说在线阅读[^\n]*/gi, "")
+      .replace(/关灯\s*护眼\s*字体[^\n]*/gi, "")
+      .replace(/大\s*中\s*小/g, "")
+      .replace(/请记住本书首发域名[^\n]*/gi, "")
+      .replace(/69书吧[^\n]*/gi, "")
+      .replace(/52书库[^\n]*/gi, "")
+      .replace(/笔趣阁[^\n]*/gi, "")
+      .replace(/爱去小说[^\n]*/gi, "");
+
+    const isJunkLine = (line: string): boolean => {
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+
+      // Filter out standalone pagination numbers (e.g. 1, 2, 3 ... 55 from page jump lists)
+      if (/^\d{1,4}$/.test(trimmed)) {
+        return true;
+      }
+
+      // Filter out residual HTML tag attributes (e.g. 'class="download-link"', 'href="...', 'download="...', 'name="downdw"')
+      if (
+        /^(?:class|id|href|download|name|style|target|rel|src|onclick)\s*=\s*["'][^"']*["']/i.test(trimmed) ||
+        /^(?:class|id|href|download|name|style)\s*=/i.test(trimmed) ||
+        /^['"][^'"]*['"]\s*class=/i.test(trimmed) ||
+        /^class\s*=\s*["']download/i.test(trimmed) ||
+        /^class\s*=\s*["']page-link/i.test(trimmed)
+      ) {
+        return true;
+      }
+
+      // Filter out pagination text, page jump forms, and script controls
+      if (
+        /当前页码[：:]/i.test(trimmed) ||
+        /可使用下面一键跳转/i.test(trimmed) ||
+        /就输入数字/i.test(trimmed) ||
+        /^第\s*\d+\s*页\s*\/\s*共\s*\d+\s*页/i.test(trimmed) ||
+        /function\s+page_go/i.test(trimmed) ||
+        /document\.getElementById/i.test(trimmed) ||
+        /location\.href/i.test(trimmed) ||
+        /event\.keyCode|keyCode/i.test(trimmed) ||
+        /isNaN\s*\(/i.test(trimmed) ||
+        /var\s+p\s*=/i.test(trimmed) ||
+        /if\s*\(p\s*!=/i.test(trimmed) ||
+        /^\/\/\s*如果输入的页码/i.test(trimmed) ||
+        /^[{}();=]+\s*$/.test(trimmed) ||
+        /^=48&&/i.test(trimmed)
+      ) {
+        return true;
+      }
+
+      // Filter out aggregator footer download links and navigation junk
+      const compact = trimmed.replace(/[\s\-_:：|]/g, "");
+      if (
+        compact === "" ||
+        compact === "|" ||
+        compact === "下载本书" ||
+        compact === "下载链接" ||
+        compact === "txt下载" ||
+        compact === "全本下载" ||
+        compact === "点击下载" ||
+        compact === "上一章" ||
+        compact === "下一章" ||
+        compact === "上一页" ||
+        compact === "下一页" ||
+        compact === "第一页" ||
+        compact === "末页" ||
+        compact === "尾页" ||
+        compact === "返回目录" ||
+        compact === "返回顶部" ||
+        compact === "加入书签" ||
+        compact === "推荐本书" ||
+        compact === "投推荐票" ||
+        compact === "小说站首页" ||
+        compact === "手机客户端" ||
+        compact === "问题反馈" ||
+        compact === "章节错误点此举报" ||
+        compact.includes("Copyright") ||
+        compact.includes("&copy") ||
+        compact.includes("本章未完") ||
+        compact.includes("点击下一页继续阅读")
+      ) {
+        return true;
+      }
+
+      // Filter out stray tag tokens
+      const lower = trimmed.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (
+        lower === "br" ||
+        lower === "brbr" ||
+        lower === "brbrbr" ||
+        lower === "div" ||
+        lower === "span" ||
+        lower === "p" ||
+        lower === "a" ||
+        lower === "script" ||
+        lower === "style" ||
+        lower === "copyright" ||
+        lower === "copy"
+      ) {
+        return true;
+      }
+
+      return false;
+    };
+
+    return text
+      .split(/\r?\n+/)
+      .map((p) =>
+        p
+          .replace(/^(?:<br\s*\/?>|&lt;br\s*\/?&gt;|br|\s)+/gi, "")
+          .replace(/(?:<br\s*\/?>|&lt;br\s*\/?&gt;|br|\s)+$/gi, "")
+          .trim()
+      )
+      .filter((p) => !isJunkLine(p));
+  };
+
   // Clean Paragraphs for Display
   const chineseParagraphs = useMemo(() => {
     if (!chineseContent) return [];
-    return chineseContent
-      .split(/\r?\n+/)
-      .map((p) => p.trim())
-      .filter((p) => p.length > 0);
+    return cleanReaderParagraphs(chineseContent);
   }, [chineseContent]);
 
   const englishParagraphs = useMemo(() => {
     if (!englishContent) return [];
-    return englishContent
-      .split(/\r?\n+/)
-      .map((p) => p.trim())
-      .filter((p) => p.length > 0);
+    return cleanReaderParagraphs(englishContent);
   }, [englishContent]);
 
   // Active paragraphs for TTS and reading
@@ -569,6 +1175,14 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
     return chineseParagraphs;
   }, [prefs.bilingualMode, englishParagraphs, chineseParagraphs]);
 
+  // Active chapter title (zero-data toggle between English & Chinese)
+  const displayChapterTitle = useMemo(() => {
+    if (prefs.bilingualMode === "chinese") {
+      return chapterTitleZh || chapterTitle;
+    }
+    return chapterTitleEn || chapterTitle;
+  }, [prefs.bilingualMode, chapterTitleZh, chapterTitleEn, chapterTitle]);
+
   // Keep ref in sync for zero-delay TTS
   useEffect(() => {
     ttsParagraphsRef.current = displayParagraphs;
@@ -580,36 +1194,139 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
   const loadChapter = useCallback(
     async (targetIndex: number, forceNetwork = false) => {
       if (targetIndex < 1) return;
+      currentChapterIndexRef.current = targetIndex;
+      ttsChapterIndexRef.current = targetIndex;
       setIsLoadingChapter(true);
       setChapterError(null);
       setIsDataSavedFromCache(false);
       setSingleChapterTranslateError(null);
 
-      // Stop any active TTS utterance when navigating chapters
+      // Stop any active TTS utterance when navigating chapters MANUALLY
       if (typeof window !== "undefined" && window.speechSynthesis) {
         window.speechSynthesis.cancel();
       }
-      setIsTtsPlaying(false);
-      setIsTtsPaused(false);
-      setActiveParagraphIndex(-1);
-      activeParagraphIndexRef.current = -1;
+      if (!pendingTtsStartRef.current) {
+        setIsTtsPlaying(false);
+        setIsTtsPaused(false);
+        setActiveParagraphIndex(-1);
+        activeParagraphIndexRef.current = -1;
+      } else {
+        // Auto-advancing TTS: preserve playing state
+        setActiveParagraphIndex(-1);
+        activeParagraphIndexRef.current = -1;
+      }
 
       // 1. Check current session chunks (e.g., active translation session)
       if (!forceNetwork && sessionChunks && sessionChunks.length > 0) {
-        const sessionChunk = sessionChunks[targetIndex - 1];
+        const sessionChunk = sessionChunks.find((c) => c.index === targetIndex - 1) || sessionChunks[targetIndex - 1];
         if (sessionChunk) {
-          setCurrentChapterIndex(targetIndex);
-          setChapterTitle(sessionChunk.chapterTitle || `Chapter ${targetIndex}`);
-          setChineseContent(sessionChunk.chineseText || "");
-          setEnglishContent(sessionChunk.englishText || "");
-          setIsLoadingChapter(false);
-          setIsDataSavedFromCache(true);
-          onUpdateChapterIndex?.(targetIndex, sessionChunk.chapterTitle || `Chapter ${targetIndex}`);
-          if (pendingTtsStartRef.current) {
-            pendingTtsStartRef.current = false;
-            setTimeout(() => speakParagraphAtIndex(0), 250);
+          const title = sessionChunk.chapterTitle || (chapterList[targetIndex - 1]?.title) || `Chapter ${targetIndex}`;
+
+          if (sessionChunk.englishText && sessionChunk.englishText.trim().length > 0) {
+            const finalEng = applyGlossaryToText(sessionChunk.englishText, novelGlossaryRef.current);
+            setCurrentChapterIndex(targetIndex);
+            setChapterTitle(title);
+            setChapterTitleZh(sessionChunk.chapterTitle || title);
+            setChapterTitleEn(title.startsWith("Chapter") ? title : `Chapter ${targetIndex}`);
+            setChineseContent(sessionChunk.chineseText || "");
+            setEnglishContent(finalEng);
+            setIsLoadingChapter(false);
+            setIsDataSavedFromCache(true);
+            onUpdateChapterIndex?.(targetIndex, title, chapterList, sessionChunk.chineseText || "", finalEng);
+            if (readerBodyRef.current) {
+              readerBodyRef.current.scrollTo({ top: 0, behavior: "instant" });
+            }
+            if (pendingTtsStartRef.current) {
+              pendingTtsStartRef.current = false;
+              const newParas = cleanReaderParagraphs(
+                prefs.bilingualMode === "chinese"
+                  ? sessionChunk.chineseText || ""
+                  : (finalEng || sessionChunk.chineseText || "")
+              );
+              ttsParagraphsRef.current = newParas;
+              setIsTtsPlaying(true);
+              setIsTtsPaused(false);
+              setTimeout(() => speakParagraphAtIndexRef.current(0), 120);
+            }
+            return;
           }
-          return;
+
+          // If sessionChunk does not have englishText loaded locally, fetch from cloud job on demand
+          try {
+            const chunkRes = await fetch(`/api/cloud-job/chunk/${sessionChunk.index}`, {
+              headers: {
+                ...getAuthHeaders(),
+                "x-novel-filename": encodeURIComponent(novelTitle),
+              },
+            });
+            if (chunkRes.ok) {
+              const chunkData = await chunkRes.json();
+              if (chunkData.success && chunkData.chunk) {
+                const finalEng = chunkData.chunk.englishText?.trim()
+                  ? applyGlossaryToText(chunkData.chunk.englishText, novelGlossaryRef.current)
+                  : "";
+                const finalZh = chunkData.chunk.chineseText || sessionChunk.chineseText || "";
+                const fetchedTitle = chunkData.chunk.chapterTitle || sessionChunk.chapterTitle || (chapterList[targetIndex - 1]?.title) || `Chapter ${targetIndex}`;
+                setCurrentChapterIndex(targetIndex);
+                setChapterTitle(fetchedTitle);
+                setChapterTitleZh(fetchedTitle);
+                setChapterTitleEn(fetchedTitle.startsWith("Chapter") ? fetchedTitle : `Chapter ${targetIndex}`);
+                setChineseContent(finalZh);
+                setEnglishContent(finalEng);
+                setIsLoadingChapter(false);
+                setIsDataSavedFromCache(true);
+                onUpdateChapterIndex?.(targetIndex, fetchedTitle, chapterList, finalZh, finalEng);
+                if (readerBodyRef.current) {
+                  readerBodyRef.current.scrollTo({ top: 0, behavior: "instant" });
+                }
+                if (pendingTtsStartRef.current) {
+                  pendingTtsStartRef.current = false;
+                  const newParas = cleanReaderParagraphs(
+                    prefs.bilingualMode === "chinese"
+                      ? finalZh
+                      : (finalEng || finalZh)
+                  );
+                  ttsParagraphsRef.current = newParas;
+                  setIsTtsPlaying(true);
+                  setIsTtsPaused(false);
+                  setTimeout(() => speakParagraphAtIndexRef.current(0), 120);
+                }
+                return;
+              }
+            }
+          } catch (fetchErr) {
+            console.warn("Could not fetch translated chunk on demand:", fetchErr);
+          }
+
+          // If raw Chinese text is present in sessionChunk even if translation is still pending
+          if (sessionChunk.chineseText && sessionChunk.chineseText.trim().length > 0) {
+            currentChapterIndexRef.current = targetIndex;
+            ttsChapterIndexRef.current = targetIndex;
+            setCurrentChapterIndex(targetIndex);
+            setChapterTitle(title);
+            setChapterTitleZh(sessionChunk.chapterTitle || title);
+            setChapterTitleEn(title.startsWith("Chapter") ? title : `Chapter ${targetIndex}`);
+            setChineseContent(sessionChunk.chineseText);
+            setEnglishContent(sessionChunk.englishText || "");
+            setIsLoadingChapter(false);
+            onUpdateChapterIndex?.(targetIndex, title, chapterList, sessionChunk.chineseText, sessionChunk.englishText || "");
+            if (readerBodyRef.current) {
+              readerBodyRef.current.scrollTo({ top: 0, behavior: "instant" });
+            }
+            if (pendingTtsStartRef.current) {
+              pendingTtsStartRef.current = false;
+              const newParas = cleanReaderParagraphs(
+                prefs.bilingualMode === "chinese"
+                  ? sessionChunk.chineseText
+                  : (sessionChunk.englishText || sessionChunk.chineseText)
+              );
+              ttsParagraphsRef.current = newParas;
+              setIsTtsPlaying(true);
+              setIsTtsPaused(false);
+              setTimeout(() => speakParagraphAtIndexRef.current(0), 120);
+            }
+            return;
+          }
         }
       }
 
@@ -624,16 +1341,34 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
             ? cached.chineseContent.split(/\r?\n+/).filter(Boolean).length
             : 0;
           if (cached && cached.chineseContent && cachedParaCount < 600) {
+            const rawEng = cached.englishContent || "";
+            const rawTEn = (cached as any).chapterTitleEn || cached.chapterTitle || `Chapter ${targetIndex}`;
+            const finalEng = applyGlossaryToText(rawEng, novelGlossaryRef.current);
+            const finalTEn = applyGlossaryToText(rawTEn, novelGlossaryRef.current);
+
             setCurrentChapterIndex(targetIndex);
             setChapterTitle(cached.chapterTitle || `Chapter ${targetIndex}`);
+            setChapterTitleZh((cached as any).chapterTitleZh || cached.chapterTitle || `Chapter ${targetIndex}`);
+            setChapterTitleEn(finalTEn);
             setChineseContent(cached.chineseContent);
-            setEnglishContent(cached.englishContent || "");
+            setEnglishContent(finalEng);
             setIsLoadingChapter(false);
             setIsDataSavedFromCache(true);
             onUpdateChapterIndex?.(targetIndex, cached.chapterTitle || `Chapter ${targetIndex}`);
             if (pendingTtsStartRef.current) {
               pendingTtsStartRef.current = false;
-              setTimeout(() => speakParagraphAtIndex(0), 250);
+              const newParas = cleanReaderParagraphs(
+                prefs.bilingualMode === "chinese"
+                  ? cached.chineseContent
+                  : (finalEng || cached.chineseContent)
+              );
+              ttsParagraphsRef.current = newParas;
+              setIsTtsPlaying(true);
+              setIsTtsPaused(false);
+              if (readerBodyRef.current) {
+                readerBodyRef.current.scrollTo({ top: 0, behavior: "instant" });
+              }
+              setTimeout(() => speakParagraphAtIndexRef.current(0), 120);
             }
             return;
           }
@@ -684,11 +1419,18 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
         const data = await res.json();
         const fetchedTitle = data.chapterTitle || (chapterObj ? chapterObj.title : `Chapter ${targetIndex}`);
         const fetchedChinese = data.content || "";
+        const titleZh = data.chapterTitleZh || (chapterObj ? chapterObj.title : fetchedTitle);
+        const titleEn = data.chapterTitleEn || fetchedTitle;
+
+        const finalEng = applyGlossaryToText(data.englishContent || "", novelGlossaryRef.current);
+        const finalTEn = applyGlossaryToText(titleEn, novelGlossaryRef.current);
 
         setCurrentChapterIndex(targetIndex);
         setChapterTitle(fetchedTitle);
+        setChapterTitleZh(titleZh);
+        setChapterTitleEn(finalTEn);
         setChineseContent(fetchedChinese);
-        setEnglishContent(data.englishContent || "");
+        setEnglishContent(finalEng);
 
         if (data.allChapters && Array.isArray(data.allChapters) && data.allChapters.length > 0) {
           setChapterList(data.allChapters);
@@ -703,7 +1445,9 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           chineseContent: fetchedChinese,
           englishContent: data.englishContent || "",
           totalChapters: data.totalChapters || totalChapters,
-        });
+          ...(titleZh ? { chapterTitleZh: titleZh } : {}),
+          ...(titleEn ? { chapterTitleEn: titleEn } : {}),
+        } as any);
 
         // If in user library, auto-update last read chapter
         try {
@@ -727,13 +1471,28 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
 
         if (pendingTtsStartRef.current) {
           pendingTtsStartRef.current = false;
-          setTimeout(() => speakParagraphAtIndex(0), 250);
+          const newParas = cleanReaderParagraphs(
+            prefs.bilingualMode === "chinese"
+              ? data.chineseContent
+              : (data.englishContent || data.chineseContent)
+          );
+          ttsParagraphsRef.current = newParas;
+          setIsTtsPlaying(true);
+          setIsTtsPaused(false);
+          if (readerBodyRef.current) {
+            readerBodyRef.current.scrollTo({ top: 0, behavior: "instant" });
+          }
+          setTimeout(() => speakParagraphAtIndexRef.current(0), 120);
         }
       } catch (err: any) {
         setChapterError(err.message || "Failed to load chapter text.");
+        if (pendingTtsStartRef.current) {
+          pendingTtsStartRef.current = false;
+          stopTts();
+        }
       } finally {
         setIsLoadingChapter(false);
-        if (readerBodyRef.current) {
+        if (readerBodyRef.current && !pendingTtsStartRef.current) {
           readerBodyRef.current.scrollTo({ top: 0, behavior: "smooth" });
         }
       }
@@ -741,7 +1500,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
     [novelId, chapterList, novelUrl, siteId, novelTitle, author, getAuthHeaders, sessionChunks, totalChapters, onUpdateChapterIndex]
   );
 
-  // Novel Identity Synchronization: When switching from Novel 1 to Novel 2, cleanly reset and load novel 2
+  // Novel Identity Synchronization & Content Re-sync
   const prevNovelKeyRef = useRef<string>(`${siteId}_${novelTitle}_${novelUrl || ""}`);
   useEffect(() => {
     const currentKey = `${siteId}_${novelTitle}_${novelUrl || ""}`;
@@ -766,11 +1525,16 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
       setChapterError(null);
       setIsDataSavedFromCache(false);
 
-      if (!initialContent) {
+      if (!initialContent && !initialEnglishContent) {
         loadChapter(targetIndex);
       }
+    } else {
+      // If chapter list was expanded in parent
+      if (allChapters && allChapters.length > 0 && allChapters.length !== chapterList.length) {
+        setChapterList(allChapters);
+      }
     }
-  }, [siteId, novelTitle, novelUrl, initialChapterIndex, initialContent, initialEnglishContent, allChapters, loadChapter]);
+  }, [siteId, novelTitle, novelUrl, initialChapterIndex, initialContent, initialEnglishContent, allChapters, loadChapter, chapterList.length]);
 
   // Load initial chapter if needed
   useEffect(() => {
@@ -798,6 +1562,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           content: chineseContent,
           chapterTitle,
           novelTitle,
+          glossary: novelGlossaryRef.current,
         }),
       });
 
@@ -808,10 +1573,11 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
 
       const data = await res.json();
       if (data.englishContent) {
-        setEnglishContent(data.englishContent);
+        const finalEng = applyGlossaryToText(data.englishContent, novelGlossaryRef.current);
+        setEnglishContent(finalEng);
         updatePrefs({ bilingualMode: "english" });
 
-        const newParas = data.englishContent
+        const newParas = finalEng
           .split(/\r?\n+/)
           .map((p: string) => p.trim())
           .filter((p: string) => p.length > 0);
@@ -828,7 +1594,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           chapterIndex: currentChapterIndex,
           chapterTitle,
           chineseContent,
-          englishContent: data.englishContent,
+          englishContent: finalEng,
           totalChapters: chapterList.length || totalChapters,
         });
       }
@@ -839,6 +1605,295 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
       setIsTranslatingSingleChapter(false);
     }
   };
+
+  // -------------------------------------------------------------
+  // Continuous Scroll (Infinite Chapter Flow) Engine
+  // -------------------------------------------------------------
+
+  // Keep flowingChapters initialized with active chapter
+  useEffect(() => {
+    if (chineseContent || englishContent) {
+      const chParas = (chineseContent || "")
+        .split(/\r?\n+/)
+        .map((p) => p.trim())
+        .filter(Boolean);
+      const enParas = (englishContent || "")
+        .split(/\r?\n+/)
+        .map((p) => p.trim())
+        .filter(Boolean);
+
+      setFlowingChapters((prev) => {
+        // If empty or user jumped to a different starting chapter
+        const existingIdx = prev.findIndex((c) => c.index === currentChapterIndex);
+        if (existingIdx === -1) {
+          return [
+            {
+              index: currentChapterIndex,
+              title: chapterTitle,
+              titleZh: chapterTitleZh || chapterTitle,
+              titleEn: chapterTitleEn || chapterTitle,
+              chineseContent,
+              englishContent,
+              chineseParagraphs: chParas,
+              englishParagraphs: enParas,
+            },
+          ];
+        }
+        // Update the chapter in place
+        return prev.map((c) =>
+          c.index === currentChapterIndex
+            ? {
+                ...c,
+                title: chapterTitle,
+                titleZh: chapterTitleZh || c.titleZh || chapterTitle,
+                titleEn: chapterTitleEn || c.titleEn || chapterTitle,
+                chineseContent,
+                englishContent,
+                chineseParagraphs: chParas,
+                englishParagraphs: enParas,
+              }
+            : c
+        );
+      });
+    }
+  }, [currentChapterIndex, chapterTitle, chapterTitleZh, chapterTitleEn, chineseContent, englishContent]);
+
+  // Load next chapter in continuous flow
+  const loadNextFlowingChapter = useCallback(async () => {
+    if (isContinuousLoadingNext || isLoadingChapter) return;
+
+    const lastCh = flowingChapters[flowingChapters.length - 1];
+    const nextIdx = lastCh ? lastCh.index + 1 : currentChapterIndex + 1;
+
+    if (chapterList.length > 0 && nextIdx > chapterList.length) return;
+    if (totalChapters > 0 && nextIdx > totalChapters) return;
+
+    setIsContinuousLoadingNext(true);
+
+    try {
+      // 1. Session chunk?
+      const chunk = sessionChunks && (sessionChunks.find((c) => c.index === nextIdx - 1) || sessionChunks[nextIdx - 1]);
+      if (chunk) {
+        let rawEng = chunk.englishText || "";
+        let rawZh = chunk.chineseText || "";
+        let rawTitle = chunk.chapterTitle || `Chapter ${nextIdx}`;
+
+        if (!rawEng.trim()) {
+          try {
+            const chunkRes = await fetch(`/api/cloud-job/chunk/${chunk.index}`, {
+              headers: {
+                ...getAuthHeaders(),
+                "x-novel-filename": encodeURIComponent(novelTitle),
+              },
+            });
+            if (chunkRes.ok) {
+              const chunkData = await chunkRes.json();
+              if (chunkData.success && chunkData.chunk?.englishText?.trim()) {
+                rawEng = chunkData.chunk.englishText;
+                if (chunkData.chunk.chineseText) rawZh = chunkData.chunk.chineseText;
+                if (chunkData.chunk.chapterTitle) rawTitle = chunkData.chunk.chapterTitle;
+              }
+            }
+          } catch {}
+        }
+
+        const finalEng = applyGlossaryToText(rawEng, novelGlossaryRef.current);
+        const chParas = rawZh.split(/\r?\n+/).map((p) => p.trim()).filter(Boolean);
+        const enParas = finalEng.split(/\r?\n+/).map((p) => p.trim()).filter(Boolean);
+        setFlowingChapters((prev) => {
+          if (prev.some((c) => c.index === nextIdx)) return prev;
+          return [
+            ...prev,
+            {
+              index: nextIdx,
+              title: rawTitle,
+              titleZh: rawTitle,
+              titleEn: rawTitle,
+              chineseContent: rawZh,
+              englishContent: finalEng,
+              chineseParagraphs: chParas,
+              englishParagraphs: enParas,
+            },
+          ];
+        });
+        setIsContinuousLoadingNext(false);
+        return;
+      }
+
+      // 2. Offline Cache (0 data!)
+      const cached = await getCachedChapter(novelId, nextIdx);
+      if (cached && cached.chineseContent) {
+        const rawEng = cached.englishContent || "";
+        const rawTEn = (cached as any).chapterTitleEn || cached.chapterTitle;
+        const finalEng = applyGlossaryToText(rawEng, novelGlossaryRef.current);
+        const finalTEn = applyGlossaryToText(rawTEn, novelGlossaryRef.current);
+        const chParas = (cached.chineseContent || "").split(/\r?\n+/).map((p) => p.trim()).filter(Boolean);
+        const enParas = finalEng.split(/\r?\n+/).map((p) => p.trim()).filter(Boolean);
+        setFlowingChapters((prev) => {
+          if (prev.some((c) => c.index === nextIdx)) return prev;
+          return [
+            ...prev,
+            {
+              index: nextIdx,
+              title: cached.chapterTitle || `Chapter ${nextIdx}`,
+              titleZh: (cached as any).chapterTitleZh || cached.chapterTitle,
+              titleEn: finalTEn,
+              chineseContent: cached.chineseContent,
+              englishContent: finalEng,
+              chineseParagraphs: chParas,
+              englishParagraphs: enParas,
+            },
+          ];
+        });
+        setIsContinuousLoadingNext(false);
+        return;
+      }
+
+      // 3. Network fetch with auto translation
+      let endpoint = "/api/store/fetch-chapter";
+      let bodyPayload: any = {
+        novelUrl,
+        chapterIndex: nextIdx,
+        siteId,
+        allChapters: chapterList.length > 0 ? chapterList : undefined,
+      };
+
+      if (siteId === "explore" || novelUrl?.includes("explore_")) {
+        endpoint = "/api/store/peek-chapter";
+        bodyPayload = {
+          novelTitle,
+          chapterIndex: nextIdx,
+          siteId,
+        };
+      }
+
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify(bodyPayload),
+      });
+
+      const data = await res.json();
+      if (res.ok && data.content) {
+        const chTitle = data.chapterTitle || `Chapter ${nextIdx}`;
+        const chZh = data.chapterTitleZh || chTitle;
+        const chEn = data.chapterTitleEn || chTitle;
+        const chContent = data.content || "";
+        const rawEngContent = data.englishContent || "";
+
+        const finalEngContent = applyGlossaryToText(rawEngContent, novelGlossaryRef.current);
+        const finalEnTitle = applyGlossaryToText(chEn, novelGlossaryRef.current);
+
+        // Cache in IndexedDB for 0-data offline reading
+        setCachedChapter(novelId, nextIdx, {
+          chapterIndex: nextIdx,
+          chapterTitle: chTitle,
+          chineseContent: chContent,
+          englishContent: finalEngContent,
+          totalChapters: data.totalChapters || totalChapters,
+          ...(chZh ? { chapterTitleZh: chZh } : {}),
+          ...(finalEnTitle ? { chapterTitleEn: finalEnTitle } : {}),
+        } as any).catch(console.warn);
+
+        const chParas = chContent.split(/\r?\n+/).map((p: string) => p.trim()).filter(Boolean);
+        const enParas = finalEngContent.split(/\r?\n+/).map((p: string) => p.trim()).filter(Boolean);
+
+        setFlowingChapters((prev) => {
+          if (prev.some((c) => c.index === nextIdx)) return prev;
+          return [
+            ...prev,
+            {
+              index: nextIdx,
+              title: chTitle,
+              titleZh: chZh,
+              titleEn: finalEnTitle,
+              chineseContent: chContent,
+              englishContent: finalEngContent,
+              chineseParagraphs: chParas,
+              englishParagraphs: enParas,
+            },
+          ];
+        });
+      }
+    } catch (e) {
+      console.error("Failed to load next flowing chapter:", e);
+    } finally {
+      setIsContinuousLoadingNext(false);
+    }
+  }, [
+    isContinuousLoadingNext,
+    isLoadingChapter,
+    flowingChapters,
+    currentChapterIndex,
+    chapterList,
+    totalChapters,
+    sessionChunks,
+    novelId,
+    novelUrl,
+    siteId,
+    novelTitle,
+    getAuthHeaders,
+  ]);
+
+  // Handle continuous scrolling in the reader body
+  const handleReaderScroll = useCallback(() => {
+    const container = readerBodyRef.current;
+    if (!container) return;
+
+    if (prefs.scrollMode === "continuous") {
+      // 1. Auto-load next chapter when near bottom (within 750px)
+      const scrollBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+      if (scrollBottom < 750 && !isContinuousLoadingNext) {
+        loadNextFlowingChapter();
+      }
+
+      // 2. Track which chapter is at the top of the viewport
+      const chapterSections = container.querySelectorAll<HTMLElement>("[data-chapter-index]");
+      let activeIdx = currentChapterIndex;
+      const scrollTop = container.scrollTop;
+
+      for (let i = 0; i < chapterSections.length; i++) {
+        const sec = chapterSections[i];
+        if (scrollTop >= sec.offsetTop - 140) {
+          const idx = Number(sec.getAttribute("data-chapter-index"));
+          if (!isNaN(idx)) {
+            activeIdx = idx;
+          }
+        }
+      }
+
+      if (activeIdx !== currentChapterIndex && activeIdx > 0) {
+        setCurrentChapterIndex(activeIdx);
+        currentChapterIndexRef.current = activeIdx;
+        const matched = flowingChapters.find((c) => c.index === activeIdx);
+        if (matched) {
+          setChapterTitle(matched.title);
+          setChapterTitleZh(matched.titleZh || matched.title);
+          setChapterTitleEn(matched.titleEn || matched.title);
+          onUpdateChapterIndex?.(activeIdx, matched.title, chapterList);
+          // If TTS is not actively playing another chapter, keep ttsChapterIndexRef in sync with visible chapter
+          if (!isTtsPlaying || isTtsPaused) {
+            ttsChapterIndexRef.current = activeIdx;
+            const flowParas = prefs.bilingualMode === "chinese"
+              ? matched.chineseParagraphs
+              : (matched.englishParagraphs?.length ? matched.englishParagraphs : matched.chineseParagraphs);
+            ttsParagraphsRef.current = flowParas;
+          }
+        }
+      }
+    }
+  }, [
+    prefs.scrollMode,
+    isContinuousLoadingNext,
+    loadNextFlowingChapter,
+    currentChapterIndex,
+    flowingChapters,
+    chapterList,
+    onUpdateChapterIndex,
+  ]);
 
   // -------------------------------------------------------------
   // QuickNovel Zero-Delay TTS & Paragraph Highlighting Engine
@@ -945,7 +2000,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
 
       utterance.onend = () => {
         if (sessionId !== ttsSessionIdRef.current) return;
-        speakParagraphAtIndex(index + 1);
+        speakParagraphAtIndexRef.current(index + 1);
       };
 
       utterance.onerror = (e) => {
@@ -953,7 +2008,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
         if (e.error !== "interrupted" && e.error !== "canceled") {
           console.warn("Browser Speech Synthesis Error:", e.error);
           // Advance gracefully to next paragraph if a paragraph fails
-          speakParagraphAtIndex(index + 1);
+          speakParagraphAtIndexRef.current(index + 1);
         }
       };
 
@@ -972,7 +2027,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
         window.speechSynthesis.speak(utterance);
       } catch (err) {
         console.warn("Direct speech synthesis speak error:", err);
-        speakParagraphAtIndex(index + 1);
+        speakParagraphAtIndexRef.current(index + 1);
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -985,7 +2040,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
 
       if (chunkIdx >= chunks.length) {
         // Entire paragraph finished, advance to next paragraph seamlessly
-        speakParagraphAtIndex(paragraphIdx + 1);
+        speakParagraphAtIndexRef.current(paragraphIdx + 1);
         return;
       }
 
@@ -1019,7 +2074,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
             }
             ut.onend = () => {
               if (sessionId === ttsSessionIdRef.current) {
-                speakParagraphAtIndex(paragraphIdx + 1);
+                speakParagraphAtIndexRef.current(paragraphIdx + 1);
               }
             };
             window.speechSynthesis.speak(ut);
@@ -1054,6 +2109,8 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
         return;
       }
 
+      const activeChapter = ttsChapterIndexRef.current || currentChapterIndexRef.current || currentChapterIndex || 1;
+
       if (index < 0 || index >= paragraphs.length) {
         // Reached end of current chapter
         if (sleepTimerMinutes === "end-of-chapter") {
@@ -1062,14 +2119,41 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           return;
         }
 
-        if (prefs.autoAdvanceTts) {
-          const nextIndex = currentChapterIndex + 1;
-          const maxChapters = chapterList.length || totalChapters;
-          if (nextIndex <= maxChapters) {
-            pendingTtsStartRef.current = true;
-            loadChapter(nextIndex);
+        // Auto-advance to next chapter smoothly without stopping (even if infinite page is off)
+        const nextIndex = activeChapter + 1;
+        const maxChapters = chapterList.length || totalChapters;
+        if (nextIndex <= maxChapters) {
+          // If flowing chapters continuous mode is active and next chapter is already loaded in DOM:
+          const existingNextFlowCh = flowingChapters.find((c) => c.index === nextIndex);
+          if (prefs.scrollMode === "continuous" && existingNextFlowCh) {
+            ttsChapterIndexRef.current = nextIndex;
+            currentChapterIndexRef.current = nextIndex;
+            setCurrentChapterIndex(nextIndex);
+            setChapterTitle(existingNextFlowCh.title);
+            setChapterTitleZh(existingNextFlowCh.titleZh || existingNextFlowCh.title);
+            setChapterTitleEn(existingNextFlowCh.titleEn || existingNextFlowCh.title);
+            onUpdateChapterIndex?.(nextIndex, existingNextFlowCh.title, chapterList);
+            const nextParas = prefs.bilingualMode === "chinese"
+              ? existingNextFlowCh.chineseParagraphs
+              : (existingNextFlowCh.englishParagraphs?.length ? existingNextFlowCh.englishParagraphs : existingNextFlowCh.chineseParagraphs);
+            ttsParagraphsRef.current = nextParas;
+            setTtsFeedbackMessage(`Chapter ${activeChapter} complete · Flowing Chapter ${nextIndex}...`);
+            setTimeout(() => setTtsFeedbackMessage(null), 3000);
+            speakParagraphAtIndexRef.current(0);
             return;
           }
+
+          pendingTtsStartRef.current = true;
+          setIsTtsPlaying(true);
+          setIsTtsPaused(false);
+          setActiveParagraphIndex(-1);
+          activeParagraphIndexRef.current = -1;
+          ttsChapterIndexRef.current = nextIndex;
+          currentChapterIndexRef.current = nextIndex;
+          setTtsFeedbackMessage(`Chapter ${activeChapter} complete · Flowing Chapter ${nextIndex}...`);
+          setTimeout(() => setTtsFeedbackMessage(null), 3500);
+          loadChapter(nextIndex);
+          return;
         }
         stopTts();
         return;
@@ -1080,7 +2164,10 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
 
       // OPTIMIZATION: Read directly from what is visually rendered on screen.
       // This allows instant TTS support for browser-translated pages (Chrome, Edge, Safari, Soul Browser, etc.)
-      const renderedEl = document.getElementById(`reader-paragraph-${index}`);
+      const renderedEl =
+        document.getElementById(`reader-ch-${activeChapter}-para-${index}`) ||
+        document.getElementById(`reader-paragraph-${index}`) ||
+        document.getElementById(`reader-ch-${currentChapterIndex}-para-${index}`);
       if (renderedEl) {
         let domText = "";
         if (prefs.bilingualMode === "dual") {
@@ -1102,7 +2189,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
 
       if (!text) {
         // Skip empty whitespace paragraphs
-        speakParagraphAtIndex(index + 1);
+        speakParagraphAtIndexRef.current(index + 1);
         return;
       }
 
@@ -1114,7 +2201,10 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
 
       // 2. Smoothly scroll highlighted paragraph into center view (non-blocking)
       requestAnimationFrame(() => {
-        const el = document.getElementById(`reader-paragraph-${index}`);
+        const el =
+          document.getElementById(`reader-ch-${activeChapter}-para-${index}`) ||
+          document.getElementById(`reader-paragraph-${index}`) ||
+          document.getElementById(`reader-ch-${currentChapterIndex}-para-${index}`);
         if (el && readerBodyRef.current) {
           el.scrollIntoView({ behavior: "smooth", block: "center" });
         }
@@ -1147,6 +2237,10 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
     ]
   );
 
+  useEffect(() => {
+    speakParagraphAtIndexRef.current = speakParagraphAtIndex;
+  }, [speakParagraphAtIndex]);
+
   // Instant 0ms Play / Pause Handler
   const togglePlayPauseTts = () => {
     if (isTtsPlaying) {
@@ -1158,7 +2252,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
         if (currentIndex < 0 || currentIndex >= currentList.length) {
           currentIndex = 0;
         }
-        speakParagraphAtIndex(currentIndex);
+        speakParagraphAtIndexRef.current(currentIndex);
       } else {
         // Pause instantly without altering voice engine or state
         setIsTtsPaused(true);
@@ -1179,7 +2273,8 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
       if (startIndex < 0 || startIndex >= currentList.length) {
         startIndex = 0;
       }
-      speakParagraphAtIndex(startIndex);
+      ttsChapterIndexRef.current = currentChapterIndexRef.current || currentChapterIndex;
+      speakParagraphAtIndexRef.current(startIndex);
     }
   };
 
@@ -1187,13 +2282,14 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
   const handleSkipParagraph = (direction: -1 | 1) => {
     const current = activeParagraphIndexRef.current >= 0 ? activeParagraphIndexRef.current : 0;
     const next = current + direction;
-    const max = displayParagraphs.length;
+    const currentList = ttsParagraphsRef.current.length > 0 ? ttsParagraphsRef.current : displayParagraphs;
+    const max = currentList.length;
     if (next >= 0 && next < max) {
-      speakParagraphAtIndex(next);
+      speakParagraphAtIndexRef.current(next);
     } else if (next >= max) {
       // Advance to next chapter
       handleSkipChapter(1);
-    } else if (next < 0 && currentChapterIndex > 1) {
+    } else if (next < 0 && (ttsChapterIndexRef.current || currentChapterIndex) > 1) {
       // Skip back to previous chapter
       handleSkipChapter(-1);
     }
@@ -1201,7 +2297,8 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
 
   // Instant Skip Chapter Handler
   const handleSkipChapter = (direction: -1 | 1) => {
-    const target = currentChapterIndex + direction;
+    const active = ttsChapterIndexRef.current || currentChapterIndexRef.current || currentChapterIndex;
+    const target = active + direction;
     const maxChapters = chapterList.length || totalChapters;
     if (target >= 1 && target <= maxChapters) {
       loadChapter(target);
@@ -1309,121 +2406,131 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
   if (!isOpen) return null;
 
   // -------------------------------------------------------------
-  // Floating Reader Pill (When Minimized)
+  // Floating Reader Pill (When Minimized) & Retained Modal DOM
   // Draggable, sits safely above bottom navigation (default bottom: 92px)
   // -------------------------------------------------------------
-  if (isMinimized) {
-    const isDockedLeft = bubblePos.side === "left";
-    return (
-      <div
-        style={{
-          bottom: `${bubblePos.bottom}px`,
-          ...(isDockedLeft ? { left: "16px" } : { right: "16px" }),
-        }}
-        className="fixed z-40 select-none animate-in zoom-in-75 duration-200"
-      >
-        {/* Subtle pulsing wave when audio is actively speaking */}
-        {isTtsPlaying && !isTtsPaused && (
-          <span className="absolute -inset-1.5 rounded-full bg-purple-500/25 animate-ping pointer-events-none" />
-        )}
+  const isDockedLeft = bubblePos.side === "left";
 
-        <div className="relative flex items-center bg-slate-900 text-white rounded-full p-1.5 shadow-2xl border border-purple-500/30 ring-1 ring-white/10 hover:border-purple-400/60 transition-colors">
-          {/* Main draggable button to restore reader */}
-          <button
-            type="button"
-            onPointerDown={(e) => {
-              isDraggingBubbleRef.current = true;
-              bubbleHasMovedRef.current = false;
-              bubbleDragStartRef.current = {
-                clientX: e.clientX,
-                clientY: e.clientY,
-                startBottom: bubblePos.bottom,
-              };
-              try {
-                (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-              } catch {}
-            }}
-            onPointerMove={(e) => {
-              if (!isDraggingBubbleRef.current) return;
-              const dy = bubbleDragStartRef.current.clientY - e.clientY;
-              const dx = Math.abs(e.clientX - bubbleDragStartRef.current.clientX);
-              if (Math.abs(dy) > 5 || dx > 5) {
-                bubbleHasMovedRef.current = true;
-              }
-              const newBottom = Math.max(84, Math.min(window.innerHeight - 80, bubbleDragStartRef.current.startBottom + dy));
-              const newSide: "right" | "left" = e.clientX < window.innerWidth / 2 ? "left" : "right";
-              setBubblePos({
-                bottom: newBottom,
-                side: newSide,
-                ...(newSide === "left" ? { left: 16 } : { right: 16 }),
-              });
-            }}
-            onPointerUp={(e) => {
-              if (!isDraggingBubbleRef.current) return;
-              isDraggingBubbleRef.current = false;
-              try {
-                (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-              } catch {}
-              if (bubbleHasMovedRef.current) {
-                try {
-                  localStorage.setItem("megatext_reader_bubble_pos", JSON.stringify(bubblePos));
-                } catch {}
-              } else {
-                // Tapping should directly restore reader view (close drawers & menus)
-                setShowChapterDrawer(false);
-                setShowSettingsMenu(false);
-                setShowTopMoreMenu(false);
-                onToggleMinimize();
-              }
-            }}
-            title={`Reader Minimized (${novelTitle} · Ch ${currentChapterIndex}) - Tap to open reader or drag to move`}
-            className="flex items-center gap-2 pl-2 pr-3 py-1 cursor-grab active:cursor-grabbing group touch-none"
-          >
-            <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-purple-600 via-indigo-600 to-purple-500 text-white flex items-center justify-center shrink-0 shadow-inner group-hover:scale-105 transition-transform">
-              {isTtsPlaying && !isTtsPaused ? (
-                <Volume2 className="h-5 w-5 text-white animate-pulse" />
-              ) : (
-                <BookOpen className="h-5 w-5 text-white" />
-              )}
-            </div>
-
-            <div className="flex flex-col text-left max-w-[140px] sm:max-w-[180px]">
-              <span className="text-[11px] font-bold text-zinc-100 truncate leading-tight">
-                {novelTitle}
-              </span>
-              <span className="text-[10px] font-medium text-purple-300 leading-tight">
-                Ch {currentChapterIndex}
-                {isTtsPlaying && !isTtsPaused ? " · Speaking..." : isTtsPaused ? " · Paused" : ""}
-              </span>
-            </div>
-          </button>
-
-          {/* Quick Play / Pause Toggle right on the floating widget */}
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              togglePlayPauseTts();
-            }}
-            title={isTtsPlaying && !isTtsPaused ? "Pause TTS" : "Play TTS"}
-            className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center cursor-pointer transition-colors active:scale-95 shrink-0 ml-1 mr-1"
-          >
-            {isTtsPlaying && !isTtsPaused ? (
-              <Pause className="h-4 w-4 fill-current" />
-            ) : (
-              <Play className="h-4 w-4 fill-current ml-0.5" />
-            )}
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  // -------------------------------------------------------------
-  // Fullscreen Immersive QuickNovel Reader
-  // -------------------------------------------------------------
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs animate-in fade-in duration-150 p-0 sm:p-2 md:p-3">
+    <>
+      {isMinimized && (
+        <div
+          style={{
+            bottom: `${bubblePos.bottom}px`,
+            ...(isDockedLeft ? { left: "16px" } : { right: "16px" }),
+          }}
+          className="fixed z-50 select-none animate-in zoom-in-75 duration-200 pointer-events-auto"
+        >
+          {/* Subtle pulsing wave when audio is actively speaking */}
+          {isTtsPlaying && !isTtsPaused && (
+            <span className="absolute -inset-1.5 rounded-full bg-purple-500/25 animate-ping pointer-events-none" />
+          )}
+
+          <div className="relative flex items-center bg-slate-900 text-white rounded-full p-1.5 shadow-2xl border border-purple-500/30 ring-1 ring-white/10 hover:border-purple-400/60 transition-colors">
+            {/* Main draggable button to restore reader */}
+            <button
+              type="button"
+              onPointerDown={(e) => {
+                isDraggingBubbleRef.current = true;
+                bubbleHasMovedRef.current = false;
+                bubbleDragStartRef.current = {
+                  clientX: e.clientX,
+                  clientY: e.clientY,
+                  startBottom: bubblePos.bottom,
+                };
+                try {
+                  (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+                } catch {}
+              }}
+              onPointerMove={(e) => {
+                if (!isDraggingBubbleRef.current) return;
+                const dy = bubbleDragStartRef.current.clientY - e.clientY;
+                const dx = Math.abs(e.clientX - bubbleDragStartRef.current.clientX);
+                if (Math.abs(dy) > 5 || dx > 5) {
+                  bubbleHasMovedRef.current = true;
+                }
+                const newBottom = Math.max(84, Math.min(window.innerHeight - 80, bubbleDragStartRef.current.startBottom + dy));
+                const newSide: "right" | "left" = e.clientX < window.innerWidth / 2 ? "left" : "right";
+                setBubblePos({
+                  bottom: newBottom,
+                  side: newSide,
+                  ...(newSide === "left" ? { left: 16 } : { right: 16 }),
+                });
+              }}
+              onPointerUp={(e) => {
+                if (!isDraggingBubbleRef.current) return;
+                isDraggingBubbleRef.current = false;
+                try {
+                  (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+                } catch {}
+                if (bubbleHasMovedRef.current) {
+                  try {
+                    localStorage.setItem("megatext_reader_bubble_pos", JSON.stringify(bubblePos));
+                  } catch {}
+                } else {
+                  // Tapping directly restores reader view cleanly
+                  e.preventDefault();
+                  e.stopPropagation();
+                  handleRestoreReader();
+                }
+              }}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+              }}
+              title={`Reader Minimized (${novelTitle} · Ch ${currentChapterIndex}) - Tap to open reader or drag to move`}
+              className="flex items-center gap-2 pl-2 pr-3 py-1 cursor-grab active:cursor-grabbing group touch-none"
+            >
+              <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-purple-600 via-indigo-600 to-purple-500 text-white flex items-center justify-center shrink-0 shadow-inner group-hover:scale-105 transition-transform">
+                {isTtsPlaying && !isTtsPaused ? (
+                  <Volume2 className="h-5 w-5 text-white animate-pulse" />
+                ) : (
+                  <BookOpen className="h-5 w-5 text-white" />
+                )}
+              </div>
+
+              <div className="flex flex-col text-left max-w-[140px] sm:max-w-[180px]">
+                <span className="text-[11px] font-bold text-zinc-100 truncate leading-tight">
+                  {novelTitle}
+                </span>
+                <span className="text-[10px] font-medium text-purple-300 leading-tight">
+                  Ch {currentChapterIndex}
+                  {isTtsPlaying && !isTtsPaused ? " · Speaking..." : isTtsPaused ? " · Paused" : ""}
+                </span>
+              </div>
+            </button>
+
+            {/* Quick Play / Pause Toggle right on the floating widget */}
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                togglePlayPauseTts();
+              }}
+              title={isTtsPlaying && !isTtsPaused ? "Pause TTS" : "Play TTS"}
+              className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center cursor-pointer transition-colors active:scale-95 shrink-0 ml-1 mr-1"
+            >
+              {isTtsPlaying && !isTtsPaused ? (
+                <Pause className="h-4 w-4 fill-current" />
+              ) : (
+                <Play className="h-4 w-4 fill-current ml-0.5" />
+              )}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ------------------------------------------------------------- */}
+      {/* Fullscreen Immersive QuickNovel Reader */}
+      {/* Retained in DOM when minimized to preserve audio continuity & exact scroll position */}
+      {/* ------------------------------------------------------------- */}
+      <div
+        className={`fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs animate-in fade-in duration-150 p-0 sm:p-2 md:p-3 transition-opacity ${
+          isMinimized ? "invisible pointer-events-none opacity-0" : "visible pointer-events-auto opacity-100"
+        }`}
+        aria-hidden={isMinimized}
+      >
       <div
         className={`w-full max-w-4xl h-full sm:h-[96vh] sm:rounded-3xl shadow-2xl flex flex-col overflow-hidden transition-colors ${themeClasses.bg} ${themeClasses.text} border ${themeClasses.border}`}
       >
@@ -1461,24 +2568,36 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
               </div>
               <h2 className="text-xs sm:text-sm font-bold truncate leading-tight mt-0.5">{novelTitle}</h2>
               <p className="text-[11px] opacity-70 truncate font-sans">
-                {chapterTitle} {chapterList.length > 0 ? `· (${currentChapterIndex} / ${chapterList.length})` : ""}
+                {displayChapterTitle} {chapterList.length > 0 ? `· (${currentChapterIndex} / ${chapterList.length})` : ""}
               </p>
             </div>
           </div>
 
-          {/* Right Action Controls (Clean, uncluttered, with 3-horizontal-dots menu and Minimize button) */}
+          {/* Right Action Controls (Clean, uncluttered, with 3-horizontal-dots menu, Glossary, TOC, and Minimize button) */}
           <div className="flex items-center gap-1 sm:gap-2 shrink-0">
+            {/* Auto-Generated Novel Glossary Button */}
+            <button
+              type="button"
+              id="reader-novel-glossary-btn"
+              onClick={() => setShowGlossaryDrawer(true)}
+              title="Auto-Generated Novel Glossary (Characters, Sects, Realms)"
+              className={`p-2 sm:p-2.5 rounded-xl ${themeClasses.buttonBg} hover:text-purple-600 dark:hover:text-purple-400 transition cursor-pointer flex items-center justify-center active:scale-95`}
+              aria-label="Open Novel Glossary"
+            >
+              <BookMarked className="h-5 w-5 shrink-0" />
+            </button>
+
             {/* Chapters Table of Contents */}
             <button
               type="button"
-              onClick={() => setShowChapterDrawer(!showChapterDrawer)}
+              onClick={guardUnminimizeClick(() => setShowChapterDrawer(!showChapterDrawer))}
               title="Table of Contents (Chapters)"
               className={`p-2 sm:p-2.5 rounded-xl ${themeClasses.buttonBg} transition cursor-pointer flex items-center justify-center active:scale-95`}
             >
               <List className="h-5 w-5" />
             </button>
 
-            {/* 3 Horizontal Dots Menu (Holds Settings, Translation, Library, and Close) */}
+            {/* 3 Horizontal Dots Menu (Holds Infinite Page, Language/Translate, Settings, Library, and Close) */}
             <div className="relative z-50" ref={topMoreMenuRef}>
               <button
                 id="reader-top-more-menu-btn"
@@ -1487,7 +2606,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                   e.stopPropagation();
                   setShowTopMoreMenu(!showTopMoreMenu);
                 }}
-                title="More Options & Settings"
+                title="More Options & Reader Modes"
                 className={`p-2 sm:p-2.5 rounded-xl transition cursor-pointer flex items-center justify-center active:scale-95 ${
                   showTopMoreMenu || showSettingsMenu
                     ? "bg-purple-600 text-white shadow-sm"
@@ -1502,14 +2621,127 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                 <div
                   onClick={(e) => e.stopPropagation()}
                   onPointerDown={(e) => e.stopPropagation()}
-                  className="absolute right-0 top-full mt-2 w-64 rounded-2xl shadow-[0_20px_50px_rgba(0,0,0,0.45)] border border-purple-200 dark:border-purple-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 p-2 z-[9999] animate-in fade-in zoom-in-95 duration-100 divide-y divide-purple-100 dark:divide-purple-900/50 select-none ring-1 ring-black/10"
+                  className="absolute right-0 top-full mt-2 w-72 rounded-2xl shadow-[0_20px_50px_rgba(0,0,0,0.45)] border border-purple-200 dark:border-purple-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 p-2 z-[9999] animate-in fade-in zoom-in-95 duration-100 divide-y divide-purple-100 dark:divide-purple-900/50 select-none ring-1 ring-black/10"
                   style={{
                     backgroundColor: prefs.theme === "oled" ? "#09090b" : prefs.theme === "slate" ? "#0f172a" : "#ffffff",
                     color: prefs.theme === "oled" || prefs.theme === "slate" ? "#f8fafc" : "#0f172a",
                     opacity: 1,
                   }}
                 >
+                  {/* Reading Modes & Language Controls */}
                   <div className="pb-1.5 space-y-1.5">
+                    {/* Continuous Scroll (Infinite Page Flow) */}
+                    <button
+                      type="button"
+                      id="menu-toggle-scroll-mode-btn"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        const nextMode = prefs.scrollMode === "continuous" ? "paged" : "continuous";
+                        updatePrefs({ scrollMode: nextMode });
+                        setShowTopMoreMenu(false);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl text-left font-bold text-xs cursor-pointer transition bg-purple-50 dark:bg-slate-800 hover:bg-purple-600 hover:text-white dark:hover:bg-purple-600 dark:hover:text-white group text-slate-900 dark:text-slate-100"
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <Infinity className="h-4.5 w-4.5 shrink-0 text-purple-600 dark:text-purple-400 group-hover:text-white" />
+                        <span className="truncate">Infinite Page Flow</span>
+                      </div>
+                      <span
+                        className={`text-[9px] font-black px-2 py-0.5 rounded-full border shrink-0 ${
+                          prefs.scrollMode === "continuous"
+                            ? "bg-purple-600 text-white border-purple-700 group-hover:bg-white group-hover:text-purple-700"
+                            : "bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300 border-slate-300 dark:border-slate-600"
+                        }`}
+                      >
+                        {prefs.scrollMode === "continuous" ? "FLOW (Active)" : "PAGED"}
+                      </span>
+                    </button>
+
+                    {/* Translate / Bilingual View (English / Original Chinese) */}
+                    <button
+                      type="button"
+                      id="menu-toggle-language-btn"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        const nextMode = prefs.bilingualMode === "chinese" ? "english" : "chinese";
+                        updatePrefs({ bilingualMode: nextMode });
+                        setShowTopMoreMenu(false);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl text-left font-bold text-xs cursor-pointer transition bg-purple-50 dark:bg-slate-800 hover:bg-purple-600 hover:text-white dark:hover:bg-purple-600 dark:hover:text-white group text-slate-900 dark:text-slate-100"
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <Languages className="h-4.5 w-4.5 shrink-0 text-purple-600 dark:text-purple-400 group-hover:text-white" />
+                        <span className="truncate">Translate View</span>
+                      </div>
+                      <span
+                        className={`text-[9px] font-black px-2 py-0.5 rounded-full border shrink-0 ${
+                          prefs.bilingualMode === "chinese"
+                            ? "bg-amber-600 text-white border-amber-700"
+                            : "bg-purple-600 text-white border-purple-700 group-hover:bg-white group-hover:text-purple-700"
+                        }`}
+                      >
+                        {prefs.bilingualMode === "chinese" ? "ZH (Chinese)" : "EN (English)"}
+                      </span>
+                    </button>
+
+                    {/* Pre-Cache Next 10 Chapters for Airplane/Offline Mode */}
+                    <button
+                      type="button"
+                      disabled={isPreCaching}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowTopMoreMenu(false);
+                        handlePreCacheNextChapters(10);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl text-left font-bold text-xs cursor-pointer transition bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-600 hover:text-white dark:hover:bg-emerald-600 dark:hover:text-white group text-emerald-800 dark:text-emerald-200"
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <Zap className="h-4.5 w-4.5 shrink-0 text-emerald-600 dark:text-emerald-400 group-hover:text-white fill-current" />
+                        <span className="truncate">{isPreCaching ? "Pre-Caching in Background..." : "Pre-Cache Next 10 Chapters"}</span>
+                      </div>
+                      <span className="text-[9px] font-mono opacity-80 group-hover:opacity-100 shrink-0">
+                        {offlineCachedCount} Offline
+                      </span>
+                    </button>
+
+                    {/* Translate Chapter Scope Modal */}
+                    <button
+                      type="button"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowTranslateModal(true);
+                        setShowTopMoreMenu(false);
+                      }}
+                      className="w-full flex items-center justify-between gap-2 px-3 py-2 rounded-xl text-left font-semibold text-xs cursor-pointer transition hover:bg-purple-600 hover:text-white group text-slate-700 dark:text-slate-300"
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <Sparkles className="h-4 w-4 shrink-0 text-purple-500 group-hover:text-white" />
+                        <span className="truncate">Translate Scope (Gemini AI)</span>
+                      </div>
+                      <span className="text-[9px] opacity-70 group-hover:opacity-100">0 KB Cache</span>
+                    </button>
+                  </div>
+
+                  {/* Novel Tools & Settings */}
+                  <div className="py-1.5 space-y-1.5">
+                    <button
+                      type="button"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowGlossaryDrawer(true);
+                        setShowTopMoreMenu(false);
+                      }}
+                      className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left font-bold text-xs cursor-pointer transition bg-purple-50 dark:bg-slate-800 hover:bg-purple-600 hover:text-white dark:hover:bg-purple-600 dark:hover:text-white group text-slate-900 dark:text-slate-100"
+                    >
+                      <BookMarked className="h-4.5 w-4.5 shrink-0 text-purple-600 dark:text-purple-400 group-hover:text-white" />
+                      <span className="flex-1">Auto-Generated Glossary</span>
+                    </button>
+
                     <button
                       type="button"
                       onPointerDown={(e) => e.stopPropagation()}
@@ -1523,22 +2755,9 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                       <Settings className="h-4.5 w-4.5 shrink-0 text-purple-600 dark:text-purple-400 group-hover:text-white" />
                       <span className="flex-1">Reader & Voice Settings</span>
                     </button>
-
-                    <button
-                      type="button"
-                      onPointerDown={(e) => e.stopPropagation()}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setShowTranslateModal(true);
-                        setShowTopMoreMenu(false);
-                      }}
-                      className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left font-bold text-xs cursor-pointer transition bg-purple-50 dark:bg-slate-800 hover:bg-purple-600 hover:text-white dark:hover:bg-purple-600 dark:hover:text-white group text-slate-900 dark:text-slate-100"
-                    >
-                      <Languages className="h-4.5 w-4.5 shrink-0 text-indigo-500 dark:text-indigo-400 group-hover:text-white" />
-                      <span className="flex-1">Translation Scope</span>
-                    </button>
                   </div>
 
+                  {/* Bookmark & Close */}
                   <div className="pt-1.5 space-y-1.5">
                     <button
                       type="button"
@@ -1751,7 +2970,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                         onClick={() => {
                           updatePrefs({ ttsEngine: "browser-native" });
                           if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
-                            speakParagraphAtIndex(activeParagraphIndexRef.current);
+                            speakParagraphAtIndexRef.current(activeParagraphIndexRef.current);
                           }
                         }}
                         className={`p-3 rounded-xl border text-left cursor-pointer transition ${
@@ -1774,7 +2993,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                         onClick={() => {
                           updatePrefs({ ttsEngine: "google-classic" });
                           if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
-                            speakParagraphAtIndex(activeParagraphIndexRef.current);
+                            speakParagraphAtIndexRef.current(activeParagraphIndexRef.current);
                           }
                         }}
                         className={`p-3 rounded-xl border text-left cursor-pointer transition ${
@@ -1840,7 +3059,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                             if (v) {
                               setChosenVoice(v);
                               if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
-                                speakParagraphAtIndex(activeParagraphIndexRef.current);
+                                speakParagraphAtIndexRef.current(activeParagraphIndexRef.current);
                               }
                             }
                           }}
@@ -1910,7 +3129,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                             const val = e.target.value;
                             updatePrefs({ cloudVoiceLang: val });
                             if (isTtsPlaying && activeParagraphIndexRef.current >= 0) {
-                              speakParagraphAtIndex(activeParagraphIndexRef.current);
+                              speakParagraphAtIndexRef.current(activeParagraphIndexRef.current);
                             }
                           }}
                           className={`w-full rounded-lg ${themeClasses.buttonBg} px-2.5 py-2 font-semibold text-xs focus:outline-none truncate border ${themeClasses.border}`}
@@ -1957,7 +3176,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                             updatePrefs({ ttsRate: newRate });
                             if (audioPlayerRef.current) audioPlayerRef.current.playbackRate = newRate;
                             if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
-                              speakParagraphAtIndex(activeParagraphIndexRef.current);
+                              speakParagraphAtIndexRef.current(activeParagraphIndexRef.current);
                             }
                           }}
                           className={`px-2 py-0.5 rounded ${themeClasses.buttonBg} hover:bg-purple-500/20 active:scale-95 font-mono font-bold text-[11px] cursor-pointer`}
@@ -1975,7 +3194,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                             updatePrefs({ ttsRate: newRate });
                             if (audioPlayerRef.current) audioPlayerRef.current.playbackRate = newRate;
                             if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
-                              speakParagraphAtIndex(activeParagraphIndexRef.current);
+                              speakParagraphAtIndexRef.current(activeParagraphIndexRef.current);
                             }
                           }}
                           className={`px-2 py-0.5 rounded ${themeClasses.buttonBg} hover:bg-purple-500/20 active:scale-95 font-mono font-bold text-[11px] cursor-pointer`}
@@ -1998,7 +3217,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                               updatePrefs({ ttsRate: rate });
                               if (audioPlayerRef.current) audioPlayerRef.current.playbackRate = rate;
                               if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
-                                speakParagraphAtIndex(activeParagraphIndexRef.current);
+                                speakParagraphAtIndexRef.current(activeParagraphIndexRef.current);
                               }
                             }}
                             className={`px-2.5 py-1 rounded-lg text-xs font-bold font-mono transition cursor-pointer active:scale-95 ${
@@ -2026,7 +3245,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                           updatePrefs({ ttsRate: newRate });
                           if (audioPlayerRef.current) audioPlayerRef.current.playbackRate = newRate;
                           if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
-                            speakParagraphAtIndex(activeParagraphIndexRef.current);
+                            speakParagraphAtIndexRef.current(activeParagraphIndexRef.current);
                           }
                         }}
                         className="w-full accent-purple-600 cursor-pointer"
@@ -2055,7 +3274,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                             const newPitch = Math.max(0.5, Math.round(((prefs.ttsPitch || 1.0) - 0.05) * 100) / 100);
                             updatePrefs({ ttsPitch: newPitch });
                             if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
-                              speakParagraphAtIndex(activeParagraphIndexRef.current);
+                              speakParagraphAtIndexRef.current(activeParagraphIndexRef.current);
                             }
                           }}
                           className={`px-2 py-0.5 rounded ${themeClasses.buttonBg} hover:bg-purple-500/20 active:scale-95 font-mono font-bold text-[11px] cursor-pointer`}
@@ -2072,7 +3291,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                             const newPitch = Math.min(1.6, Math.round(((prefs.ttsPitch || 1.0) + 0.05) * 100) / 100);
                             updatePrefs({ ttsPitch: newPitch });
                             if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
-                              speakParagraphAtIndex(activeParagraphIndexRef.current);
+                              speakParagraphAtIndexRef.current(activeParagraphIndexRef.current);
                             }
                           }}
                           className={`px-2 py-0.5 rounded ${themeClasses.buttonBg} hover:bg-purple-500/20 active:scale-95 font-mono font-bold text-[11px] cursor-pointer`}
@@ -2100,7 +3319,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                             onClick={() => {
                               updatePrefs({ ttsPitch: item.val });
                               if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
-                                speakParagraphAtIndex(activeParagraphIndexRef.current);
+                                speakParagraphAtIndexRef.current(activeParagraphIndexRef.current);
                               }
                             }}
                             className={`px-2.5 py-1 rounded-lg text-xs font-bold transition cursor-pointer active:scale-95 ${
@@ -2127,7 +3346,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                           const newPitch = parseFloat(e.target.value);
                           updatePrefs({ ttsPitch: newPitch });
                           if (isTtsPlaying && activeParagraphIndexRef.current >= 0 && prefs.ttsEngine === "browser-native") {
-                            speakParagraphAtIndex(activeParagraphIndexRef.current);
+                            speakParagraphAtIndexRef.current(activeParagraphIndexRef.current);
                           }
                         }}
                         className="w-full accent-purple-600 cursor-pointer"
@@ -2227,6 +3446,50 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                   </div>
 
                   <div className="space-y-1.5">
+                    <span className="font-bold block opacity-75">Chapter Flow / Scroll Mode</span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => updatePrefs({ scrollMode: "continuous" })}
+                        className={`flex-1 px-3 py-1.5 rounded-lg font-bold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                          prefs.scrollMode === "continuous"
+                            ? "bg-purple-600 text-white shadow-xs"
+                            : `${themeClasses.buttonBg} opacity-80 hover:opacity-100`
+                        }`}
+                      >
+                        <Infinity className="h-3.5 w-3.5" />
+                        <span>Continuous Flow</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => updatePrefs({ scrollMode: "paged" })}
+                        className={`flex-1 px-3 py-1.5 rounded-lg font-bold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                          prefs.scrollMode === "paged"
+                            ? "bg-purple-600 text-white shadow-xs"
+                            : `${themeClasses.buttonBg} opacity-80 hover:opacity-100`
+                        }`}
+                      >
+                        <span>Paged (Single)</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <span className="font-bold block opacity-75">Novel Glossary & Codex</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowGlossaryDrawer(true);
+                        setShowSettingsMenu(false);
+                      }}
+                      className="w-full px-3 py-2 rounded-xl bg-purple-600/10 hover:bg-purple-600 text-purple-700 dark:text-purple-300 hover:text-white font-bold text-xs flex items-center justify-center gap-2 transition cursor-pointer border border-purple-500/20"
+                    >
+                      <BookMarked className="h-4 w-4" />
+                      <span>Open Auto-Generated Glossary</span>
+                    </button>
+                  </div>
+
+                  <div className="space-y-1.5">
                     <span className="font-bold block opacity-75">Sleep Timer</span>
                     <div className="flex flex-wrap gap-1.5">
                       {[
@@ -2292,7 +3555,42 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                 </button>
               </div>
 
-              <div className="p-2">
+              <div className="p-2 space-y-2">
+                {/* Pre-Cache Next 10 Chapters Button & Progress */}
+                <button
+                  type="button"
+                  disabled={isPreCaching}
+                  onClick={() => handlePreCacheNextChapters(10)}
+                  className="w-full flex items-center justify-between px-3 py-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white font-bold text-xs shadow-xs transition active:scale-95 disabled:opacity-50 cursor-pointer"
+                >
+                  <div className="flex items-center gap-2">
+                    <Zap className={`h-4 w-4 ${isPreCaching ? "animate-bounce" : "fill-current"}`} />
+                    <span>{isPreCaching ? "Pre-Caching..." : "Pre-Cache Next 10 Ch"}</span>
+                  </div>
+                  <span className="text-[10px] bg-white/20 px-1.5 py-0.5 rounded-full font-mono">
+                    {offlineCachedCount} Offline
+                  </span>
+                </button>
+
+                {preCacheProgress && (
+                  <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-2 space-y-1">
+                    <div className="flex items-center justify-between text-[10px] text-emerald-700 dark:text-emerald-300 font-bold">
+                      <span className="truncate">{preCacheProgress.message}</span>
+                      {preCacheProgress.total > 0 && (
+                        <span className="shrink-0 ml-1">{preCacheProgress.current}/{preCacheProgress.total}</span>
+                      )}
+                    </div>
+                    {preCacheProgress.total > 0 && (
+                      <div className="h-1 w-full bg-emerald-200 dark:bg-emerald-950 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-emerald-500 transition-all duration-300 rounded-full"
+                          style={{ width: `${Math.min(100, (preCacheProgress.current / preCacheProgress.total) * 100)}%` }}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 <input
                   type="text"
                   placeholder="Search chapter title or #..."
@@ -2306,6 +3604,10 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                 {filteredChapters.map((ch, idx) => {
                   const chIndex = ch.index || idx + 1;
                   const isCurrent = chIndex === currentChapterIndex;
+                  const sessionChunk = sessionChunks?.find((c) => c.index === chIndex - 1) || sessionChunks?.[chIndex - 1];
+                  const hasEnglish = Boolean(sessionChunk?.englishText?.trim());
+                  const isProcessing = sessionChunk?.status === "processing";
+
                   return (
                     <button
                       key={idx}
@@ -2320,8 +3622,25 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                           : "hover:bg-purple-500/10 opacity-90"
                       }`}
                     >
-                      <span className="truncate">{ch.title || `Chapter ${chIndex}`}</span>
-                      <span className="text-[10px] opacity-75 shrink-0">#{chIndex}</span>
+                      <div className="flex items-center gap-1.5 truncate">
+                        <span className="truncate">{ch.title || `Chapter ${chIndex}`}</span>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {hasEnglish ? (
+                          <span className={`text-[9px] font-black px-1.5 py-0.5 rounded-full ${
+                            isCurrent ? "bg-white text-purple-700" : "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400"
+                          }`}>
+                            EN
+                          </span>
+                        ) : isProcessing ? (
+                          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full animate-pulse ${
+                            isCurrent ? "bg-white text-purple-700" : "bg-purple-500/20 text-purple-600 dark:text-purple-400"
+                          }`}>
+                            Translating
+                          </span>
+                        ) : null}
+                        <span className={`text-[10px] ${isCurrent ? "text-white/80" : "opacity-60"}`}>#{chIndex}</span>
+                      </div>
                     </button>
                   );
                 })}
@@ -2333,6 +3652,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
           <div
             ref={readerBodyRef}
             id="novel-reader-scrollable-body"
+            onScroll={handleReaderScroll}
             className={`flex-1 p-4 sm:p-8 overflow-y-auto ${fontClass} scroll-smooth`}
             style={{ fontSize: `${prefs.fontSize}px` }}
           >
@@ -2365,176 +3685,448 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
                     : "max-w-2xl px-1 sm:px-4"
                 } space-y-6 transition-all duration-150`}
               >
-                {/* Chapter Title Heading */}
-                <div className="text-center pb-4 border-b border-black/10 dark:border-white/10">
-                  <h3 className="text-lg sm:text-xl font-bold tracking-tight">{chapterTitle}</h3>
-                  <p className="text-xs opacity-60 mt-1 font-sans">
-                    Chapter {currentChapterIndex} · {displayParagraphs.length} paragraphs
-                  </p>
-                </div>
+                {/* Check if Continuous Scroll Mode is Active */}
+                {prefs.scrollMode === "continuous" && flowingChapters.length > 0 ? (
+                  <div className="space-y-12">
+                    {flowingChapters.map((flowCh, flowIdx) => {
+                      const isCurrentFlowCh = flowCh.index === currentChapterIndex;
+                      const chParas = flowCh.chineseParagraphs;
+                      const enParas = flowCh.englishParagraphs;
+                      const displayFlowParas =
+                        prefs.bilingualMode === "chinese"
+                          ? chParas
+                          : enParas.length > 0
+                          ? enParas
+                          : chParas;
 
-                {/* Translation Scope Prompt Banner (If only Chinese exists) */}
-                {prefs.bilingualMode !== "chinese" && englishParagraphs.length === 0 && chineseParagraphs.length > 0 && (
-                  <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 font-sans text-xs space-y-3">
-                    <div className="flex items-start gap-2 text-amber-800 dark:text-amber-300">
-                      <Sparkles className="h-4 w-4 shrink-0 mt-0.5 text-amber-600" />
-                      <div>
-                        <p className="font-bold">Original Chinese Chapter Displayed</p>
-                        <p className="opacity-85 text-[11px] mt-0.5">
-                          This chapter has not been translated into English yet. You can choose whether to translate
-                          just this single chapter instantly or queue the full novel:
-                        </p>
+                      const flowTitle =
+                        prefs.bilingualMode === "chinese"
+                          ? flowCh.titleZh || flowCh.title
+                          : flowCh.titleEn || flowCh.title;
+
+                      return (
+                        <div
+                          key={flowCh.index}
+                          data-chapter-index={flowCh.index}
+                          className="space-y-6 scroll-mt-6"
+                        >
+                          {/* Chapter Header / Separator */}
+                          <div className="text-center pt-6 pb-4 border-b border-black/10 dark:border-white/10">
+                            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-purple-600/10 text-purple-700 dark:text-purple-300 text-[11px] font-black uppercase tracking-wider mb-2">
+                              <Infinity className="h-3 w-3" />
+                              <span>Chapter {flowCh.index}</span>
+                              {chapterList.length > 0 && <span className="opacity-60">/ {chapterList.length}</span>}
+                            </div>
+                            <h3 className="text-lg sm:text-xl font-bold tracking-tight">{flowTitle}</h3>
+                            <p className="text-xs opacity-60 mt-1 font-sans">
+                              {displayFlowParas.length} paragraphs
+                            </p>
+                          </div>
+
+                          {/* When viewing Chinese mode: option to translate with Gemini AI */}
+                          {flowIdx === 0 && prefs.bilingualMode === "chinese" && (
+                            <div className="p-4 rounded-2xl bg-purple-50 dark:bg-purple-950/40 border border-purple-200 dark:border-purple-800/60 font-sans text-xs space-y-2.5">
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-2 text-purple-900 dark:text-purple-200 font-bold">
+                                  <Sparkles className="h-4 w-4 text-purple-600 shrink-0" />
+                                  <span>Viewing Original Chinese Chapter</span>
+                                </div>
+                                {enParas.length > 0 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => updatePrefs({ bilingualMode: "english" })}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold shadow-xs active:scale-95 transition cursor-pointer"
+                                    title="Switch back to English translation (0 Mobile Data)"
+                                  >
+                                    <Languages className="h-3.5 w-3.5" />
+                                    <span>Show English (0 Data)</span>
+                                  </button>
+                                )}
+                              </div>
+                              <p className="text-[11px] opacity-80 text-purple-950 dark:text-purple-300">
+                                You can translate this chapter with Gemini AI or tap the EN button in the top bar to switch back to English anytime with 0 mobile data.
+                              </p>
+                              <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                                <button
+                                  type="button"
+                                  onClick={handleTranslateThisChapter}
+                                  disabled={isTranslatingSingleChapter}
+                                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold shadow-xs active:scale-95 transition cursor-pointer disabled:opacity-50"
+                                >
+                                  {isTranslatingSingleChapter ? (
+                                    <>
+                                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                      <span>Gemini Translating...</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Sparkles className="h-3.5 w-3.5" />
+                                      <span>Translate this Chapter with Gemini AI</span>
+                                    </>
+                                  )}
+                                </button>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Paragraphs Display */}
+                          <div className={lineHeightClass}>
+                            {prefs.bilingualMode === "dual" ? (
+                              chParas.map((para, idx) => {
+                                const engPara = enParas[idx] || "";
+                                const isHighlighted = isCurrentFlowCh && idx === activeParagraphIndex;
+                                return (
+                                  <div
+                                    key={idx}
+                                    id={`reader-ch-${flowCh.index}-para-${idx}`}
+                                    onClick={() => {
+                                      if (flowCh.index !== currentChapterIndex) {
+                                        setCurrentChapterIndex(flowCh.index);
+                                        currentChapterIndexRef.current = flowCh.index;
+                                        setChapterTitle(flowCh.title);
+                                        onUpdateChapterIndex?.(flowCh.index, flowCh.title, chapterList);
+                                      }
+                                      ttsChapterIndexRef.current = flowCh.index;
+                                      currentChapterIndexRef.current = flowCh.index;
+                                      const flowParas = prefs.bilingualMode === "chinese"
+                                        ? flowCh.chineseParagraphs
+                                        : (flowCh.englishParagraphs?.length ? flowCh.englishParagraphs : flowCh.chineseParagraphs);
+                                      ttsParagraphsRef.current = flowParas;
+                                      speakParagraphAtIndexRef.current(idx);
+                                    }}
+                                    className={`p-3 rounded-xl transition cursor-pointer ${
+                                      isHighlighted ? themeClasses.activeParagraph : "bg-black/5 dark:bg-white/5"
+                                    } space-y-1.5 mb-2.5`}
+                                  >
+                                    <p
+                                      className={`font-sans font-medium ${engPara ? "block" : "hidden"}`}
+                                      style={{ fontSize: `${prefs.fontSize}px` }}
+                                    >
+                                      <span>{engPara}</span>
+                                    </p>
+                                    <p
+                                      className="opacity-75 font-serif"
+                                      style={{ fontSize: `${Math.max(8, prefs.fontSize - 1)}px` }}
+                                    >
+                                      <span>{para}</span>
+                                    </p>
+                                  </div>
+                                );
+                              })
+                            ) : (
+                              displayFlowParas.map((para, pIdx) => {
+                                const isHighlighted = isCurrentFlowCh && pIdx === activeParagraphIndex;
+                                const showVolumeIcon = isHighlighted && isTtsPlaying;
+                                return (
+                                  <p
+                                    key={pIdx}
+                                    id={`reader-ch-${flowCh.index}-para-${pIdx}`}
+                                    onClick={() => {
+                                      if (flowCh.index !== currentChapterIndex) {
+                                        setCurrentChapterIndex(flowCh.index);
+                                        currentChapterIndexRef.current = flowCh.index;
+                                        setChapterTitle(flowCh.title);
+                                        onUpdateChapterIndex?.(flowCh.index, flowCh.title, chapterList);
+                                      }
+                                      ttsChapterIndexRef.current = flowCh.index;
+                                      currentChapterIndexRef.current = flowCh.index;
+                                      const flowParas = prefs.bilingualMode === "chinese"
+                                        ? flowCh.chineseParagraphs
+                                        : (flowCh.englishParagraphs?.length ? flowCh.englishParagraphs : flowCh.chineseParagraphs);
+                                      ttsParagraphsRef.current = flowParas;
+                                      speakParagraphAtIndexRef.current(pIdx);
+                                    }}
+                                    style={{ fontSize: `${prefs.fontSize}px` }}
+                                    className={`transition-all duration-150 cursor-pointer rounded-xl p-2 sm:p-2.5 select-text ${
+                                      isHighlighted
+                                        ? `${themeClasses.activeParagraph} shadow-xs font-medium`
+                                        : "hover:bg-black/5 dark:hover:bg-white/5 opacity-90"
+                                    }`}
+                                  >
+                                    <span
+                                      className={`select-none align-middle mr-2 ${
+                                        showVolumeIcon
+                                          ? "inline-flex items-center gap-1 text-[11px] font-bold text-purple-600 dark:text-purple-400"
+                                          : "hidden"
+                                      }`}
+                                    >
+                                      <Volume2 className="h-3.5 w-3.5 inline animate-pulse" />
+                                    </span>
+                                    <span className="select-text">{para}</span>
+                                  </p>
+                                );
+                              })
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+
+                    {/* Continuous Loading / Sentinel */}
+                    {isContinuousLoadingNext ? (
+                      <div className="py-8 flex flex-col items-center justify-center gap-2 text-center text-xs opacity-75 font-sans">
+                        <Loader2 className="h-6 w-6 animate-spin text-purple-600" />
+                        <span className="font-semibold">Flowing next chapter seamlessly...</span>
                       </div>
-                    </div>
-
-                    <div className="flex flex-wrap items-center gap-2 pt-1">
-                      {/* Button 1: Translate Just THIS Chapter */}
-                      <button
-                        type="button"
-                        onClick={handleTranslateThisChapter}
-                        disabled={isTranslatingSingleChapter}
-                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold shadow-xs active:scale-95 transition cursor-pointer disabled:opacity-50"
-                      >
-                        {isTranslatingSingleChapter ? (
-                          <>
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            <span>Translating This Chapter...</span>
-                          </>
+                    ) : (
+                      <div className="pt-6 pb-12 text-center space-y-2 font-sans">
+                        {chapterList.length > 0 &&
+                        flowingChapters[flowingChapters.length - 1]?.index >= chapterList.length ? (
+                          <div className="p-6 rounded-2xl bg-purple-500/10 text-center space-y-1">
+                            <p className="text-sm font-bold text-purple-600 dark:text-purple-400">
+                              🎉 You have reached the latest chapter!
+                            </p>
+                            <p className="text-xs opacity-60">All available chapters loaded in continuous flow.</p>
+                          </div>
                         ) : (
-                          <>
-                            <Sparkles className="h-3.5 w-3.5" />
-                            <span>Translate This Chapter</span>
-                          </>
+                          <div className="space-y-1">
+                            <button
+                              type="button"
+                              onClick={loadNextFlowingChapter}
+                              disabled={isContinuousLoadingNext}
+                              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-2xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold shadow-md transition active:scale-95 cursor-pointer disabled:opacity-50"
+                            >
+                              <Infinity className="h-4 w-4" />
+                              <span>
+                                Load Chapter{" "}
+                                {flowingChapters[flowingChapters.length - 1]?.index
+                                  ? flowingChapters[flowingChapters.length - 1].index + 1
+                                  : currentChapterIndex + 1}
+                              </span>
+                            </button>
+                            <p className="text-[11px] opacity-60">Scroll down to auto-load seamlessly</p>
+                          </div>
                         )}
-                      </button>
-
-                      {/* Button 2: Translate Full Novel / Range */}
-                      {onImportNovel && (
-                        <button
-                          type="button"
-                          onClick={onImportNovel}
-                          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-black/10 dark:border-white/10 hover:bg-purple-500/10 text-xs font-bold active:scale-95 transition cursor-pointer"
-                        >
-                          <Download className="h-3.5 w-3.5" />
-                          <span>Translate Whole Book</span>
-                        </button>
-                      )}
-                    </div>
-
-                    {singleChapterTranslateError && (
-                      <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 flex flex-wrap items-center justify-between gap-2">
-                        <p className="text-rose-500 text-xs font-medium">{singleChapterTranslateError}</p>
-                        <button
-                          type="button"
-                          onClick={() => loadChapter(currentChapterIndex, true)}
-                          className="px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-600 dark:text-rose-400 text-xs font-semibold cursor-pointer transition"
-                        >
-                          Re-fetch Clean Chapter
-                        </button>
-                      </div>
-                    )}
-
-                    {displayParagraphs.length > 600 && (
-                      <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 flex flex-wrap items-center justify-between gap-2 text-amber-700 dark:text-amber-300 text-xs">
-                        <span>Notice: This chapter contains {displayParagraphs.length} paragraphs. Tap Re-fetch to reload with exact single chapter boundaries.</span>
-                        <button
-                          type="button"
-                          onClick={() => loadChapter(currentChapterIndex, true)}
-                          className="px-2.5 py-1 rounded-lg bg-amber-500/25 hover:bg-amber-500/35 font-bold cursor-pointer transition"
-                        >
-                          Re-fetch Boundaries
-                        </button>
                       </div>
                     )}
                   </div>
-                )}
+                ) : (
+                  /* Traditional Paged Mode (Single Chapter) */
+                  <>
+                    {/* Chapter Title Heading */}
+                    <div className="text-center pb-4 border-b border-black/10 dark:border-white/10">
+                      <h3 className="text-lg sm:text-xl font-bold tracking-tight">{displayChapterTitle}</h3>
+                      <p className="text-xs opacity-60 mt-1 font-sans">
+                        Chapter {currentChapterIndex} · {displayParagraphs.length} paragraphs
+                      </p>
+                    </div>
 
-                {/* Paragraphs Display with QuickNovel Paragraph Highlighting & Click-to-Read */}
-                <div className={lineHeightClass}>
-                  {prefs.bilingualMode === "dual" ? (
-                    // Dual Bilingual Mode (Side-by-side or stacked paragraph by paragraph)
-                    chineseParagraphs.map((para, idx) => {
-                      const engPara = englishParagraphs[idx] || "";
-                      const isHighlighted = idx === activeParagraphIndex;
-                      return (
-                        <div
-                          key={idx}
-                          id={`reader-paragraph-${idx}`}
-                          onClick={() => speakParagraphAtIndex(idx)}
-                          className={`p-3 rounded-xl transition cursor-pointer ${
-                            isHighlighted ? themeClasses.activeParagraph : "bg-black/5 dark:bg-white/5"
-                          } space-y-1.5 mb-2.5`}
-                        >
-                          {/* Always render paragraphs to prevent DOM structure mismatch crashes with Google Translate */}
-                          <p 
-                            className={`font-sans font-medium ${engPara ? "block" : "hidden"}`} 
-                            style={{ fontSize: `${prefs.fontSize}px` }}
-                          >
-                            <span>{engPara}</span>
-                          </p>
-                          <p className="opacity-75 font-serif" style={{ fontSize: `${Math.max(8, prefs.fontSize - 1)}px` }}>
-                            <span>{para}</span>
-                          </p>
+                    {/* When viewing Chinese mode: clear 1-click option to translate with Gemini AI or switch back to English */}
+                    {prefs.bilingualMode === "chinese" && (
+                      <div className="p-4 rounded-2xl bg-purple-50 dark:bg-purple-950/40 border border-purple-200 dark:border-purple-800/60 font-sans text-xs space-y-3">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex items-center gap-2 text-purple-900 dark:text-purple-200 font-bold">
+                            <Sparkles className="h-4 w-4 text-purple-600 shrink-0" />
+                            <span>Viewing Original Chinese Chapter</span>
+                          </div>
+                          {englishParagraphs.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => updatePrefs({ bilingualMode: "english" })}
+                              className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold shadow-xs active:scale-95 transition cursor-pointer shrink-0"
+                              title="Switch back to English translation (0 Mobile Data)"
+                            >
+                              <Languages className="h-3.5 w-3.5" />
+                              <span>Show English (0 Data)</span>
+                            </button>
+                          )}
                         </div>
-                      );
-                    })
-                  ) : (
-                    // English or Chinese Paragraphs with QuickNovel Paragraph Highlighting!
-                    displayParagraphs.map((para, pIdx) => {
-                      const isHighlighted = pIdx === activeParagraphIndex;
-                      const showVolumeIcon = isHighlighted && isTtsPlaying;
-                      return (
-                        <p
-                          key={pIdx}
-                          id={`reader-paragraph-${pIdx}`}
-                          onClick={() => speakParagraphAtIndex(pIdx)}
-                          style={{ fontSize: `${prefs.fontSize}px` }}
-                          className={`transition-all duration-150 cursor-pointer rounded-xl p-2 sm:p-2.5 select-text ${
-                            isHighlighted
-                              ? `${themeClasses.activeParagraph} shadow-xs font-medium`
-                              : "hover:bg-black/5 dark:hover:bg-white/5 opacity-90"
-                          }`}
-                        >
-                          {/* Stable, non-conditional DOM sibling structure to completely avoid insertBefore/removeChild crash under Google Translate */}
-                          <span 
-                            className={`select-none align-middle mr-2 ${
-                              showVolumeIcon ? "inline-flex items-center gap-1 text-[11px] font-bold text-purple-600 dark:text-purple-400" : "hidden"
-                            }`}
-                          >
-                            <Volume2 className="h-3.5 w-3.5 inline animate-pulse" />
-                          </span>
-                          <span className="select-text">{para}</span>
+                        <p className="text-[11px] opacity-80 leading-relaxed text-purple-950 dark:text-purple-300">
+                          You are reading the raw Chinese text. You can translate this chapter with Gemini AI, or switch back to the Google-translated English version at any time with 0 mobile data consumption.
                         </p>
-                      );
-                    })
-                  )}
-                </div>
+                        <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                          <button
+                            type="button"
+                            onClick={handleTranslateThisChapter}
+                            disabled={isTranslatingSingleChapter}
+                            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold shadow-xs active:scale-95 transition cursor-pointer disabled:opacity-50"
+                          >
+                            {isTranslatingSingleChapter ? (
+                              <>
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                <span>Gemini Translating...</span>
+                              </>
+                            ) : (
+                              <>
+                                <Sparkles className="h-3.5 w-3.5" />
+                                <span>Translate this Chapter with Gemini AI</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                    )}
 
-                {/* Bottom Chapter Navigation Buttons */}
-                <div className="pt-8 pb-10 flex items-center justify-between gap-4 font-sans text-xs">
-                  <button
-                    type="button"
-                    onClick={() => loadChapter(currentChapterIndex - 1)}
-                    disabled={currentChapterIndex <= 1 || isLoadingChapter}
-                    className={`flex items-center gap-1.5 px-4 py-2.5 rounded-xl ${themeClasses.buttonBg} disabled:opacity-30 disabled:pointer-events-none transition cursor-pointer font-bold active:scale-95`}
-                  >
-                    <ChevronLeft className="h-4 w-4" />
-                    <span>Previous Chapter</span>
-                  </button>
+                    {/* Translation Scope Prompt Banner (If only Chinese exists) */}
+                    {prefs.bilingualMode !== "chinese" && englishParagraphs.length === 0 && chineseParagraphs.length > 0 && (
+                      <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 font-sans text-xs space-y-3">
+                        <div className="flex items-start gap-2 text-amber-800 dark:text-amber-300">
+                          <Sparkles className="h-4 w-4 shrink-0 mt-0.5 text-amber-600" />
+                          <div>
+                            <p className="font-bold">Original Chinese Chapter Displayed</p>
+                            <p className="opacity-85 text-[11px] mt-0.5">
+                              This chapter has not been translated into English yet. You can choose whether to translate
+                              just this single chapter instantly or queue the full novel:
+                            </p>
+                          </div>
+                        </div>
 
-                  <button
-                    type="button"
-                    onClick={() => loadChapter(currentChapterIndex + 1)}
-                    disabled={
-                      isLoadingChapter ||
-                      (chapterList.length > 0 && currentChapterIndex >= chapterList.length)
-                    }
-                    className="flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-700 text-white disabled:opacity-30 disabled:pointer-events-none transition cursor-pointer font-bold shadow-md active:scale-95"
-                  >
-                    <span>Next Chapter</span>
-                    <ChevronRight className="h-4 w-4" />
-                  </button>
-                </div>
+                        <div className="flex flex-wrap items-center gap-2 pt-1">
+                          {/* Button 1: Translate Just THIS Chapter */}
+                          <button
+                            type="button"
+                            onClick={handleTranslateThisChapter}
+                            disabled={isTranslatingSingleChapter}
+                            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-bold shadow-xs active:scale-95 transition cursor-pointer disabled:opacity-50"
+                          >
+                            {isTranslatingSingleChapter ? (
+                              <>
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                <span>Translating This Chapter...</span>
+                              </>
+                            ) : (
+                              <>
+                                <Sparkles className="h-3.5 w-3.5" />
+                                <span>Translate This Chapter</span>
+                              </>
+                            )}
+                          </button>
+
+                          {/* Button 2: Translate Full Novel / Range */}
+                          {onImportNovel && (
+                            <button
+                              type="button"
+                              onClick={onImportNovel}
+                              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-black/10 dark:border-white/10 hover:bg-purple-500/10 text-xs font-bold active:scale-95 transition cursor-pointer"
+                            >
+                              <Download className="h-3.5 w-3.5" />
+                              <span>Translate Whole Book</span>
+                            </button>
+                          )}
+                        </div>
+
+                        {singleChapterTranslateError && (
+                          <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 flex flex-wrap items-center justify-between gap-2">
+                            <p className="text-rose-500 text-xs font-medium">{singleChapterTranslateError}</p>
+                            <button
+                              type="button"
+                              onClick={() => loadChapter(currentChapterIndex, true)}
+                              className="px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-600 dark:text-rose-400 text-xs font-semibold cursor-pointer transition"
+                            >
+                              Re-fetch Clean Chapter
+                            </button>
+                          </div>
+                        )}
+
+                        {displayParagraphs.length > 600 && (
+                          <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 flex flex-wrap items-center justify-between gap-2 text-amber-700 dark:text-amber-300 text-xs">
+                            <span>Notice: This chapter contains {displayParagraphs.length} paragraphs. Tap Re-fetch to reload with exact single chapter boundaries.</span>
+                            <button
+                              type="button"
+                              onClick={() => loadChapter(currentChapterIndex, true)}
+                              className="px-2.5 py-1 rounded-lg bg-amber-500/25 hover:bg-amber-500/35 font-bold cursor-pointer transition"
+                            >
+                              Re-fetch Boundaries
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Paragraphs Display with QuickNovel Paragraph Highlighting & Click-to-Read */}
+                    <div className={lineHeightClass}>
+                      {prefs.bilingualMode === "dual" ? (
+                        // Dual Bilingual Mode (Side-by-side or stacked paragraph by paragraph)
+                        chineseParagraphs.map((para, idx) => {
+                          const engPara = englishParagraphs[idx] || "";
+                          const isHighlighted = idx === activeParagraphIndex;
+                          return (
+                            <div
+                              key={idx}
+                              id={`reader-paragraph-${idx}`}
+                              onClick={() => {
+                                ttsChapterIndexRef.current = currentChapterIndexRef.current || currentChapterIndex;
+                                ttsParagraphsRef.current = displayParagraphs;
+                                speakParagraphAtIndexRef.current(idx);
+                              }}
+                              className={`p-3 rounded-xl transition cursor-pointer ${
+                                isHighlighted ? themeClasses.activeParagraph : "bg-black/5 dark:bg-white/5"
+                              } space-y-1.5 mb-2.5`}
+                            >
+                              <p 
+                                className={`font-sans font-medium ${engPara ? "block" : "hidden"}`} 
+                                style={{ fontSize: `${prefs.fontSize}px` }}
+                              >
+                                <span>{engPara}</span>
+                              </p>
+                              <p className="opacity-75 font-serif" style={{ fontSize: `${Math.max(8, prefs.fontSize - 1)}px` }}>
+                                <span>{para}</span>
+                              </p>
+                            </div>
+                          );
+                        })
+                      ) : (
+                        // English or Chinese Paragraphs with QuickNovel Paragraph Highlighting!
+                        displayParagraphs.map((para, pIdx) => {
+                          const isHighlighted = pIdx === activeParagraphIndex;
+                          const showVolumeIcon = isHighlighted && isTtsPlaying;
+                          return (
+                            <p
+                              key={pIdx}
+                              id={`reader-paragraph-${pIdx}`}
+                              onClick={() => {
+                                ttsChapterIndexRef.current = currentChapterIndexRef.current || currentChapterIndex;
+                                ttsParagraphsRef.current = displayParagraphs;
+                                speakParagraphAtIndexRef.current(pIdx);
+                              }}
+                              style={{ fontSize: `${prefs.fontSize}px` }}
+                              className={`transition-all duration-150 cursor-pointer rounded-xl p-2 sm:p-2.5 select-text ${
+                                isHighlighted
+                                  ? `${themeClasses.activeParagraph} shadow-xs font-medium`
+                                  : "hover:bg-black/5 dark:hover:bg-white/5 opacity-90"
+                              }`}
+                            >
+                              <span 
+                                className={`select-none align-middle mr-2 ${
+                                  showVolumeIcon ? "inline-flex items-center gap-1 text-[11px] font-bold text-purple-600 dark:text-purple-400" : "hidden"
+                                }`}
+                              >
+                                <Volume2 className="h-3.5 w-3.5 inline animate-pulse" />
+                              </span>
+                              <span className="select-text">{para}</span>
+                            </p>
+                          );
+                        })
+                      )}
+                    </div>
+
+                    {/* Bottom Chapter Navigation Buttons */}
+                    <div className="pt-8 pb-10 flex items-center justify-between gap-4 font-sans text-xs">
+                      <button
+                        type="button"
+                        onClick={guardUnminimizeClick(() => loadChapter(currentChapterIndex - 1))}
+                        disabled={currentChapterIndex <= 1 || isLoadingChapter}
+                        className={`flex items-center gap-1.5 px-4 py-2.5 rounded-xl ${themeClasses.buttonBg} disabled:opacity-30 disabled:pointer-events-none transition cursor-pointer font-bold active:scale-95`}
+                      >
+                        <ChevronLeft className="h-4 w-4" />
+                        <span>Previous Chapter</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={guardUnminimizeClick(() => loadChapter(currentChapterIndex + 1))}
+                        disabled={
+                          isLoadingChapter ||
+                          (chapterList.length > 0 && currentChapterIndex >= chapterList.length)
+                        }
+                        className="flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-700 text-white disabled:opacity-30 disabled:pointer-events-none transition cursor-pointer font-bold shadow-md active:scale-95"
+                      >
+                        <span>Next Chapter</span>
+                        <ChevronRight className="h-4 w-4" />
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </div>
@@ -2552,7 +4144,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
               {/* 1. tts_action_back: Rewind / Previous Paragraph */}
               <button
                 type="button"
-                onClick={() => handleSkipParagraph(-1)}
+                onClick={guardUnminimizeClick(() => handleSkipParagraph(-1))}
                 className="flex flex-col items-center justify-center w-full h-full text-zinc-700 dark:text-zinc-200 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-black/5 dark:hover:bg-white/5 active:bg-black/10 dark:active:bg-white/10 transition-colors cursor-pointer select-none group"
                 title="Previous Paragraph (Rewind)"
               >
@@ -2563,7 +4155,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
               {/* 2. tts_action_stop: Stop TTS */}
               <button
                 type="button"
-                onClick={stopTts}
+                onClick={guardUnminimizeClick(stopTts)}
                 className="flex flex-col items-center justify-center w-full h-full text-zinc-700 dark:text-zinc-200 hover:text-rose-600 dark:hover:text-rose-400 hover:bg-black/5 dark:hover:bg-white/5 active:bg-black/10 dark:active:bg-white/10 transition-colors cursor-pointer select-none group"
                 title="Stop TTS"
               >
@@ -2574,7 +4166,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
               {/* 3. tts_action_pause_play: Pause / Play Toggle (0ms Delay) */}
               <button
                 type="button"
-                onClick={togglePlayPauseTts}
+                onClick={guardUnminimizeClick(togglePlayPauseTts)}
                 className="flex flex-col items-center justify-center w-full h-full text-purple-600 dark:text-purple-400 hover:bg-purple-500/10 active:bg-purple-500/20 transition-colors cursor-pointer select-none group"
                 title={isTtsPlaying && !isTtsPaused ? "Pause Speech" : "Play Speech"}
               >
@@ -2591,7 +4183,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
               {/* 4. tts_action_forward: Next Paragraph / Fast Forward */}
               <button
                 type="button"
-                onClick={() => handleSkipParagraph(1)}
+                onClick={guardUnminimizeClick(() => handleSkipParagraph(1))}
                 className="flex flex-col items-center justify-center w-full h-full text-zinc-700 dark:text-zinc-200 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-black/5 dark:hover:bg-white/5 active:bg-black/10 dark:active:bg-white/10 transition-colors cursor-pointer select-none group"
                 title="Next Paragraph (Forward)"
               >
@@ -2605,9 +4197,9 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
               {/* 1. read_action_rotate: Screen Rotation / Reading Width */}
               <button
                 type="button"
-                onClick={() => {
+                onClick={guardUnminimizeClick(() => {
                   setReadingWidth((prev) => (prev === "standard" ? "wide" : prev === "wide" ? "full" : "standard"));
-                }}
+                })}
                 className="flex flex-col items-center justify-center w-full h-full text-zinc-700 dark:text-zinc-200 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-black/5 dark:hover:bg-white/5 active:bg-black/10 dark:active:bg-white/10 transition-colors cursor-pointer select-none group"
                 title={`Rotate Reading Layout (${readingWidth})`}
               >
@@ -2618,10 +4210,11 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
               {/* 2. read_action_tts: Start Text-to-Speech */}
               <button
                 type="button"
-                onClick={() => {
+                onClick={guardUnminimizeClick(() => {
                   const startIndex = activeParagraphIndexRef.current >= 0 ? activeParagraphIndexRef.current : 0;
-                  speakParagraphAtIndex(startIndex);
-                }}
+                  ttsChapterIndexRef.current = currentChapterIndexRef.current || currentChapterIndex;
+                  speakParagraphAtIndexRef.current(startIndex);
+                })}
                 className="flex flex-col items-center justify-center w-full h-full text-purple-600 dark:text-purple-400 hover:bg-purple-500/10 active:bg-purple-500/20 transition-colors cursor-pointer select-none group"
                 title="Start Text-to-Speech (TTS)"
               >
@@ -2632,7 +4225,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
               {/* 3. read_action_chapters: Chapters Table of Contents */}
               <button
                 type="button"
-                onClick={() => setShowChapterDrawer(true)}
+                onClick={guardUnminimizeClick(() => setShowChapterDrawer(true))}
                 className="flex flex-col items-center justify-center w-full h-full text-zinc-700 dark:text-zinc-200 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-black/5 dark:hover:bg-white/5 active:bg-black/10 dark:active:bg-white/10 transition-colors cursor-pointer select-none group"
                 title="Table of Contents (Chapters)"
               >
@@ -2643,7 +4236,7 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
               {/* 4. read_action_library: Bookmark / Library Toggle */}
               <button
                 type="button"
-                onClick={handleToggleLibrary}
+                onClick={guardUnminimizeClick(handleToggleLibrary)}
                 className={`flex flex-col items-center justify-center w-full h-full transition-colors cursor-pointer select-none group ${
                   isInLibrary
                     ? "text-purple-600 dark:text-purple-400 font-bold bg-purple-500/10"
@@ -2764,7 +4357,28 @@ export const NovelReaderModal: React.FC<NovelReaderModalProps> = ({
             </div>
           </div>
         )}
+
+        {/* ========================================================= */}
+        {/* QuickNovel Auto-Generated Glossary Drawer */}
+        {/* ========================================================= */}
+        <NovelGlossaryDrawer
+          isOpen={showGlossaryDrawer}
+          onClose={() => setShowGlossaryDrawer(false)}
+          novelId={novelId}
+          novelTitle={novelTitle}
+          author={author}
+          chineseSampleText={
+            chineseContent ||
+            (flowingChapters.length > 0
+              ? flowingChapters.map((c) => c.chineseContent).join("\n\n")
+              : "")
+          }
+          getAuthHeaders={getAuthHeaders}
+          onApplyReplacementsToReader={handleApplyReplacementsToCurrentReader}
+          onGlossaryChanged={handleGlossaryChanged}
+        />
       </div>
     </div>
+    </>
   );
 };

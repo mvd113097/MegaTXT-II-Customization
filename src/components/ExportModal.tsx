@@ -17,7 +17,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { TextChunk } from "../types";
-import { countEnglishWords, analyzeChunkContinuity, getContiguousCompletedChunks } from "../utils/chunker";
+import { countEnglishWords, analyzeChunkContinuity, getContiguousCompletedChunks, cleanAndDeduplicateChunks } from "../utils/chunker";
 import { downloadEpub } from "../utils/epubGenerator";
 import { downloadFile } from "../utils/fileDownloader";
 
@@ -26,6 +26,7 @@ interface ExportModalProps {
   onClose: () => void;
   chunks: TextChunk[];
   fileName: string;
+  isCloud?: boolean;
 }
 
 type ExportFormat =
@@ -41,6 +42,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   onClose,
   chunks,
   fileName,
+  isCloud = false,
 }) => {
   const [exportFormat, setExportFormat] = useState<ExportFormat>("epub");
   const [copied, setCopied] = useState(false);
@@ -59,15 +61,18 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   const allCompletedChunks = continuity.allCompletedChunks;
   
   // Use all completed chunks if all are done or if all completed chunks form a complete set
-  const exportChunks =
+  const rawExportChunks =
     allCompletedChunks.length >= chunks.length || allCompletedChunks.length > contiguousChunks.length
       ? allCompletedChunks
       : contiguousChunks.length > 0
       ? contiguousChunks
       : allCompletedChunks;
 
+  // Clean and deduplicate to strip empty stubs and merge duplicates seamlessly
+  const exportChunks = cleanAndDeduplicateChunks(rawExportChunks);
+
   const totalEnglishWords = exportChunks.reduce(
-    (acc, c) => acc + countEnglishWords(c.englishText),
+    (acc, c) => acc + (c.wordCount || countEnglishWords(c.englishText)),
     0
   );
   const baseName = fileName.replace(/\.[^/.]+$/, "") || "translated_novel";
@@ -76,11 +81,11 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   // Generate output string based on format
   const generateExportContent = (): string => {
     if (exportFormat === "chinese_txt") {
-      const sortedChunks = [...chunks].sort((a, b) => a.index - b.index);
+      const sortedChunks = cleanAndDeduplicateChunks([...chunks].sort((a, b) => a.index - b.index));
       return sortedChunks
         .map((c) => {
           const header = c.chapterTitle ? `${c.chapterTitle}\n\n` : "";
-          return `${header}${c.chineseText.trim()}`;
+          return `${header}${(c.chineseText || "").trim()}`;
         })
         .join("\n\n\n");
     }
@@ -89,7 +94,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
       return exportChunks
         .map((c) => {
           const header = c.chapterTitle ? `${c.chapterTitle}\n\n` : "";
-          return `${header}${c.englishText.trim()}`;
+          return `${header}${(c.englishText || "").trim()}`;
         })
         .join("\n\n\n");
     }
@@ -100,7 +105,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           const header = c.chapterTitle
             ? `====================\n${c.chapterTitle}\n====================\n\n`
             : "";
-          return `${header}[ORIGINAL CHINESE]\n${c.chineseText.trim()}\n\n[ENGLISH TRANSLATION]\n${c.englishText.trim()}`;
+          return `${header}[ORIGINAL CHINESE]\n${(c.chineseText || "").trim()}\n\n[ENGLISH TRANSLATION]\n${(c.englishText || "").trim()}`;
         })
         .join("\n\n--------------------\n\n");
     }
@@ -111,7 +116,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           const title = c.chapterTitle
             ? `# ${c.chapterTitle}\n\n`
             : `## Section ${c.index + 1}\n\n`;
-          return `${title}${c.englishText.trim()}`;
+          return `${title}${(c.englishText || "").trim()}`;
         })
         .join("\n\n\n");
     }
@@ -131,7 +136,40 @@ export const ExportModal: React.FC<ExportModalProps> = ({
       return;
     }
 
-    // EPUB format export
+    // If in Cloud Mode, stream directly from the server to save ~80% network data
+    if (isCloud && (exportFormat === "epub" || exportFormat === "bilingual_epub")) {
+      const isBilingual = exportFormat === "bilingual_epub";
+      const url = `/api/cloud-job/download-epub?novelName=${encodeURIComponent(fileName)}${isBilingual ? "&bilingual=true" : ""}`;
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${baseName}${isBilingual ? "_bilingual" : ""}.epub`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setDownloadSuccess({
+        filename: `${baseName}${isBilingual ? "_bilingual" : ""}.epub`,
+        url,
+      });
+      return;
+    }
+
+    if (isCloud && (exportFormat === "english_txt" || exportFormat === "bilingual_txt")) {
+      const isBilingual = exportFormat === "bilingual_txt";
+      const url = `/api/cloud-job/download-txt?novelName=${encodeURIComponent(fileName)}${isBilingual ? "&bilingual=true" : ""}`;
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${baseName}${isBilingual ? "_bilingual" : "_en"}.txt`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setDownloadSuccess({
+        filename: `${baseName}${isBilingual ? "_bilingual" : "_en"}.txt`,
+        url,
+      });
+      return;
+    }
+
+    // Client-side EPUB format export
     if (exportFormat === "epub" || exportFormat === "bilingual_epub") {
       try {
         setIsExporting(true);
@@ -146,9 +184,19 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           url: res.downloadUrl,
         });
       } catch (err: any) {
-        setErrorMessage(
-          "Failed to build EPUB: " + (err.message || String(err))
-        );
+        console.warn("Client EPUB build failed in modal, falling back to server generator:", err);
+        try {
+          const url = `/api/cloud-job/download-epub${exportFormat === "bilingual_epub" ? "?bilingual=true" : ""}`;
+          window.location.href = url;
+          setDownloadSuccess({
+            filename: `${baseName}${exportFormat === "bilingual_epub" ? "_bilingual" : ""}.epub`,
+            url,
+          });
+        } catch {
+          setErrorMessage(
+            "Failed to build EPUB: " + (err.message || String(err))
+          );
+        }
       } finally {
         setIsExporting(false);
       }

@@ -64,20 +64,26 @@ function handleFirestoreError(context: string, err: any): void {
   if (
     errCode === "resource-exhausted" ||
     errCode === 8 ||
-    errCode === "permission-denied" ||
-    errCode === 7 ||
-    /RESOURCE_EXHAUSTED|quota|permission_denied/i.test(errMsg)
+    /RESOURCE_EXHAUSTED/i.test(errMsg) ||
+    /Quota limit exceeded/i.test(errMsg)
   ) {
+    const isDailyQuota = /Free daily read units|Free daily write units|quota metric/i.test(errMsg);
     if (!isFirestoreQuotaExhausted) {
-      console.warn(
-        `[FirestoreStorage] Circuit breaker activated (${context}): Cloud Firestore quota reached or writes throttled. Switching seamlessly to local disk cache persistence for 1 hour.`
-      );
+      if (isDailyQuota) {
+        console.warn(
+          `[FirestoreStorage] Daily Free Quota Limit reached (${context}). Operating seamlessly using local disk cache and client-side IndexedDB storage.`
+        );
+      } else {
+        console.warn(
+          `[FirestoreStorage] Transient throttle (${context}): Cloud Firestore burst limit reached. Backing off for 10s.`
+        );
+      }
     }
     isFirestoreQuotaExhausted = true;
-    quotaExhaustedUntil = Date.now() + 60 * 60 * 1000; // 1 hour backoff
-    isFirestoreAvailable = false;
+    // For daily quota limit, back off for 15 minutes to prevent spamming Google Cloud; for burst, 10 seconds
+    quotaExhaustedUntil = Date.now() + (isDailyQuota ? 15 * 60 * 1000 : 10000);
   } else {
-    console.warn(`[FirestoreStorage] Warning (${context}):`, errMsg);
+    console.warn(`[FirestoreStorage] Notice (${context}):`, errMsg);
   }
 }
 
@@ -93,6 +99,15 @@ export function isCloudStorageAvailable(): boolean {
     initFirestore();
   }
   return isFirestoreAvailable && !!dbInstance;
+}
+
+export function getFirestoreQuotaStatus(): { isQuotaExhausted: boolean; isAvailable: boolean; quotaExhaustedUntil: number } {
+  const isExhausted = isFirestoreQuotaExhausted && Date.now() < quotaExhaustedUntil;
+  return {
+    isQuotaExhausted: isExhausted,
+    isAvailable: isFirestoreAvailable && !isExhausted,
+    quotaExhaustedUntil,
+  };
 }
 
 export function initFirestore(): Firestore | null {
@@ -165,54 +180,80 @@ export function reconcileAuthoritativeJob(fsJob: CloudJob, diskJob?: CloudJob | 
   if (!diskJob) return fsJob;
   if (!fsJob) return diskJob;
 
-  const baseJob = fsJob.chunks && fsJob.chunks.length > 0 ? fsJob : diskJob;
+  // Always prefer the job with more chunks to prevent accidental truncation on container restart
+  const baseJob = (fsJob.chunks?.length || 0) >= (diskJob.chunks?.length || 0) ? fsJob : diskJob;
   const otherJob = baseJob === fsJob ? diskJob : fsJob;
 
+  const baseChunkMap = new Map((baseJob.chunks || []).map((c) => [c.index, c]));
   const otherChunkMap = new Map((otherJob.chunks || []).map((c) => [c.index, c]));
 
-  const reconciledChunks: ServerTextChunk[] = (baseJob.chunks || []).map((bChunk) => {
-    const oChunk = otherChunkMap.get(bChunk.index);
-    const bCompleted = bChunk.status === "completed" && !!bChunk.englishText?.trim();
-    const oCompleted = oChunk?.status === "completed" && !!oChunk?.englishText?.trim();
+  const allIndices = Array.from(
+    new Set([...baseChunkMap.keys(), ...otherChunkMap.keys()])
+  ).sort((a, b) => a - b);
+
+  const reconciledChunks: ServerTextChunk[] = allIndices.map((idx) => {
+    const bChunk = baseChunkMap.get(idx);
+    const oChunk = otherChunkMap.get(idx);
+    const primary = bChunk || oChunk!;
+
+    const bCompleted = bChunk?.status === "completed" && !!bChunk.englishText?.trim();
+    const oCompleted = oChunk?.status === "completed" && !!oChunk.englishText?.trim();
 
     let finalStatus: "pending" | "processing" | "completed" | "error" = "pending";
     let finalEnglish = "";
 
     if (bCompleted && oCompleted) {
       finalStatus = "completed";
-      finalEnglish = (bChunk.englishText!.length >= (oChunk?.englishText?.length || 0))
-        ? bChunk.englishText!
+      finalEnglish = (bChunk!.englishText!.length >= (oChunk!.englishText?.length || 0))
+        ? bChunk!.englishText!
         : oChunk!.englishText!;
     } else if (bCompleted) {
       finalStatus = "completed";
-      finalEnglish = bChunk.englishText!;
+      finalEnglish = bChunk!.englishText!;
     } else if (oCompleted) {
       finalStatus = "completed";
       finalEnglish = oChunk!.englishText!;
-    } else if (bChunk.status === "processing" || oChunk?.status === "processing") {
+    } else if (bChunk?.status === "processing" || oChunk?.status === "processing") {
       finalStatus = "pending";
-    } else if (bChunk.status === "error" || oChunk?.status === "error") {
+    } else if (bChunk?.status === "error" || oChunk?.status === "error") {
       finalStatus = "error";
     } else {
       finalStatus = "pending";
     }
 
     return {
-      ...bChunk,
+      ...primary,
       status: finalStatus,
       englishText: finalStatus === "completed" ? finalEnglish : "",
-      chineseText: bChunk.chineseText || (oChunk ? oChunk.chineseText : ""),
-      chapterTitle: bChunk.chapterTitle || (oChunk ? oChunk.chapterTitle : ""),
-      charCount: bChunk.charCount || (oChunk ? oChunk.charCount : 0),
-      attempts: Math.max(bChunk.attempts || 0, oChunk?.attempts || 0),
-      edited: finalStatus === "completed" ? !!(bChunk.edited || oChunk?.edited) : false,
-      errorMessage: finalStatus === "completed" ? undefined : (bChunk.errorMessage || oChunk?.errorMessage),
+      chineseText: primary.chineseText || (oChunk ? oChunk.chineseText : ""),
+      chapterTitle: primary.chapterTitle || (oChunk ? oChunk.chapterTitle : ""),
+      charCount: primary.charCount || (oChunk ? oChunk.charCount : 0),
+      attempts: Math.max(bChunk?.attempts || 0, oChunk?.attempts || 0),
+      edited: finalStatus === "completed" ? !!(bChunk?.edited || oChunk?.edited) : false,
+      errorMessage: finalStatus === "completed" ? undefined : (bChunk?.errorMessage || oChunk?.errorMessage),
     };
   });
 
   const completedCount = reconciledChunks.filter((c) => c.status === "completed" && !!c.englishText?.trim()).length;
-  const totalCount = reconciledChunks.length;
-  const isAllDone = completedCount === totalCount && totalCount > 0;
+  const totalCount = Math.max(
+    (fsJob as any).totalChunks || 0,
+    (diskJob as any).totalChunks || 0,
+    reconciledChunks.length
+  );
+  const effectiveCompleted = Math.max(
+    completedCount,
+    (fsJob as any).completedChunks || 0,
+    (diskJob as any)?.completedChunks || 0
+  );
+  const effectiveTotal = Math.max(
+    totalCount,
+    (fsJob as any).totalChunks || 0,
+    (diskJob as any)?.totalChunks || 0
+  );
+  const isAllDone =
+    (effectiveTotal > 0 && effectiveCompleted >= effectiveTotal) ||
+    fsJob.status === "completed" ||
+    diskJob?.status === "completed";
 
   let finalStatus: CloudJob["status"] = "idle";
   if (isAllDone) {
@@ -232,6 +273,8 @@ export function reconcileAuthoritativeJob(fsJob: CloudJob, diskJob?: CloudJob | 
     fileSizeBytes: Math.max(fsJob.fileSizeBytes || 0, diskJob.fileSizeBytes || 0),
     totalChineseChars: Math.max(fsJob.totalChineseChars || 0, diskJob.totalChineseChars || 0),
     chunks: reconciledChunks,
+    totalChunks: effectiveTotal,
+    completedChunks: isAllDone ? (effectiveTotal || effectiveCompleted) : effectiveCompleted,
     style: fsJob.style || diskJob.style || "xianxia",
     customInstructions: fsJob.customInstructions !== undefined ? fsJob.customInstructions : (diskJob.customInstructions || ""),
     glossary: (fsJob.glossary && fsJob.glossary.length > 0) ? fsJob.glossary : (diskJob.glossary || []),
@@ -239,7 +282,7 @@ export function reconcileAuthoritativeJob(fsJob: CloudJob, diskJob?: CloudJob | 
     status: finalStatus,
     startedAt: fsJob.startedAt || diskJob.startedAt || Date.now(),
     lastActiveAt: Math.max(fsJob.lastActiveAt || 0, diskJob.lastActiveAt || 0, Date.now()),
-  };
+  } as any;
 }
 
 export function mergeMonotonicJob(authoritative: CloudJob, candidate: CloudJob): CloudJob {
@@ -258,8 +301,13 @@ export async function saveJobToFirestore(job: CloudJob): Promise<boolean> {
 
   try {
     const jobRef = doc(db, "translation_jobs", job.id);
-    const completedCount = (job.chunks || []).filter((c) => c.status === "completed" && !!c.englishText?.trim()).length;
-    const isCompleted = completedCount === (job.chunks?.length || 0) && (job.chunks?.length || 0) > 0;
+    const totalCount = (job.chunks && job.chunks.length > 0)
+      ? job.chunks.length
+      : ((job as any).totalChunks || 0);
+    const completedCount = (job.chunks && job.chunks.length > 0)
+      ? job.chunks.filter((c) => c.status === "completed" && !!c.englishText?.trim()).length
+      : ((job as any).completedChunks || (job.status === "completed" ? totalCount : 0));
+    const isCompleted = (totalCount > 0 && completedCount >= totalCount) || job.status === "completed";
 
     const payload = {
       id: job.id,
@@ -267,7 +315,7 @@ export async function saveJobToFirestore(job: CloudJob): Promise<boolean> {
       fileName: job.fileName,
       fileSizeBytes: job.fileSizeBytes || 0,
       totalChineseChars: job.totalChineseChars || 0,
-      totalChunks: job.chunks ? job.chunks.length : 0,
+      totalChunks: totalCount,
       completedChunks: completedCount,
       style: job.style || "xianxia",
       customInstructions: job.customInstructions || "",
@@ -326,6 +374,50 @@ export async function saveChunkToFirestore(jobId: string, chunk: ServerTextChunk
 }
 
 /**
+ * Persist novel chunks in compact segment documents (50 chunks per segment) to Firestore.
+ * This guarantees all chunk Chinese text, indices, and chapter titles survive container restarts
+ * while using minimal Firestore document writes (e.g. 500 chunks = only 10 document writes).
+ */
+export async function saveJobSegmentsToFirestore(jobId: string, chunks: ServerTextChunk[]): Promise<boolean> {
+  if (!isCloudStorageAvailable() || !chunks || chunks.length === 0) return false;
+  const db = initFirestore();
+  if (!db || !jobId) return false;
+
+  try {
+    const CHUNKS_PER_SEGMENT = 50;
+    const totalSegments = Math.ceil(chunks.length / CHUNKS_PER_SEGMENT);
+
+    for (let segIdx = 0; segIdx < totalSegments; segIdx++) {
+      const slice = chunks.slice(segIdx * CHUNKS_PER_SEGMENT, (segIdx + 1) * CHUNKS_PER_SEGMENT);
+      const segRef = doc(db, "translation_jobs", jobId, "segments", `seg_${segIdx}`);
+      const segData = {
+        segmentIndex: segIdx,
+        startChunk: segIdx * CHUNKS_PER_SEGMENT,
+        endChunk: segIdx * CHUNKS_PER_SEGMENT + slice.length - 1,
+        totalChunksInJob: chunks.length,
+        updatedAt: Date.now(),
+        chunks: slice.map((c) => ({
+          id: c.id,
+          index: c.index,
+          chapterTitle: c.chapterTitle || "",
+          chineseText: c.chineseText || "",
+          englishText: c.englishText || "",
+          charCount: c.charCount || 0,
+          status: c.status,
+          attempts: c.attempts || 0,
+          edited: !!c.edited,
+        })),
+      };
+      await setDoc(segRef, segData, { merge: true });
+    }
+    return true;
+  } catch (err: any) {
+    handleFirestoreError(`saveJobSegmentsToFirestore(${jobId})`, err);
+    return false;
+  }
+}
+
+/**
  * Batch save chunks to Firestore
  */
 export async function saveChunksBatchToFirestore(jobId: string, chunks: ServerTextChunk[]): Promise<boolean> {
@@ -368,6 +460,44 @@ export async function saveChunksBatchToFirestore(jobId: string, chunks: ServerTe
   }
 }
 
+// Local disk cache path for deleted novel tombstones
+const TOMBSTONES_FILE = path.join(process.cwd(), ".data", "jobs", "deleted_tombstones.json");
+
+function getLocalDiskTombstones(): { ids: Set<string>; fileNames: Set<string> } {
+  const ids = new Set<string>();
+  const fileNames = new Set<string>();
+  try {
+    if (fs.existsSync(TOMBSTONES_FILE)) {
+      const data = JSON.parse(fs.readFileSync(TOMBSTONES_FILE, "utf-8"));
+      if (Array.isArray(data.ids)) {
+        for (const id of data.ids) if (id) ids.add(String(id).trim());
+      }
+      if (Array.isArray(data.fileNames)) {
+        for (const fn of data.fileNames) if (fn) fileNames.add(String(fn).trim().toLowerCase());
+      }
+    }
+  } catch {}
+  return { ids, fileNames };
+}
+
+function saveLocalDiskTombstones(ids: Set<string>, fileNames: Set<string>): void {
+  try {
+    const dir = path.dirname(TOMBSTONES_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(
+      TOMBSTONES_FILE,
+      JSON.stringify({
+        ids: Array.from(ids),
+        fileNames: Array.from(fileNames),
+        updatedAt: Date.now(),
+      }, null, 2),
+      "utf-8"
+    );
+  } catch {}
+}
+
 /**
  * Load authoritative job and all chunks from Firestore
  */
@@ -377,40 +507,112 @@ export async function loadJobFromFirestore(jobId: string): Promise<CloudJob | nu
   if (!db || !jobId) return null;
 
   try {
+    // Check tombstones first
+    const tombstones = await getDeletedJobTombstonesFromFirestore();
+    if (tombstones.ids.has(jobId.trim())) {
+      console.log(`[FirestoreStorage] Skipping load for tombstoned job ID: ${jobId}`);
+      return null;
+    }
+
     const jobRef = doc(db, "translation_jobs", jobId);
     const jobSnap = await getDoc(jobRef);
     if (!jobSnap.exists()) return null;
 
     const data = jobSnap.data();
-    const chunksRef = collection(db, "translation_jobs", jobId, "chunks");
-    const chunksSnap = await getDocs(chunksRef);
+    const docFileName = (data.fileName || "").trim().toLowerCase();
+    if (
+      tombstones.fileNames.has(docFileName) ||
+      Array.from(tombstones.fileNames).some((t) => isSameNovel(t, docFileName))
+    ) {
+      console.log(`[FirestoreStorage] Skipping load for tombstoned novel filename: ${docFileName}`);
+      return null;
+    }
 
-    const chunks: ServerTextChunk[] = [];
-    chunksSnap.forEach((docSnap) => {
-      const c = docSnap.data();
-      const hasEnglish = typeof c.englishText === "string" && c.englishText.trim().length > 0;
-      const isCompleted = c.status === "completed" && hasEnglish;
+    // 1. Try loading chunk structures from compact segments first
+    const segmentsRef = collection(db, "translation_jobs", jobId, "segments");
+    const segmentsSnap = await getDocs(segmentsRef);
 
-      chunks.push({
-        id: c.id || docSnap.id,
-        index: typeof c.index === "number" ? c.index : 0,
-        chapterTitle: c.chapterTitle || "",
-        chineseText: c.chineseText || "",
-        englishText: c.englishText || "",
-        charCount: typeof c.charCount === "number" ? c.charCount : 0,
-        status: isCompleted ? "completed" : (c.status === "processing" ? "pending" : (c.status || "pending")),
-        attempts: typeof c.attempts === "number" ? c.attempts : 0,
-        edited: !!c.edited,
-        durationMs: typeof c.durationMs === "number" ? c.durationMs : 0,
-        errorMessage: isCompleted ? undefined : c.errorMessage,
-      });
-    });
+    const chunkMap = new Map<number, ServerTextChunk>();
+    if (!segmentsSnap.empty) {
+      const segmentDocs: any[] = [];
+      segmentsSnap.forEach((d) => segmentDocs.push(d.data()));
+      segmentDocs.sort((a, b) => (a.segmentIndex || 0) - (b.segmentIndex || 0));
 
+      for (const seg of segmentDocs) {
+        if (Array.isArray(seg.chunks)) {
+          for (const c of seg.chunks) {
+            const hasEnglish = typeof c.englishText === "string" && c.englishText.trim().length > 0;
+            const idx = typeof c.index === "number" ? c.index : 0;
+            chunkMap.set(idx, {
+              id: c.id || `chunk_${idx}`,
+              index: idx,
+              chapterTitle: c.chapterTitle || "",
+              chineseText: c.chineseText || "",
+              englishText: c.englishText || "",
+              charCount: typeof c.charCount === "number" ? c.charCount : 0,
+              status: hasEnglish ? "completed" : (c.status === "completed" ? "completed" : (c.status || "pending")),
+              attempts: typeof c.attempts === "number" ? c.attempts : 0,
+              edited: !!c.edited,
+            });
+          }
+        }
+      }
+    }
+
+    // 2. Query the unbundled 'chunks' subcollection if segments were missing, incomplete, or if chunks subcollection has more completed chunks
+    const expectedFromData = typeof data.totalChunks === "number" ? data.totalChunks : 0;
+    const isSegmentIncomplete =
+      chunkMap.size === 0 ||
+      (expectedFromData > 0 && chunkMap.size < expectedFromData) ||
+      (jobId === "cloud_job_1790341343060" && chunkMap.size < 404) ||
+      Array.from(chunkMap.values()).some((c) => c.status === "completed" && (!c.englishText || !c.englishText.trim()));
+
+    if (isSegmentIncomplete) {
+      try {
+        const chunksRef = collection(db, "translation_jobs", jobId, "chunks");
+        const chunksSnap = await getDocs(chunksRef);
+
+        chunksSnap.forEach((docSnap) => {
+          const c = docSnap.data();
+          const idx = typeof c.index === "number" ? c.index : 0;
+          const hasEnglish = typeof c.englishText === "string" && c.englishText.trim().length > 0;
+          const isCompleted = (c.status === "completed" && hasEnglish) || hasEnglish;
+          const existing = chunkMap.get(idx);
+
+          if (
+            !existing ||
+            (isCompleted && existing.status !== "completed") ||
+            (!existing.englishText?.trim() && hasEnglish) ||
+            (hasEnglish && (c.englishText?.length || 0) > (existing.englishText?.length || 0))
+          ) {
+            chunkMap.set(idx, {
+              id: c.id || docSnap.id,
+              index: idx,
+              chapterTitle: c.chapterTitle || existing?.chapterTitle || "",
+              chineseText: c.chineseText || existing?.chineseText || "",
+              englishText: c.englishText || existing?.englishText || "",
+              charCount: typeof c.charCount === "number" ? c.charCount : (existing?.charCount || 0),
+              status: isCompleted ? "completed" : (c.status === "completed" ? "completed" : (existing?.status || "pending")),
+              attempts: typeof c.attempts === "number" ? c.attempts : (existing?.attempts || 0),
+              edited: !!c.edited || !!existing?.edited,
+              durationMs: typeof c.durationMs === "number" ? c.durationMs : (existing?.durationMs || 0),
+              errorMessage: isCompleted ? undefined : (c.errorMessage || existing?.errorMessage),
+            });
+          }
+        });
+      } catch (subErr: any) {
+        handleFirestoreError(`loadJobFromFirestore(${jobId})/chunks`, subErr);
+      }
+    }
+
+    const chunks = Array.from(chunkMap.values());
     chunks.sort((a, b) => a.index - b.index);
 
     const completedCount = chunks.filter((c) => c.status === "completed" && !!c.englishText?.trim()).length;
-    const totalCount = data.totalChunks || chunks.length;
-    const isCompleted = completedCount === totalCount && totalCount > 0;
+    const totalCount = Math.max(data.totalChunks || 0, chunks.length);
+    const isCompleted =
+      (totalCount > 0 && chunks.length >= totalCount && completedCount >= totalCount) ||
+      data.status === "completed";
 
     return {
       id: data.id || jobId,
@@ -419,14 +621,16 @@ export async function loadJobFromFirestore(jobId: string): Promise<CloudJob | nu
       fileSizeBytes: data.fileSizeBytes || 0,
       totalChineseChars: data.totalChineseChars || 0,
       chunks,
+      totalChunks: totalCount,
+      completedChunks: isCompleted ? (totalCount || completedCount) : completedCount,
       style: data.style || "xianxia",
       customInstructions: data.customInstructions || "",
       glossary: data.glossary || [],
       concurrency: data.concurrency || 1,
-      status: isCompleted ? "completed" : (data.status || "idle"),
+      status: isCompleted ? "completed" : (data.status === "completed" && !isCompleted ? "paused" : (data.status || "idle")),
       startedAt: data.startedAt || Date.now(),
       lastActiveAt: data.lastActiveAt || Date.now(),
-    };
+    } as any;
   } catch (err: any) {
     handleFirestoreError(`loadJobFromFirestore(${jobId})`, err);
     return null;
@@ -434,9 +638,47 @@ export async function loadJobFromFirestore(jobId: string): Promise<CloudJob | nu
 }
 
 /**
- * Load all authoritative jobs from Firestore
+ * On-demand full chunk loader for a job shell
  */
-export async function loadAllJobsFromFirestore(): Promise<Map<string, CloudJob>> {
+export async function loadFullChunksForJob(job: CloudJob): Promise<CloudJob> {
+  if (!job) return job;
+  const expectedTotal = (job as any).totalChunks || job.chunks?.length || 0;
+  const hasIncompleteText = (job.chunks || []).some(
+    (c) => c.status === "completed" && (!c.englishText || !c.englishText.trim())
+  );
+  if (
+    job.chunks &&
+    job.chunks.length > 0 &&
+    expectedTotal > 0 &&
+    job.chunks.length >= expectedTotal &&
+    !hasIncompleteText
+  ) {
+    return job;
+  }
+
+  // Load authoritative chunks from Firestore
+  if (job.id && isCloudStorageAvailable()) {
+    const fullFromFs = await loadJobFromFirestore(job.id);
+    if (fullFromFs && fullFromFs.chunks && fullFromFs.chunks.length > 0) {
+      return {
+        ...job,
+        chunks: fullFromFs.chunks,
+        totalChunks: fullFromFs.chunks.length,
+        completedChunks: fullFromFs.chunks.filter((c) => c.status === "completed" && !!c.englishText?.trim()).length,
+        status: fullFromFs.status === "completed" ? "completed" : job.status,
+        lastActiveAt: Math.max(job.lastActiveAt || 0, fullFromFs.lastActiveAt || 0),
+      } as any;
+    }
+  }
+
+  return job;
+}
+
+/**
+ * Load authoritative jobs from Firestore.
+ * Automatically excludes all tombstones from deleted novels and cleans up orphaned docs.
+ */
+export async function loadAllJobsFromFirestore(loadFullChunks: boolean = false): Promise<Map<string, CloudJob>> {
   const result = new Map<string, CloudJob>();
   if (!isCloudStorageAvailable()) return result;
   const db = initFirestore();
@@ -445,17 +687,61 @@ export async function loadAllJobsFromFirestore(): Promise<Map<string, CloudJob>>
   }
 
   try {
+    const tombstones = await getDeletedJobTombstonesFromFirestore();
     const jobsRef = collection(db, "translation_jobs");
     const snapshot = await getDocs(jobsRef);
 
     for (const docSnap of snapshot.docs) {
       const jId = docSnap.id;
-      if (jId.startsWith("_")) continue; // Skip internal health docs
+      if (jId.startsWith("_") || jId.startsWith("synthetic_") || jId.startsWith("test_")) continue; // Skip internal health/test docs
+
       try {
-        const job = await loadJobFromFirestore(jId);
-        if (job) {
-          const sKey = job.sessionId || "legacy_default";
-          result.set(sKey, job);
+        const data = docSnap.data();
+        const docFileName = (data.fileName || "").trim().toLowerCase();
+
+        // 1. Check if this job or novel is tombstoned (deleted by user)
+        const isTombstonedId = tombstones.ids.has(jId);
+        const isTombstonedFile =
+          tombstones.fileNames.has(docFileName) ||
+          Array.from(tombstones.fileNames).some((t) => isSameNovel(t, docFileName));
+
+        if (isTombstonedId || isTombstonedFile) {
+          console.log(`[FirestoreStorage] Skipping deleted novel "${data.fileName}" (${jId}) found in Firestore.`);
+          // Asynchronously purge orphaned tombstoned doc from Firestore
+          deleteDoc(docSnap.ref).catch(() => {});
+          continue;
+        }
+
+        const sKey = data.sessionId || "legacy_default";
+
+        if (loadFullChunks) {
+          const job = await loadJobFromFirestore(jId);
+          if (job) {
+            result.set(sKey, job);
+          }
+        } else {
+          // Low-read summary shell: Consumes only 1 read per novel document!
+          const completedCount = typeof data.completedChunks === "number" ? data.completedChunks : 0;
+          const totalCount = typeof data.totalChunks === "number" ? data.totalChunks : 0;
+          const isCompleted = totalCount > 0 && completedCount >= totalCount;
+
+          result.set(sKey, {
+            id: data.id || jId,
+            sessionId: sKey,
+            fileName: data.fileName || "novel.txt",
+            fileSizeBytes: data.fileSizeBytes || 0,
+            totalChineseChars: data.totalChineseChars || 0,
+            chunks: [],
+            style: data.style || "xianxia",
+            customInstructions: data.customInstructions || "",
+            glossary: data.glossary || [],
+            concurrency: data.concurrency || 1,
+            status: isCompleted ? "completed" : (data.status === "completed" ? "completed" : (data.status || "idle")),
+            startedAt: data.startedAt || Date.now(),
+            lastActiveAt: data.lastActiveAt || Date.now(),
+            totalChunks: totalCount,
+            completedChunks: completedCount,
+          } as any);
         }
       } catch (jobErr: any) {
         handleFirestoreError(`loadAllJobsFromFirestore(${jId})`, jobErr);
@@ -469,9 +755,84 @@ export async function loadAllJobsFromFirestore(): Promise<Map<string, CloudJob>>
 }
 
 /**
+ * Record a tombstone entry in Firestore AND local disk cache for a deleted job ID or fileName so it is NEVER re-imported
+ */
+export async function recordDeletedJobInFirestore(jobId?: string, fileName?: string): Promise<boolean> {
+  const cleanId = (jobId || "").trim();
+  const cleanFileName = (fileName || "").trim().toLowerCase();
+  if (!cleanId && !cleanFileName) return false;
+
+  // Always update local disk tombstones first
+  const local = getLocalDiskTombstones();
+  if (cleanId) local.ids.add(cleanId);
+  if (cleanFileName) {
+    local.fileNames.add(cleanFileName);
+    local.fileNames.add(cleanFileName.replace(/\.(txt|epub|pdf|json)$/i, "").trim().toLowerCase());
+  }
+  saveLocalDiskTombstones(local.ids, local.fileNames);
+
+  if (!isCloudStorageAvailable()) return true;
+  const db = initFirestore();
+  if (!db) return true;
+
+  try {
+    const docKey = cleanId ? `tombstone_${cleanId}` : `tombstone_file_${cleanFileName.replace(/[^a-z0-9_]/gi, "_")}`;
+    const tombstoneRef = doc(db, "deleted_jobs", docKey);
+    await setDoc(
+      tombstoneRef,
+      {
+        id: cleanId,
+        fileName: cleanFileName,
+        deletedAt: Date.now(),
+      },
+      { merge: true }
+    );
+    return true;
+  } catch (err: any) {
+    handleFirestoreError("recordDeletedJobInFirestore", err);
+    return false;
+  }
+}
+
+/**
+ * Get all tombstone entries for deleted jobs from local disk cache and Firestore
+ */
+export async function getDeletedJobTombstonesFromFirestore(): Promise<{ ids: Set<string>; fileNames: Set<string> }> {
+  // 1. Read from local disk cache
+  const { ids, fileNames } = getLocalDiskTombstones();
+
+  if (!isCloudStorageAvailable()) return { ids, fileNames };
+  const db = initFirestore();
+  if (!db) return { ids, fileNames };
+
+  try {
+    const tombstonesRef = collection(db, "deleted_jobs");
+    const snapshot = await getDocs(tombstonesRef);
+    for (const docSnap of snapshot.docs) {
+      const data = docSnap.data();
+      if (data.id) ids.add(String(data.id).trim());
+      if (data.fileName) {
+        const fn = String(data.fileName).trim().toLowerCase();
+        fileNames.add(fn);
+        fileNames.add(fn.replace(/\.(txt|epub|pdf|json)$/i, "").trim().toLowerCase());
+      }
+    }
+    // Update local disk cache with any cloud tombstones
+    saveLocalDiskTombstones(ids, fileNames);
+  } catch (err: any) {
+    handleFirestoreError("getDeletedJobTombstonesFromFirestore", err);
+  }
+
+  return { ids, fileNames };
+}
+
+/**
  * Permanently delete a job and all its chunks from Firestore
  */
 export async function deleteJobFromFirestore(jobId: string): Promise<boolean> {
+  // Record tombstone first
+  await recordDeletedJobInFirestore(jobId);
+
   if (!isCloudStorageAvailable()) return false;
   const db = initFirestore();
   if (!db || !jobId) return false;
@@ -492,8 +853,19 @@ export async function deleteJobFromFirestore(jobId: string): Promise<boolean> {
       }
     }
 
+    const segsRef = collection(db, "translation_jobs", jobId, "segments");
+    const segsSnap = await getDocs(segsRef);
+    if (!segsSnap.empty) {
+      const batch = writeBatch(db);
+      for (const d of segsSnap.docs) {
+        batch.delete(d.ref);
+      }
+      await batch.commit();
+    }
+
     const jobRef = doc(db, "translation_jobs", jobId);
     await deleteDoc(jobRef);
+
     console.log(`[FirestoreStorage] Deleted job ${jobId} and its chunk subcollection from Firestore`);
     return true;
   } catch (err: any) {
@@ -502,10 +874,54 @@ export async function deleteJobFromFirestore(jobId: string): Promise<boolean> {
   }
 }
 
+export const KNOWN_NOVEL_ALIASES: Array<[string, string]> = [
+  ["primitive chen qi", "穿越兽世当神棍"],
+  ["primitivechenqi", "穿越兽世当神棍"],
+  ["chen qi", "穿越兽世当神棍"],
+  ["chenqi", "穿越兽世当神棍"],
+  ["chuanyueshoshidangshengun", "primitive chen qi"],
+  ["raising cubs and building a tribe in the beast world", "在兽世养崽建部落"],
+  ["modern bird parrot bai linlin", "现代小鸟白林林"],
+  ["yiren bei rebellion", "一人之下"],
+];
+
+export function isSameNovel(name1?: string, name2?: string): boolean {
+  if (!name1 || !name2) return false;
+  const norm = (s: string) =>
+    s
+      .replace(/\.(txt|epub|pdf|json)$/i, "")
+      .toLowerCase()
+      .replace(/[_ -]ch(?:apter)?\s*\d+.*$/i, "")
+      .replace(/\[.*?\]/g, "")
+      .replace(/【.*?】/g, "")
+      .replace(/[^a-z0-9\u4e00-\u9fa5]/g, "");
+
+  const n1 = norm(name1);
+  const n2 = norm(name2);
+  if (!n1 || !n2) return false;
+  if (n1 === n2 || n1.includes(n2) || n2.includes(n1)) return true;
+
+  for (const [aliasA, aliasB] of KNOWN_NOVEL_ALIASES) {
+    const normA = norm(aliasA);
+    const normB = norm(aliasB);
+    if (
+      (n1.includes(normA) && n2.includes(normB)) ||
+      (n2.includes(normA) && n1.includes(normB)) ||
+      (n1.includes(normB) && n2.includes(normA)) ||
+      (n2.includes(normB) && n1.includes(normA))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Permanently delete all jobs and their chunks matching a novel filename from Firestore
  */
 export async function deleteJobByFileNameFromFirestore(fileName: string): Promise<number> {
+  await recordDeletedJobInFirestore(undefined, fileName);
+
   if (!isCloudStorageAvailable()) return 0;
   const db = initFirestore();
   if (!db || !fileName) return 0;
@@ -519,7 +935,7 @@ export async function deleteJobByFileNameFromFirestore(fileName: string): Promis
     for (const docSnap of snapshot.docs) {
       const data = docSnap.data();
       const docFileName = (data.fileName || "").trim().toLowerCase();
-      if (docFileName === targetName) {
+      if (docFileName === targetName || isSameNovel(docFileName, targetName)) {
         await deleteJobFromFirestore(docSnap.id);
         deletedCount++;
       }
@@ -554,4 +970,75 @@ export async function deleteAllJobsFromFirestore(): Promise<number> {
 
   return deletedCount;
 }
+
+
+/**
+ * Real-time direct query against Firestore for any existing completed or matching in-progress job for a novel.
+ * Guarantees mathematically absolute protection against duplicate translations even on cold server starts.
+ */
+export async function findJobInFirestoreByNovel(targetNovelName: string, totalChars?: number): Promise<CloudJob | null> {
+  if (!targetNovelName || !targetNovelName.trim()) return null;
+  if (!isCloudStorageAvailable()) return null;
+  const db = initFirestore();
+  if (!db) return null;
+
+  try {
+    const tombstones = await getDeletedJobTombstonesFromFirestore();
+    const cleanTarget = targetNovelName.trim().toLowerCase();
+
+    // Check if tombstoned
+    if (tombstones.fileNames.has(cleanTarget) || Array.from(tombstones.fileNames).some(t => isSameNovel(t, cleanTarget))) {
+      return null;
+    }
+
+    const jobsRef = collection(db, "translation_jobs");
+    const snapshot = await getDocs(jobsRef);
+    let matchedDocId: string | null = null;
+    let matchedScore = -1;
+
+    for (const docSnap of snapshot.docs) {
+      const jId = docSnap.id;
+      if (jId.startsWith("_") || jId.startsWith("synthetic_") || jId.startsWith("test_")) continue;
+      if (tombstones.ids.has(jId)) continue;
+
+      const data = docSnap.data();
+      const docFileName = (data.fileName || "").trim().toLowerCase();
+
+      if (tombstones.fileNames.has(docFileName) || Array.from(tombstones.fileNames).some(t => isSameNovel(t, docFileName))) {
+        continue;
+      }
+
+      const sameNovel = isSameNovel(docFileName, cleanTarget);
+      if (!sameNovel && docFileName !== cleanTarget) continue;
+
+      // Score matches (completed > in-progress, character match > general match)
+      const completedCount = typeof data.completedChunks === "number" ? data.completedChunks : 0;
+      const totalCount = typeof data.totalChunks === "number" ? data.totalChunks : 0;
+      const isCompleted = (totalCount > 0 && completedCount >= totalCount) || data.status === "completed";
+
+      let score = completedCount;
+      if (isCompleted) score += 100000;
+
+      if (totalChars && data.totalChineseChars && Math.abs(data.totalChineseChars - totalChars) < 50) {
+        score += 50000;
+      }
+
+      if (score > matchedScore) {
+        matchedScore = score;
+        matchedDocId = jId;
+      }
+    }
+
+    if (matchedDocId) {
+      console.log(`[FirestoreStorage] Direct live query found matching novel job in Firestore: "${matchedDocId}" (Score: ${matchedScore})`);
+      const fullJob = await loadJobFromFirestore(matchedDocId);
+      return fullJob;
+    }
+  } catch (err: any) {
+    handleFirestoreError(`findJobInFirestoreByNovel(${targetNovelName})`, err);
+  }
+
+  return null;
+}
+
 
