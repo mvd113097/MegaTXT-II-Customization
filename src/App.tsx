@@ -1182,13 +1182,6 @@ export default function App() {
 
   // Reset workspace / permanently delete novel translation
   const handleReset = async (novelNameToDelete?: any, clearAll: boolean = false) => {
-    if (
-      isRunning &&
-      !window.confirm("Translation is in progress. Are you sure you want to stop and delete?")
-    ) {
-      return;
-    }
-
     const cleanNovelToDelete =
       typeof novelNameToDelete === "string" && novelNameToDelete.trim()
         ? novelNameToDelete.trim()
