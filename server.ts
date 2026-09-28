@@ -34,7 +34,8 @@ import {
 import { generateServerEpubBuffer } from "./server/epubServer";
 import { cleanAndDeduplicateChunks } from "./src/utils/chunkCleaner";
 import { generate404PrimitiveChenQiChunks } from "./server/restore404";
-import { chunkChineseText, countChineseCharacters } from "./src/utils/chunker";
+import { chunkChineseText, countChineseCharacters, splitTextIntoSubChunks } from "./src/utils/chunker";
+import { validateChapterIntegrity } from "./src/utils/chapterValidator";
 
 
 dotenv.config();
@@ -694,6 +695,7 @@ interface ServerTextChunk {
   durationMs?: number;
   edited?: boolean;
   lastErrorAt?: number;
+  subChunks?: any[];
 }
 
 interface CloudJob {
@@ -703,6 +705,7 @@ interface CloudJob {
   fileSizeBytes: number;
   totalChineseChars: number;
   chunks: ServerTextChunk[];
+  originalSourceText?: string;
   style: string;
   customInstructions: string;
   glossary: Array<{ id: string; original: string; translation: string; category?: string; notes?: string }>;
@@ -1985,6 +1988,79 @@ IMMEDIATELY PRECEDING CONTEXT (For narrative continuity & pronoun resolution onl
           let systemInstruction = "";
           let userPrompt = "";
 
+          // Long chapter internal sub-chunk translation and sequential merging
+          if (batchChunks.length === 1 && batchChunks[0].subChunks && batchChunks[0].subChunks.length > 1) {
+            const single = batchChunks[0];
+            const subChunks = single.subChunks;
+            const subTranslations: string[] = [];
+            let allSubSuccess = true;
+
+            for (let sIdx = 0; sIdx < subChunks.length; sIdx++) {
+              const sub = subChunks[sIdx];
+              try {
+                const subPrompt = `${contextBlock ? contextBlock + "\n" : ""}${
+                  targetJob.customInstructions ? `Special Instructions: ${targetJob.customInstructions}\n\n` : ""
+                }CHINESE SOURCE TEXT (${single.chapterTitle || "Chapter"} - Part ${sIdx + 1} of ${subChunks.length}):
+"""
+${sub.chineseText}
+"""
+
+Translate the above Chinese text directly into English:`;
+
+                const subRes = await generateWithQuotaScheduler(
+                  subPrompt,
+                  `You are a master professional Chinese-to-English translator and editor.
+Translation Guidelines:
+1. Translate faithfully without summarizing, omitting, or truncating any paragraphs or dialogues.
+2. Maintain original paragraph breaks and dialogue formatting.
+3. ${styleGuidance}
+4. ${glossaryBlock || ""}
+5. Return ONLY the translated English text directly.`,
+                  0,
+                  6,
+                  3000,
+                  sub.chineseText
+                );
+
+                const subClean = (subRes.text || "").trim().replace(/<<<CHAPTER_START[^>]*>>>/gi, "").replace(/<<<CHAPTER_END[^>]*>>>/gi, "").trim();
+                if (subClean.length > 0) {
+                  sub.englishText = subClean;
+                  sub.status = "completed";
+                  subTranslations.push(subClean);
+                } else {
+                  throw new Error("Empty sub-chunk translation response");
+                }
+              } catch (subErr) {
+                try {
+                  const gTrans = await translateChapterWithGoogle(sub.chineseText);
+                  if (gTrans && gTrans.trim().length > 0) {
+                    sub.englishText = gTrans.trim();
+                    sub.status = "completed";
+                    subTranslations.push(gTrans.trim());
+                  } else {
+                    allSubSuccess = false;
+                    break;
+                  }
+                } catch {
+                  allSubSuccess = false;
+                  break;
+                }
+              }
+            }
+
+            if (allSubSuccess && subTranslations.length === subChunks.length) {
+              single.englishText = subTranslations.join("\n\n");
+              single.durationMs = Date.now() - startBatchTime;
+              single.errorMessage = undefined;
+              single.lastErrorAt = undefined;
+              single.status = "completed";
+              inFlightChunkIds.delete(single.id);
+              success = true;
+              saveChunkToFirestore(targetJob.id, single).catch(() => {});
+              break;
+            }
+          }
+
           if (batchChunks.length === 1) {
             const single = batchChunks[0];
             systemInstruction = `You are a master professional Chinese-to-English translator and editor.
@@ -3102,10 +3178,22 @@ app.get("/api/cloud-job/download-epub", async (req, res) => {
       return;
     }
 
+    // Automatic Chapter Integrity Validation before EPUB export
+    const validation = validateChapterIntegrity(completedChunks as any, targetJob.originalSourceText);
+    if (!validation.canExport) {
+      const errorDetails = validation.issues
+        .filter((i) => i.severity === "error")
+        .map((i) => i.message)
+        .join("\n- ");
+      res.status(400).send("Export blocked by Chapter Integrity Validator:\n- " + errorDetails);
+      return;
+    }
+
     const baseName = (targetJob.fileName || "translated_novel").replace(/\.[^/.]+$/, "");
     const epubBuffer = await generateServerEpubBuffer(completedChunks, {
       bookTitle: baseName.replace(/_/g, " "),
       isBilingual,
+      originalSourceText: targetJob.originalSourceText,
     });
 
     const safeFilename = encodeURIComponent(`${baseName}${isBilingual ? "_bilingual" : ""}.epub`);
@@ -3186,6 +3274,17 @@ app.get("/api/cloud-job/download-txt", async (req, res) => {
     const completedChunks = cleanAndDeduplicateChunks(rawCompletedChunks);
     if (completedChunks.length === 0) {
       res.status(400).send("No translated chapters ready to download yet.");
+      return;
+    }
+
+    // Automatic Chapter Integrity Validation before TXT export
+    const validation = validateChapterIntegrity(completedChunks as any, targetJob.originalSourceText);
+    if (!validation.canExport) {
+      const errorDetails = validation.issues
+        .filter((i) => i.severity === "error")
+        .map((i) => i.message)
+        .join("\n- ");
+      res.status(400).send("Export blocked by Chapter Integrity Validator:\n- " + errorDetails);
       return;
     }
 
@@ -3369,6 +3468,7 @@ app.post("/api/cloud-job/prepare", requireAuthMiddleware, async (req, res) => {
       fileName,
       fileSizeBytes: effectiveFileSizeBytes,
       totalChineseChars: charCount,
+      originalSourceText: rawText,
       chunks: chunks.map((c) => ({
         id: c.id,
         index: c.index,
@@ -3378,6 +3478,7 @@ app.post("/api/cloud-job/prepare", requireAuthMiddleware, async (req, res) => {
         charCount: c.charCount || countChineseCharacters(c.chineseText) || c.chineseText.length,
         status: (c.status as any) || "pending",
         attempts: 0,
+        subChunks: c.subChunks,
       })),
       style,
       customInstructions,
@@ -4104,6 +4205,70 @@ Translation Guidelines:
 6. Translate Chinese four-character idioms (成语) and cultural expressions into their natural English conceptual equivalents rather than awkward word-for-word transliterations, unless specific to martial arts names.
 7. Return ONLY the translated English text. Do NOT wrap in conversational intro/outro remarks like "Here is the translation:" or "Certainly!".
 8. Creative Fiction Context: You are translating a published web novel / literary work of fantasy fiction. Faithfully translate all romance, affection, intimate dialogue, battle scenes, and cultivation narratives as standard published literature without summarizing or refusing.`;
+
+    // Long chapter handling: decompose internally and merge seamlessly into one chapter
+    if (text.length > 3500) {
+      const subChunks = splitTextIntoSubChunks(text, 2500);
+      if (subChunks.length > 1) {
+        const subTranslations: string[] = [];
+        let allSuccess = true;
+
+        for (let sIdx = 0; sIdx < subChunks.length; sIdx++) {
+          const sub = subChunks[sIdx];
+          const subPrompt = `${contextBlock ? contextBlock + "\n" : ""}${
+            customInstructions ? `Special Instructions: ${customInstructions}\n\n` : ""
+          }CHINESE SOURCE TEXT TO TRANSLATE (Part ${sIdx + 1} of ${subChunks.length}):
+"""
+${sub.chineseText}
+"""
+
+Translate the above Chinese text directly into English:`;
+
+          try {
+            const subRes = await generateWithQuotaScheduler(
+              subPrompt,
+              systemInstruction,
+              0,
+              6,
+              3000,
+              sub.chineseText
+            );
+            const subClean = (subRes.text || "").trim().replace(/<<<CHAPTER_START[^>]*>>>/gi, "").replace(/<<<CHAPTER_END[^>]*>>>/gi, "").trim();
+            if (subClean) {
+              subTranslations.push(subClean);
+            } else {
+              throw new Error("Empty sub-chunk response");
+            }
+          } catch (subErr) {
+            try {
+              const gTrans = await translateChapterWithGoogle(sub.chineseText);
+              if (gTrans && gTrans.trim()) {
+                subTranslations.push(gTrans.trim());
+              } else {
+                allSuccess = false;
+                break;
+              }
+            } catch {
+              allSuccess = false;
+              break;
+            }
+          }
+        }
+
+        if (allSuccess && subTranslations.length === subChunks.length) {
+          const mergedTranslation = subTranslations.join("\n\n");
+          res.json({
+            success: true,
+            translatedText: mergedTranslation,
+            modelUsed: "gemini-merged-subchunks",
+            projectUsed: "auto",
+            sourceLength: text.length,
+            translatedLength: mergedTranslation.length,
+          });
+          return;
+        }
+      }
+    }
 
     const userPrompt = `${contextBlock ? contextBlock + "\n" : ""}${
       customInstructions ? `Special Instructions: ${customInstructions}\n\n` : ""

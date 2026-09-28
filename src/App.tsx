@@ -1062,6 +1062,7 @@ export default function App() {
       fileSizeBytes: new Blob([text]).size,
       totalChineseChars: totalChars,
       chunks: rawChunks,
+      originalSourceText: text,
       style,
       customInstructions,
       glossary,
@@ -2400,6 +2401,7 @@ Export Timestamp: ${new Date().toLocaleString()}
             chunks={session.chunks}
             fileName={session.fileName}
             isCloud={mode === "cloud"}
+            originalSourceText={session.originalSourceText}
           />
         )}
 
